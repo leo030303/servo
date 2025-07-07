@@ -363,6 +363,8 @@ pub fn detect_image_format(buffer: &[u8]) -> Result<ImageFormat, &str> {
         Ok(ImageFormat::Bmp)
     } else if is_ico(buffer) {
         Ok(ImageFormat::Ico)
+    } else if is_avif(buffer) {
+        Ok(ImageFormat::Avif)
     } else {
         Err("Image Format Not Supported")
     }
@@ -477,6 +479,12 @@ fn is_ico(buffer: &[u8]) -> bool {
     buffer.starts_with(&[0x00, 0x00, 0x01, 0x00])
 }
 
+fn is_avif(buffer: &[u8]) -> bool {
+    buffer.starts_with(&[
+        0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66,
+    ])
+}
+
 fn is_webp(buffer: &[u8]) -> bool {
     // https://developers.google.com/speed/webp/docs/riff_container
     // First four bytes: `RIFF`, header size 12 bytes
@@ -573,6 +581,9 @@ mod test {
         ];
         let bmp = [0x42, 0x4D];
         let ico = [0x00, 0x00, 0x01, 0x00];
+        let avif = [
+            0x00, 0x00, 0x00, 0x20, b'f', b't', b'y', b'p', b'a', b'v', b'i', b'f',
+        ];
         let junk_format = [0x01, 0x02, 0x03, 0x04, 0x05];
 
         assert!(detect_image_format(&gif1).is_ok());
@@ -582,6 +593,7 @@ mod test {
         assert!(detect_image_format(&webp).is_ok());
         assert!(detect_image_format(&bmp).is_ok());
         assert!(detect_image_format(&ico).is_ok());
+        assert!(detect_image_format(&avif).is_ok());
         assert!(detect_image_format(&junk_format).is_err());
     }
 }

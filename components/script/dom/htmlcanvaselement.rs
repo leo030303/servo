@@ -16,7 +16,7 @@ use html5ever::{LocalName, Prefix, local_name, ns};
 use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::PngEncoder;
 use image::codecs::webp::WebPEncoder;
-use image::{ColorType, ImageEncoder, ImageError};
+use image::{ExtendedColorType, ImageEncoder, ImageError};
 #[cfg(feature = "webgpu")]
 use ipc_channel::ipc::{self as ipcchan};
 use js::error::throw_type_error;
@@ -363,8 +363,8 @@ impl HTMLCanvasElement {
             Some(context) => context.get_image_data(),
             None => {
                 let size = self.get_size();
-                if size.is_empty() ||
-                    pixels::compute_rgba8_byte_length_if_within_limit(
+                if size.is_empty()
+                    || pixels::compute_rgba8_byte_length_if_within_limit(
                         size.width as usize,
                         size.height as usize,
                     )
@@ -405,7 +405,12 @@ impl HTMLCanvasElement {
             EncodedImageType::Png => {
                 // FIXME(nox): https://github.com/image-rs/image-png/issues/86
                 // FIXME(nox): https://github.com/image-rs/image-png/issues/87
-                PngEncoder::new(encoder).write_image(canvas_data, width, height, ColorType::Rgba8)
+                PngEncoder::new(encoder).write_image(
+                    canvas_data,
+                    width,
+                    height,
+                    ExtendedColorType::Rgba8,
+                )
             },
             EncodedImageType::Jpeg => {
                 let jpeg_encoder = if let Some(quality) = quality {
@@ -423,7 +428,7 @@ impl HTMLCanvasElement {
                     JpegEncoder::new(encoder)
                 };
 
-                jpeg_encoder.write_image(canvas_data, width, height, ColorType::Rgba8)
+                jpeg_encoder.write_image(canvas_data, width, height, ExtendedColorType::Rgba8)
             },
             EncodedImageType::Webp => {
                 // No quality support because of https://github.com/image-rs/image/issues/1984
@@ -431,7 +436,7 @@ impl HTMLCanvasElement {
                     canvas_data,
                     width,
                     height,
-                    ColorType::Rgba8,
+                    ExtendedColorType::Rgba8,
                 )
             },
         }
