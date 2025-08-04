@@ -15,31 +15,30 @@ use compositing_traits::display_list::{
     SpatialTreeNodeInfo, StickyNodeInfo,
 };
 use embedder_traits::ViewportDetails;
-use euclid::SideOffsets2D;
 use euclid::default::{Point2D, Rect, Size2D};
+use euclid::{Box2D, SideOffsets2D};
 use log::warn;
 use servo_config::opts::DebugOptions;
 use style::Zero;
 use style::color::AbsoluteColor;
 use style::computed_values::float::T as ComputedFloat;
-use style::computed_values::mix_blend_mode::T as ComputedMixBlendMode;
 use style::computed_values::overflow_x::T as ComputedOverflow;
 use style::computed_values::position::T as ComputedPosition;
 use style::computed_values::text_decoration_style::T as TextDecorationStyle;
 use style::values::computed::angle::Angle;
-use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::{ClipRectOrAuto, Length, TextDecorationLine};
 use style::values::generics::box_::Perspective;
 use style::values::generics::transform::{self, GenericRotate, GenericScale, GenericTranslate};
 use style::values::specified::box_::DisplayOutside;
 use webrender_api::units::{LayoutPoint, LayoutRect, LayoutTransform, LayoutVector2D};
-use webrender_api::{self as wr, BorderRadius};
+use webrender_api::{self as wr, BorderRadius, ImageMask};
 use wr::StickyOffsetBounds;
 use wr::units::{LayoutPixel, LayoutSize};
 
 use super::ClipId;
 use super::clip::StackingContextTreeClipStore;
 use crate::ArcRefCell;
+use crate::context::ResolvedImage;
 use crate::display_list::conversions::{FilterToWebRender, ToWebRender};
 use crate::display_list::{BuilderForBoxFragment, DisplayListBuilder, offset_radii};
 use crate::fragment_tree::{
@@ -489,24 +488,19 @@ impl StackingContext {
                 .iter()
                 .all(|c| matches!(
                     c.context_type,
-                    StackingContextType::RealStackingContext |
-                        StackingContextType::PositionedStackingContainer
+                    StackingContextType::RealStackingContext
+                        | StackingContextType::PositionedStackingContainer
                 ))
         );
-        debug_assert!(
-            self.float_stacking_containers
-                .iter()
-                .all(
-                    |c| c.context_type == StackingContextType::FloatStackingContainer &&
-                        c.z_index() == 0
-                )
-        );
+        debug_assert!(self.float_stacking_containers.iter().all(|c| c.context_type
+            == StackingContextType::FloatStackingContainer
+            && c.z_index() == 0));
         debug_assert!(
             self.atomic_inline_stacking_containers
                 .iter()
                 .all(
-                    |c| c.context_type == StackingContextType::AtomicInlineStackingContainer &&
-                        c.z_index() == 0
+                    |c| c.context_type == StackingContextType::AtomicInlineStackingContainer
+                        && c.z_index() == 0
                 )
         );
     }
@@ -524,22 +518,30 @@ impl StackingContext {
         // actually need to create a stacking context, just avoid creating one.
         let style = &fragment.style;
         let effects = style.get_effects();
-        if effects.filter.0.is_empty() &&
-            effects.opacity == 1.0 &&
-            effects.mix_blend_mode == ComputedMixBlendMode::Normal &&
-            !style.has_effective_transform_or_perspective(FragmentFlags::empty()) &&
-            style.clone_clip_path() == ClipPath::None
-        {
-            return false;
-        }
+        // if effects.filter.0.is_empty()
+        //     && effects.opacity == 1.0
+        //     && effects.mix_blend_mode == ComputedMixBlendMode::Normal
+        //     && !style.has_effective_transform_or_perspective(FragmentFlags::empty())
+        //     && style.clone_clip_path() == ClipPath::None
+        // {
+        //     return false;
+        // }
 
         // Create the filter pipeline.
         let current_color = style.clone_color();
+        let spatial_id = builder.spatial_id(self.scroll_tree_node_id);
         let mut filters: Vec<wr::FilterOp> = effects
             .filter
             .0
             .iter()
-            .map(|filter| FilterToWebRender::to_webrender(filter, &current_color))
+            .map(|filter| {
+                println!(
+                    "{filter:?} \n{:?} \n{:?}",
+                    fragment.border_rect(),
+                    spatial_id
+                );
+                FilterToWebRender::to_webrender(filter, &current_color)
+            })
             .collect();
         if effects.opacity != 1.0 {
             filters.push(wr::FilterOp::Opacity(
@@ -554,22 +556,104 @@ impl StackingContext {
         //            This will require additional tracking during layout
         //            before we start collecting stacking contexts so that
         //            information will be available when we reach this point.
-        let spatial_id = builder.spatial_id(self.scroll_tree_node_id);
-        let clip_chain_id = self.clip_id.map(|clip_id| builder.clip_chain_id(clip_id));
-        builder.wr().push_stacking_context(
-            LayoutPoint::zero(), // origin
-            spatial_id,
-            style.get_webrender_primitive_flags(),
-            clip_chain_id,
-            style.get_used_transform_style().to_webrender(),
-            effects.mix_blend_mode.to_webrender(),
-            &filters,
-            &[], // filter_datas
-            &[], // filter_primitives
-            wr::RasterSpace::Screen,
-            wr::StackingContextFlags::empty(),
-            None, // snapshot
-        );
+        let node = fragment.base.tag.map(|tag| tag.node);
+        let svg_data = fragment.style.get_svg();
+        if let Ok(ResolvedImage::Image { image, size }) = builder
+            .image_resolver
+            .resolve_image(node, svg_data.mask_image.0.first().unwrap())
+        {
+            // println!("Mask mode: {:?}", svg_data.mask_mode);
+            println!(
+                "Hello resolved image\nborder x {:?}  y {:?}\ncontent x {:?}  y {:?}\npadding x {:?}  y {:?}\nmargin x {:?}  y {:?}",
+                fragment.border_rect().origin.x.to_f32_px(),
+                fragment.border_rect().origin.y.to_f32_px(),
+                fragment.content_rect.origin.x.to_f32_px(),
+                fragment.content_rect.origin.y.to_f32_px(),
+                fragment.padding_rect().origin.x.to_f32_px(),
+                fragment.padding_rect().origin.y.to_f32_px(),
+                fragment.margin_rect().origin.x.to_f32_px(),
+                fragment.margin_rect().origin.y.to_f32_px(),
+            );
+            // let layer = background::layout_layer(self, painter, builder, index, intrinsic);
+            let image_rect = Box2D::from_origin_and_size(
+                euclid::Point2D::new(
+                    fragment.border_rect().origin.x.to_f32_px(),
+                    fragment.border_rect().origin.y.to_f32_px(),
+                ),
+                euclid::Size2D::new(
+                    image.metadata().width as f32,
+                    image.metadata().height as f32,
+                ),
+            );
+
+            let image_wr_key = match image {
+                net_traits::image_cache::Image::Raster(raster_image) => raster_image.id,
+                net_traits::image_cache::Image::Vector(vector_image) => node
+                    .and_then(|node| {
+                        builder.image_resolver.rasterize_vector_image(
+                            vector_image.id,
+                            size.to_i32(),
+                            node,
+                        )
+                    })
+                    .and_then(|rasterized_image| rasterized_image.id),
+            };
+            let mut mask_filters = filters.clone();
+            mask_filters.retain(|f| !matches!(f, wr::FilterOp::Opacity(_, _)));
+
+            if let Some(image_key) = image_wr_key {
+                // println!("Image key: {:?}", image_key);
+                let clip_id = builder.wr().define_clip_image_mask(
+                    spatial_id,
+                    ImageMask {
+                        image: image_key,
+                        rect: image_rect,
+                    },
+                    &[],
+                    webrender_api::FillRule::Nonzero,
+                );
+                let clip_chain_id = builder.wr().define_clip_chain(None, vec![clip_id]);
+                // println!("Clip id: {:?}", clip_id);
+                // println!(
+                //     "Origin: {:?}\nSize: {:?}\nBorder: {:?}\nMin: {:?}\nMax: {:?}",
+                //     fragment.border_rect().origin.to_webrender().to_f32(),
+                //     fragment.border_rect().size,
+                //     fragment.border,
+                //     fragment.border_rect().min(),
+                //     fragment.border_rect().max()
+                // );
+                builder.wr().push_stacking_context(
+                    LayoutPoint::zero(), // origin
+                    spatial_id,
+                    style.get_webrender_primitive_flags(),
+                    Some(clip_chain_id),
+                    style.get_used_transform_style().to_webrender(),
+                    effects.mix_blend_mode.to_webrender(),
+                    &mask_filters,
+                    &[], // filter_datas
+                    &[], // filter_primitives
+                    wr::RasterSpace::Screen,
+                    wr::StackingContextFlags::WRAPS_BACKDROP_FILTER,
+                    None, // snapshot
+                );
+            }
+        } else {
+            let clip_chain_id = self.clip_id.map(|clip_id| builder.clip_chain_id(clip_id));
+            builder.wr().push_stacking_context(
+                LayoutPoint::zero(), // origin
+                spatial_id,
+                style.get_webrender_primitive_flags(),
+                clip_chain_id,
+                style.get_used_transform_style().to_webrender(),
+                effects.mix_blend_mode.to_webrender(),
+                &filters,
+                &[], // filter_datas
+                &[], // filter_primitives
+                wr::RasterSpace::Screen,
+                wr::StackingContextFlags::empty(),
+                None, // snapshot
+            );
+        }
 
         true
     }
@@ -828,8 +912,8 @@ impl Fragment {
         match self {
             Fragment::Box(fragment) | Fragment::Float(fragment) => {
                 let fragment = fragment.borrow();
-                if mode == StackingContextBuildMode::SkipHoisted &&
-                    fragment.style.clone_position().is_absolutely_positioned()
+                if mode == StackingContextBuildMode::SkipHoisted
+                    && fragment.style.clone_position().is_absolutely_positioned()
                 {
                     return;
                 }
@@ -1291,8 +1375,9 @@ impl BoxFragment {
         // > Note that text decorations are not propagated to floating and absolutely
         // > positioned descendants, nor to the contents of atomic inline-level descendants
         // > such as inline blocks and inline tables.
-        let text_decorations = match self.is_atomic_inline_level() ||
-            self.base
+        let text_decorations = match self.is_atomic_inline_level()
+            || self
+                .base
                 .flags
                 .contains(FragmentFlags::IS_OUTSIDE_LIST_ITEM_MARKER)
         {
@@ -1538,10 +1623,10 @@ impl BoxFragment {
             return None;
         }
 
-        if offsets.top.is_auto() &&
-            offsets.right.is_auto() &&
-            offsets.bottom.is_auto() &&
-            offsets.left.is_auto()
+        if offsets.top.is_auto()
+            && offsets.right.is_auto()
+            && offsets.bottom.is_auto()
+            && offsets.left.is_auto()
         {
             return None;
         }
