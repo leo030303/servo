@@ -534,14 +534,7 @@ impl StackingContext {
             .filter
             .0
             .iter()
-            .map(|filter| {
-                println!(
-                    "{filter:?} \n{:?} \n{:?}",
-                    fragment.border_rect(),
-                    spatial_id
-                );
-                FilterToWebRender::to_webrender(filter, &current_color)
-            })
+            .map(|filter| FilterToWebRender::to_webrender(filter, &current_color))
             .collect();
         if effects.opacity != 1.0 {
             filters.push(wr::FilterOp::Opacity(
