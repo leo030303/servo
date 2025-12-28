@@ -45,7 +45,6 @@ pub(crate) struct DissimilarOriginWindow {
 }
 
 impl DissimilarOriginWindow {
-    #[allow(unsafe_code)]
     pub(crate) fn new(
         global_to_clone_from: &GlobalScope,
         window_proxy: &WindowProxy,
@@ -58,13 +57,12 @@ impl DissimilarOriginWindow {
                 global_to_clone_from.mem_profiler_chan().clone(),
                 global_to_clone_from.time_profiler_chan().clone(),
                 global_to_clone_from.script_to_constellation_chan().clone(),
+                global_to_clone_from.script_to_embedder_chan().clone(),
                 global_to_clone_from.resource_threads().clone(),
+                global_to_clone_from.storage_threads().clone(),
                 global_to_clone_from.origin().clone(),
                 global_to_clone_from.creation_url().clone(),
                 global_to_clone_from.top_level_creation_url().clone(),
-                // FIXME(nox): The microtask queue is probably not important
-                // here, but this whole DOM interface is a hack anyway.
-                global_to_clone_from.microtask_queue().clone(),
                 #[cfg(feature = "webgpu")]
                 global_to_clone_from.wgpu_id_hub(),
                 Some(global_to_clone_from.is_secure_context()),
@@ -83,22 +81,22 @@ impl DissimilarOriginWindow {
 }
 
 impl DissimilarOriginWindowMethods<crate::DomTypeHolder> for DissimilarOriginWindow {
-    // https://html.spec.whatwg.org/multipage/#dom-window
+    /// <https://html.spec.whatwg.org/multipage/#dom-window>
     fn Window(&self) -> DomRoot<WindowProxy> {
         self.window_proxy()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-self
+    /// <https://html.spec.whatwg.org/multipage/#dom-self>
     fn Self_(&self) -> DomRoot<WindowProxy> {
         self.window_proxy()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-frames
+    /// <https://html.spec.whatwg.org/multipage/#dom-frames>
     fn Frames(&self) -> DomRoot<WindowProxy> {
         self.window_proxy()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-parent
+    /// <https://html.spec.whatwg.org/multipage/#dom-parent>
     fn GetParent(&self) -> Option<DomRoot<WindowProxy>> {
         // Steps 1-3.
         if self.window_proxy.is_browsing_context_discarded() {
@@ -112,7 +110,7 @@ impl DissimilarOriginWindowMethods<crate::DomTypeHolder> for DissimilarOriginWin
         Some(DomRoot::from_ref(&*self.window_proxy))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-top
+    /// <https://html.spec.whatwg.org/multipage/#dom-top>
     fn GetTop(&self) -> Option<DomRoot<WindowProxy>> {
         // Steps 1-3.
         if self.window_proxy.is_browsing_context_discarded() {
@@ -122,18 +120,18 @@ impl DissimilarOriginWindowMethods<crate::DomTypeHolder> for DissimilarOriginWin
         Some(DomRoot::from_ref(self.window_proxy.top()))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-length
+    /// <https://html.spec.whatwg.org/multipage/#dom-length>
     fn Length(&self) -> u32 {
         // TODO: Implement x-origin length
         0
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-window-close
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-close>
     fn Close(&self) {
         // TODO: Implement x-origin close
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-window-closed
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-closed>
     fn Closed(&self) -> bool {
         // TODO: Implement x-origin close
         false
@@ -170,29 +168,29 @@ impl DissimilarOriginWindowMethods<crate::DomTypeHolder> for DissimilarOriginWin
         self.post_message_impl(&options.targetOrigin, cx, message, transfer)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-opener
+    /// <https://html.spec.whatwg.org/multipage/#dom-opener>
     fn Opener(&self, _: JSContext, mut retval: MutableHandleValue) {
         // TODO: Implement x-origin opener
         retval.set(UndefinedValue());
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-opener
+    /// <https://html.spec.whatwg.org/multipage/#dom-opener>
     fn SetOpener(&self, _: JSContext, _: HandleValue) {
         // TODO: Implement x-origin opener
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-window-blur
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-blur>
     fn Blur(&self) {
         // > User agents are encouraged to ignore calls to this `blur()` method
         // > entirely.
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-window-focus
+    /// <https://html.spec.whatwg.org/multipage/#dom-window-focus>
     fn Focus(&self) {
         self.window_proxy().focus();
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location
+    /// <https://html.spec.whatwg.org/multipage/#dom-location>
     fn Location(&self, can_gc: CanGc) -> DomRoot<DissimilarOriginLocation> {
         self.location
             .or_init(|| DissimilarOriginLocation::new(self, can_gc))
@@ -236,7 +234,7 @@ impl DissimilarOriginWindow {
             "/" => Some(source_origin.clone()),
             url => match ServoUrl::parse(url) {
                 Ok(url) => Some(url.origin().clone()),
-                Err(_) => return Err(Error::Syntax),
+                Err(_) => return Err(Error::Syntax(None)),
             },
         };
         let msg = ScriptToConstellationMessage::PostMessage {

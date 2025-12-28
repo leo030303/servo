@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::thread::{self, Builder, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -11,10 +11,11 @@ use background_hang_monitor_api::{
     BackgroundHangMonitorExitSignal, BackgroundHangMonitorRegister, HangAlert, HangAnnotation,
     HangMonitorAlert, MonitoredComponentId,
 };
+use base::generic_channel::{GenericReceiver, GenericSender, RoutedReceiver};
 use crossbeam_channel::{Receiver, Sender, after, never, select, unbounded};
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
-use ipc_channel::router::ROUTER;
+use rustc_hash::FxHashMap;
 
+use crate::SamplerImpl;
 use crate::sampler::{NativeStack, Sampler};
 
 #[derive(Clone)]
@@ -27,12 +28,11 @@ impl HangMonitorRegister {
     /// Start a new hang monitor worker, and return a handle to register components for monitoring,
     /// as well as a join handle on the worker thread.
     pub fn init(
-        constellation_chan: IpcSender<HangMonitorAlert>,
-        control_port: IpcReceiver<BackgroundHangMonitorControlMsg>,
+        constellation_chan: GenericSender<HangMonitorAlert>,
+        control_port: GenericReceiver<BackgroundHangMonitorControlMsg>,
         monitoring_enabled: bool,
     ) -> (Box<dyn BackgroundHangMonitorRegister>, JoinHandle<()>) {
         let (sender, port) = unbounded();
-        let sender_clone = sender.clone();
 
         let join_handle = Builder::new()
             .name("BackgroundHangMonitor".to_owned())
@@ -50,7 +50,7 @@ impl HangMonitorRegister {
             .expect("Couldn't start BHM worker.");
         (
             Box::new(HangMonitorRegister {
-                sender: sender_clone,
+                sender,
                 monitoring_enabled,
             }),
             join_handle,
@@ -75,43 +75,8 @@ impl BackgroundHangMonitorRegister for HangMonitorRegister {
             self.monitoring_enabled,
         );
 
-        #[cfg(all(
-            feature = "sampler",
-            target_os = "windows",
-            any(target_arch = "x86_64", target_arch = "x86")
-        ))]
-        let sampler = crate::sampler_windows::WindowsSampler::new_boxed();
-        #[cfg(all(feature = "sampler", target_os = "macos"))]
-        let sampler = crate::sampler_mac::MacOsSampler::new_boxed();
-        #[cfg(all(feature = "sampler", target_os = "android"))]
-        let sampler = crate::sampler_linux::LinuxSampler::new_boxed();
-        #[cfg(all(
-            feature = "sampler",
-            target_os = "linux",
-            not(any(
-                target_arch = "arm",
-                target_arch = "aarch64",
-                target_env = "ohos",
-                target_env = "musl"
-            )),
-        ))]
-        let sampler = crate::sampler_linux::LinuxSampler::new_boxed();
-        #[cfg(any(
-            not(feature = "sampler"),
-            all(
-                target_os = "linux",
-                any(
-                    target_arch = "arm",
-                    target_arch = "aarch64",
-                    target_env = "ohos",
-                    target_env = "musl"
-                )
-            ),
-        ))]
-        let sampler = crate::sampler::DummySampler::new_boxed();
-
         bhm_chan.send(MonitoredComponentMsg::Register(
-            sampler,
+            SamplerImpl::default(),
             thread::current().name().map(str::to_owned),
             transient_hang_timeout,
             permanent_hang_timeout,
@@ -131,7 +96,7 @@ impl BackgroundHangMonitorClone for HangMonitorRegister {
 enum MonitoredComponentMsg {
     /// Register component for monitoring,
     Register(
-        Box<dyn Sampler>,
+        SamplerImpl,
         Option<String>,
         Duration,
         Duration,
@@ -194,7 +159,7 @@ impl BackgroundHangMonitor for BackgroundHangMonitorChan {
 }
 
 struct MonitoredComponent {
-    sampler: Box<dyn Sampler>,
+    sampler: SamplerImpl,
     last_activity: Instant,
     last_annotation: Option<HangAnnotation>,
     transient_hang_timeout: Duration,
@@ -208,11 +173,11 @@ struct MonitoredComponent {
 struct Sample(MonitoredComponentId, Instant, NativeStack);
 
 struct BackgroundHangMonitorWorker {
-    component_names: HashMap<MonitoredComponentId, String>,
-    monitored_components: HashMap<MonitoredComponentId, MonitoredComponent>,
-    constellation_chan: IpcSender<HangMonitorAlert>,
+    component_names: FxHashMap<MonitoredComponentId, String>,
+    monitored_components: FxHashMap<MonitoredComponentId, MonitoredComponent>,
+    constellation_chan: GenericSender<HangMonitorAlert>,
     port: Receiver<(MonitoredComponentId, MonitoredComponentMsg)>,
-    control_port: Receiver<BackgroundHangMonitorControlMsg>,
+    control_port: RoutedReceiver<BackgroundHangMonitorControlMsg>,
     sampling_duration: Option<Duration>,
     sampling_max_duration: Option<Duration>,
     last_sample: Instant,
@@ -228,12 +193,12 @@ type MonitoredComponentReceiver = Receiver<(MonitoredComponentId, MonitoredCompo
 
 impl BackgroundHangMonitorWorker {
     fn new(
-        constellation_chan: IpcSender<HangMonitorAlert>,
-        control_port: IpcReceiver<BackgroundHangMonitorControlMsg>,
+        constellation_chan: GenericSender<HangMonitorAlert>,
+        control_port: GenericReceiver<BackgroundHangMonitorControlMsg>,
         port: MonitoredComponentReceiver,
         monitoring_enabled: bool,
     ) -> Self {
-        let control_port = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(control_port);
+        let control_port = control_port.route_preserving_errors();
         Self {
             component_names: Default::default(),
             monitored_components: Default::default(),
@@ -272,13 +237,11 @@ impl BackgroundHangMonitorWorker {
                 None => "null".to_string(),
             };
             let json = format!(
-                "{}{{ \"name\": {}, \"namespace\": {}, \"index\": {}, \"type\": \"{:?}\", \
+                "{}{{ \"name\": {}, \"event loop id\": \"{:?}\", \
                  \"time\": {}, \"frames\": {} }}",
                 if !first { ",\n" } else { "" },
                 name,
-                id.0.namespace_id.0,
-                id.0.index.0.get(),
-                id.1,
+                id,
                 (instant - self.sampling_baseline).as_millis(),
                 serde_json::to_string(&profile.backtrace).unwrap(),
             );
@@ -317,7 +280,7 @@ impl BackgroundHangMonitorWorker {
             },
             recv(self.control_port) -> event => {
                 match event {
-                    Ok(BackgroundHangMonitorControlMsg::ToggleSampler(rate, max_duration)) => {
+                    Ok(Ok(BackgroundHangMonitorControlMsg::ToggleSampler(rate, max_duration))) => {
                         if self.sampling_duration.is_some() {
                             println!("Enabling profiler.");
                             self.finish_sampled_profile();
@@ -330,7 +293,7 @@ impl BackgroundHangMonitorWorker {
                         }
                         None
                     },
-                    Ok(BackgroundHangMonitorControlMsg::Exit) => {
+                    Ok(Ok(BackgroundHangMonitorControlMsg::Exit)) => {
                         for component in self.monitored_components.values_mut() {
                             component.exit_signal.signal_to_exit();
                         }
@@ -344,6 +307,10 @@ impl BackgroundHangMonitorWorker {
                         // Keep running; this worker thread will shutdown
                         // when the monitored components have shutdown,
                         // which we know has happened when `self.port` disconnects.
+                        None
+                    },
+                    Ok(Err(e)) => {
+                        log::warn!("BackgroundHangMonitorWorker control message deserialization error: {e:?}");
                         None
                     },
                     Err(_) => return false,

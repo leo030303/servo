@@ -2,9 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use canvas_context::WebGpuExternalImageMap;
+pub use canvas_context::{ContextData, WebGpuExternalImages};
 use log::warn;
-use swapchain::WGPUImageMap;
-pub use swapchain::{ContextData, WGPUExternalImages};
 use webgpu_traits::{WebGPU, WebGPUMsg};
 use wgpu_thread::WGPU;
 pub use {wgpu_core as wgc, wgpu_types as wgt};
@@ -13,18 +13,17 @@ mod poll_thread;
 mod wgpu_thread;
 
 use std::borrow::Cow;
-use std::sync::{Arc, Mutex};
 
-use compositing_traits::{CrossProcessCompositorApi, WebrenderExternalImageRegistry};
+use compositing_traits::{CrossProcessPaintApi, WebRenderExternalImageIdManager};
 use ipc_channel::ipc::{self, IpcReceiver};
 use servo_config::pref;
 
-pub mod swapchain;
+pub mod canvas_context;
 
 pub fn start_webgpu_thread(
-    compositor_api: CrossProcessCompositorApi,
-    external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
-    wgpu_image_map: WGPUImageMap,
+    paint_api: CrossProcessPaintApi,
+    webrender_external_image_id_manager: WebRenderExternalImageIdManager,
+    wgpu_image_map: WebGpuExternalImageMap,
 ) -> Option<(WebGPU, IpcReceiver<WebGPUMsg>)> {
     if !pref!(dom_webgpu_enabled) {
         return None;
@@ -59,8 +58,8 @@ pub fn start_webgpu_thread(
                 receiver,
                 sender_clone,
                 script_sender,
-                compositor_api,
-                external_images,
+                paint_api,
+                webrender_external_image_id_manager,
                 wgpu_image_map,
             )
             .run();

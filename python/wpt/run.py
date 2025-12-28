@@ -55,7 +55,7 @@ def run_tests(default_binary_path: str, **kwargs: Any) -> int:
     # makes CI logs unreadable.
     github_context = os.environ.pop("GITHUB_CONTEXT", None)
 
-    set_if_none(kwargs, "product", "servo")
+    set_if_none(kwargs, "product", "servodriver")
     set_if_none(kwargs, "config", os.path.join(WPT_PATH, "config.ini"))
     set_if_none(kwargs, "include_manifest", os.path.join(WPT_PATH, "include.ini"))
     set_if_none(kwargs, "manifest_update", False)
@@ -68,8 +68,6 @@ def run_tests(default_binary_path: str, **kwargs: Any) -> int:
     # chunks and leads to more consistent timing on GitHub Actions.
     set_if_none(kwargs, "chunk_type", "id_hash")
 
-    kwargs["user_stylesheets"].append(os.path.join(SERVO_ROOT, "tests", "wpt", "tests", "fonts", "ahem.css"))
-
     set_if_none(kwargs, "binary", default_binary_path)
     set_if_none(kwargs, "webdriver_binary", default_binary_path)
 
@@ -81,8 +79,16 @@ def run_tests(default_binary_path: str, **kwargs: Any) -> int:
 
     prefs = kwargs.pop("prefs")
     kwargs.setdefault("binary_args", [])
+
+    given_http_proxy_uri = False
     if prefs:
-        kwargs["binary_args"] += ["--pref=" + pref for pref in prefs]
+        for pref in prefs:
+            kwargs["binary_args"].append("--pref=" + pref)
+            given_http_proxy_uri |= "network_http_proxy_uri" in pref
+    # We clearly dictates no proxy unless users know what they are doing.
+    # This is to override potential default http_proxy/https_proxy.
+    if not given_http_proxy_uri:
+        kwargs["binary_args"].append("--pref=network_http_proxy_uri=")
 
     if not kwargs.get("no_default_test_types"):
         test_types = {
@@ -93,7 +99,7 @@ def run_tests(default_binary_path: str, **kwargs: Any) -> int:
         kwargs["test_types"] = test_types[product]
 
     filter_intermittents_output = kwargs.pop("filter_intermittents", None)
-    unexpected_raw_log_output_file = kwargs.pop("log_raw_unexpected", None)
+    stable_unexpected_raw_log_output_file = kwargs.pop("log_raw_stable_unexpected", None)
     raw_log_outputs = kwargs.get("log_raw", [])
     if filter_intermittents_output and kwargs["retry_unexpected"] <= 0:
         kwargs["retry_unexpected"] = 1
@@ -110,6 +116,11 @@ def run_tests(default_binary_path: str, **kwargs: Any) -> int:
         file_ext = os.path.splitext(kwargs["test_list"][0])[1].lower()
         if file_ext in [".htm", ".html", ".js", ".xhtml", ".xht", ".py"]:
             use_mach_logging = True
+
+    # Enable headless mode by default, unless `--no-headless` is explicitly passed, in
+    # which case we do not run in headless mode.
+    if kwargs.get("headless", None) is None:
+        kwargs["headless"] = True
 
     if use_mach_logging:
         logger = wptrunner.setup_logging(kwargs, {"mach": sys.stdout})
@@ -135,12 +146,12 @@ def run_tests(default_binary_path: str, **kwargs: Any) -> int:
         return_value = 0 if all_filtered else 1
 
     # Write the unexpected-only raw log if that was specified on the command-line.
-    if unexpected_raw_log_output_file:
+    if stable_unexpected_raw_log_output_file:
         if not raw_log_outputs:
-            print("'--log-raw-unexpected' not written without '--log-raw'.")
+            print("'--log-raw-stable-unexpected' not written without '--log-raw'.")
         else:
-            write_unexpected_only_raw_log(
-                handler.unexpected_results, raw_log_outputs[0].name, unexpected_raw_log_output_file
+            write_stable_unexpected_only_raw_log(
+                handler.unexpected_results, raw_log_outputs[0].name, stable_unexpected_raw_log_output_file
             )
 
     return return_value
@@ -280,11 +291,14 @@ def filter_intermittents(unexpected_results: List[UnexpectedResult], output_path
     return not any([is_stable_and_unexpected(result) for result in unexpected_results])
 
 
-def write_unexpected_only_raw_log(
+def write_stable_unexpected_only_raw_log(
     unexpected_results: List[UnexpectedResult], raw_log_file: str, filtered_raw_log_file: str
 ) -> None:
-    tests = [result.path for result in unexpected_results]
-    print(f"Writing unexpected-only raw log to {filtered_raw_log_file}")
+    # Only write the data for tests which are not flaky and which do not have issues.
+    # This allows the resulting log file to be used to update baselines after a CI run,
+    # as it will only contain stable unexpected results without issues.
+    tests = [result.path for result in unexpected_results if not result.flaky and not result.issues]
+    print(f"Writing stable unexpected-only raw log to {filtered_raw_log_file}")
 
     with open(filtered_raw_log_file, "w", encoding="utf-8") as output:
         with open(raw_log_file) as input:

@@ -3,8 +3,8 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 /// Log an event from constellation at trace level.
-/// - To disable tracing: RUST_LOG='compositor<constellation@=off'
-/// - To enable tracing: RUST_LOG='compositor<constellation@'
+/// - To disable tracing: RUST_LOG='paint<constellation@=off'
+/// - To enable tracing: RUST_LOG='paint<constellation@'
 macro_rules! trace_msg_from_constellation {
     // This macro only exists to put the docs in the same file as the target prefix,
     // so the macro definition is always the same.
@@ -23,24 +23,22 @@ mod from_constellation {
 
     macro_rules! target {
         ($($name:literal)+) => {
-            concat!("compositor<constellation@", $($name),+)
+            concat!("paint<constellation@", $($name),+)
         };
     }
 
-    impl LogTarget for compositing_traits::CompositorMsg {
+    impl LogTarget for compositing_traits::PaintMessage {
         fn log_target(&self) -> &'static str {
             match self {
                 Self::ChangeRunningAnimationsState(..) => target!("ChangeRunningAnimationsState"),
-                Self::CreateOrUpdateWebView(..) => target!("CreateOrUpdateWebView"),
-                Self::RemoveWebView(..) => target!("RemoveWebView"),
-                Self::TouchEventProcessed(..) => target!("TouchEventProcessed"),
-                Self::IsReadyToSaveImageReply(..) => target!("IsReadyToSaveImageReply"),
+                Self::SetFrameTreeForWebView(..) => target!("SetFrameTreeForWebView"),
                 Self::SetThrottled(..) => target!("SetThrottled"),
                 Self::NewWebRenderFrameReady(..) => target!("NewWebRenderFrameReady"),
                 Self::PipelineExited(..) => target!("PipelineExited"),
-                Self::LoadComplete(..) => target!("LoadComplete"),
                 Self::SendInitialTransaction(..) => target!("SendInitialTransaction"),
-                Self::SendScrollNode(..) => target!("SendScrollNode"),
+                Self::ScrollNodeByDelta(..) => target!("ScrollNodeByDelta"),
+                Self::ScrollViewportByDelta(..) => target!("ScrollViewportByDelta"),
+                Self::UpdateEpoch { .. } => target!("UpdateEpoch"),
                 Self::SendDisplayList { .. } => target!("SendDisplayList"),
                 Self::GenerateFrame { .. } => target!("GenerateFrame"),
                 Self::GenerateImageKey(..) => target!("GenerateImageKey"),
@@ -53,6 +51,9 @@ mod from_constellation {
                 Self::CollectMemoryReport(..) => target!("CollectMemoryReport"),
                 Self::Viewport(..) => target!("Viewport"),
                 Self::GenerateImageKeysForPipeline(..) => target!("GenerateImageKeysForPipeline"),
+                Self::DelayNewFrameForCanvas(..) => target!("DelayFramesForCanvas"),
+                Self::ScreenshotReadinessReponse(..) => target!("ScreenshotReadinessResponse"),
+                Self::SendLCPCandidate(..) => target!("SendLCPCandidate"),
             }
         }
     }

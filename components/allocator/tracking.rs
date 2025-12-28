@@ -9,10 +9,11 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::hash_map::Entry;
+use std::io::Write;
 use std::os::raw::c_void;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
-use fnv::{FnvBuildHasher, FnvHashMap};
+use rustc_hash::FxHashMap;
 
 /// The maximum number of allocations that we'll keep track of. Once the limit
 /// is reached, we'll evict the first allocation that is smaller than the new addition.
@@ -28,7 +29,7 @@ const SKIPPED_FRAMES: usize = 5;
 const MIN_SIZE: usize = 0;
 
 thread_local! {
-    static IN_ALLOCATION: Cell<bool> = Cell::new(false);
+    static IN_ALLOCATION: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(PartialEq, Eq)]
@@ -47,15 +48,15 @@ struct AllocSite {
 
 impl AllocSite {
     fn contains(&self, ptr: *mut u8) -> bool {
-        ptr >= self.ptr && ptr < unsafe { self.ptr.offset(self.size as isize) }
+        ptr >= self.ptr && ptr < unsafe { self.ptr.add(self.size) }
     }
 }
 
 unsafe impl Send for AllocSite {}
 
 /// A map of pointers to allocation callsite metadata.
-static ALLOCATION_SITES: Mutex<FnvHashMap<usize, AllocSite>> =
-    const { Mutex::new(FnvHashMap::with_hasher(FnvBuildHasher::new())) };
+static ALLOCATION_SITES: LazyLock<Mutex<FxHashMap<usize, AllocSite>>> =
+    LazyLock::new(|| Mutex::new(FxHashMap::default()));
 
 #[derive(Default)]
 pub struct AccountingAlloc<A = System> {
@@ -67,6 +68,7 @@ impl<A> AccountingAlloc<A> {
         Self { allocator }
     }
 
+    #[allow(clippy::absurd_extreme_comparisons)]
     fn remove_allocation(&self, ptr: *const c_void, size: usize) {
         if size < MIN_SIZE {
             return;
@@ -82,6 +84,7 @@ impl<A> AccountingAlloc<A> {
         IN_ALLOCATION.with(|status| status.set(old));
     }
 
+    #[allow(clippy::absurd_extreme_comparisons)]
     fn record_allocation(&self, ptr: *mut u8, size: usize) {
         if size < MIN_SIZE {
             return;
@@ -115,7 +118,7 @@ impl<A> AccountingAlloc<A> {
         } else if let Some(key) = sites
             .iter()
             .find(|(_, s)| s.size < site.size)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| *k)
         {
             sites.remove(&key);
             sites.insert(ptr as usize, site);
@@ -135,6 +138,8 @@ impl<A> AccountingAlloc<A> {
             })
     }
 
+    // The default is an absurd comparisons but you are supposed to change the default.
+    #[allow(clippy::absurd_extreme_comparisons)]
     pub(crate) fn note_allocation(&self, ptr: *const c_void, size: usize) {
         if size < MIN_SIZE {
             return;
@@ -146,7 +151,7 @@ impl<A> AccountingAlloc<A> {
         IN_ALLOCATION.with(|status| status.set(false));
     }
 
-    pub(crate) fn dump_unmeasured_allocations(&self) {
+    pub(crate) fn dump_unmeasured_allocations(&self, mut writer: impl Write) {
         // Ensure that we ignore all allocations triggered while processing
         // the existing allocation data.
         IN_ALLOCATION.with(|status| status.set(true));
@@ -168,15 +173,22 @@ impl<A> AccountingAlloc<A> {
                     });
                 }
 
-                println!("---\n{}\n", site.size);
+                if let Err(error) = writeln!(&mut writer, "---\n{}\n", site.size) {
+                    log::error!("Error writing to log file: {error:?}");
+                    return;
+                }
                 for (filename, line, symbol) in &resolved {
                     let fname = filename.as_ref().map(|f| f.display().to_string());
-                    println!(
+                    if let Err(error) = writeln!(
+                        &mut writer,
                         "{}:{} ({})",
                         fname.as_deref().unwrap_or(default),
                         line.unwrap_or_default(),
                         symbol.as_deref().unwrap_or(default),
-                    );
+                    ) {
+                        log::error!("Error writing to log file: {error:?}");
+                        return;
+                    }
                 }
             }
         }

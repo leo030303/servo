@@ -6,24 +6,24 @@ use std::cell::RefCell;
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::default::Default;
 use std::ffi::CString;
-use std::hash::BuildHasherDefault;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use deny_public_fields::DenyPublicFields;
 use dom_struct::dom_struct;
-use fnv::FnvHasher;
 use js::jsapi::JS::CompileFunction;
 use js::jsapi::{JS_GetFunctionObject, SupportUnscopables};
 use js::jsval::JSVal;
 use js::rust::{CompileOptionsWrapper, HandleObject, transform_u16_to_source_text};
 use libc::c_char;
+use rustc_hash::FxBuildHasher;
 use servo_url::ServoUrl;
 use style::str::HTML_SPACE_CHARACTERS;
 use stylo_atoms::Atom;
 
 use crate::conversions::Convert;
+use crate::dom::abortsignal::{AbortAlgorithm, RemovableDomEventListener};
 use crate::dom::beforeunloadevent::BeforeUnloadEvent;
 use crate::dom::bindings::callback::{CallbackContainer, CallbackFunction, ExceptionHandling};
 use crate::dom::bindings::cell::DomRefCell;
@@ -50,7 +50,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{
     DomGlobal, DomObject, Reflector, reflect_dom_object_with_proto,
 };
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::trace::HashMapTracedValues;
 use crate::dom::csp::{CspReporting, InlineCheckType};
@@ -59,7 +59,7 @@ use crate::dom::element::Element;
 use crate::dom::errorevent::ErrorEvent;
 use crate::dom::event::{Event, EventBubbles, EventCancelable, EventComposed};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlformelement::FormControlElementHelpers;
+use crate::dom::html::htmlformelement::FormControlElementHelpers;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::shadowroot::ShadowRoot;
 use crate::dom::virtualmethods::VirtualMethods;
@@ -191,7 +191,7 @@ static CONTENT_EVENT_HANDLER_NAMES: [&str; 108] = [
 ];
 
 #[derive(Clone, JSTraceable, MallocSizeOf, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 pub(crate) enum CommonEventHandler {
     EventHandler(#[conditional_malloc_size_of] Rc<EventHandlerNonNull>),
 
@@ -291,7 +291,7 @@ pub(crate) enum CompiledEventListener {
 }
 
 impl CompiledEventListener {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn associated_global(&self) -> DomRoot<GlobalScope> {
         let obj = match self {
             CompiledEventListener::Listener(listener) => listener.callback(),
@@ -432,7 +432,7 @@ pub(crate) struct EventListenerEntry {
     phase: ListenerPhase,
     listener: EventListenerType,
     once: bool,
-    passive: Option<bool>,
+    passive: bool,
     removed: bool,
 }
 
@@ -486,7 +486,7 @@ impl DerefMut for EventListeners {
 }
 
 impl EventListeners {
-    // https://html.spec.whatwg.org/multipage/#getting-the-current-value-of-the-event-handler
+    /// <https://html.spec.whatwg.org/multipage/#getting-the-current-value-of-the-event-handler>
     fn get_inline_listener(
         &self,
         owner: &EventTarget,
@@ -512,7 +512,7 @@ impl EventListeners {
 #[dom_struct]
 pub struct EventTarget {
     reflector_: Reflector,
-    handlers: DomRefCell<HashMapTracedValues<Atom, EventListeners, BuildHasherDefault<FnvHasher>>>,
+    handlers: DomRefCell<HashMapTracedValues<Atom, EventListeners, FxBuildHasher>>,
 }
 
 impl EventTarget {
@@ -606,7 +606,7 @@ impl EventTarget {
     /// <https://html.spec.whatwg.org/multipage/#event-handler-attributes:event-handlers-11>
     fn set_inline_event_listener(&self, ty: Atom, listener: Option<InlineEventListener>) {
         let mut handlers = self.handlers.borrow_mut();
-        let entries = match handlers.entry(ty) {
+        let entries = match handlers.entry(ty.clone()) {
             Occupied(entry) => entry.into_mut(),
             Vacant(entry) => entry.insert(EventListeners(vec![])),
         };
@@ -632,7 +632,7 @@ impl EventTarget {
                         phase: ListenerPhase::Bubbling,
                         listener: EventListenerType::Inline(listener.into()),
                         once: false,
-                        passive: None,
+                        passive: self.default_passive_value(&ty),
                         removed: false,
                     })));
                 }
@@ -651,11 +651,8 @@ impl EventTarget {
     }
 
     /// Determines the `passive` attribute of an associated event listener
-    pub(crate) fn is_passive(&self, ty: &Atom, listener: &Rc<RefCell<EventListenerEntry>>) -> bool {
-        listener
-            .borrow()
-            .passive
-            .unwrap_or(self.default_passive_value(ty))
+    pub(crate) fn is_passive(&self, listener: &Rc<RefCell<EventListenerEntry>>) -> bool {
+        listener.borrow().passive
     }
 
     fn get_inline_event_listener(&self, ty: &Atom, can_gc: CanGc) -> Option<CommonEventHandler> {
@@ -684,6 +681,7 @@ impl EventTarget {
                     element.upcast(),
                     InlineCheckType::ScriptAttribute,
                     source,
+                    line as u32,
                 )
             {
                 return;
@@ -705,7 +703,7 @@ impl EventTarget {
     // step 3
     // While the CanGc argument appears unused, it reflects the fact that the CompileFunction
     // API call can trigger a GC operation.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn get_compiled_event_handler(
         &self,
         handler: InternalRawUncompiledHandler,
@@ -720,12 +718,12 @@ impl EventTarget {
         };
 
         // Step 3.2
-        if !document.is_scripting_enabled() {
+        if !document.scripting_enabled() {
             return None;
         }
 
         // Step 3.3
-        let body: Vec<u16> = handler.source.encode_utf16().collect();
+        let body: Vec<u16> = handler.source.str().encode_utf16().collect();
 
         // Step 3.4 is handler.line
 
@@ -762,7 +760,7 @@ impl EventTarget {
 
         let cx = GlobalScope::get_cx();
         let options = unsafe {
-            CompileOptionsWrapper::new(*cx, &handler.url.to_string(), handler.line as u32)
+            CompileOptionsWrapper::new_raw(*cx, &handler.url.to_string(), handler.line as u32)
         };
 
         // Step 3.9, subsection Scope steps 1-6
@@ -818,7 +816,7 @@ impl EventTarget {
         }
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn set_event_handler_common<T: CallbackContainer<crate::DomTypeHolder>>(
         &self,
         ty: &str,
@@ -834,7 +832,7 @@ impl EventTarget {
         self.set_inline_event_listener(Atom::from(ty), event_listener);
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn set_error_event_handler<T: CallbackContainer<crate::DomTypeHolder>>(
         &self,
         ty: &str,
@@ -850,7 +848,7 @@ impl EventTarget {
         self.set_inline_event_listener(Atom::from(ty), event_listener);
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn set_beforeunload_event_handler<T: CallbackContainer<crate::DomTypeHolder>>(
         &self,
         ty: &str,
@@ -866,7 +864,7 @@ impl EventTarget {
         self.set_inline_event_listener(Atom::from(ty), event_listener);
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn get_event_handler_common<T: CallbackContainer<crate::DomTypeHolder>>(
         &self,
         ty: &str,
@@ -886,7 +884,7 @@ impl EventTarget {
     }
 
     // https://dom.spec.whatwg.org/#concept-event-fire
-    pub(crate) fn fire_event(&self, name: Atom, can_gc: CanGc) -> DomRoot<Event> {
+    pub(crate) fn fire_event(&self, name: Atom, can_gc: CanGc) -> bool {
         self.fire_event_with_params(
             name,
             EventBubbles::DoesNotBubble,
@@ -897,7 +895,7 @@ impl EventTarget {
     }
 
     // https://dom.spec.whatwg.org/#concept-event-fire
-    pub(crate) fn fire_bubbling_event(&self, name: Atom, can_gc: CanGc) -> DomRoot<Event> {
+    pub(crate) fn fire_bubbling_event(&self, name: Atom, can_gc: CanGc) -> bool {
         self.fire_event_with_params(
             name,
             EventBubbles::Bubbles,
@@ -908,7 +906,7 @@ impl EventTarget {
     }
 
     // https://dom.spec.whatwg.org/#concept-event-fire
-    pub(crate) fn fire_cancelable_event(&self, name: Atom, can_gc: CanGc) -> DomRoot<Event> {
+    pub(crate) fn fire_cancelable_event(&self, name: Atom, can_gc: CanGc) -> bool {
         self.fire_event_with_params(
             name,
             EventBubbles::DoesNotBubble,
@@ -919,11 +917,7 @@ impl EventTarget {
     }
 
     // https://dom.spec.whatwg.org/#concept-event-fire
-    pub(crate) fn fire_bubbling_cancelable_event(
-        &self,
-        name: Atom,
-        can_gc: CanGc,
-    ) -> DomRoot<Event> {
+    pub(crate) fn fire_bubbling_cancelable_event(&self, name: Atom, can_gc: CanGc) -> bool {
         self.fire_event_with_params(
             name,
             EventBubbles::Bubbles,
@@ -941,26 +935,43 @@ impl EventTarget {
         cancelable: EventCancelable,
         composed: EventComposed,
         can_gc: CanGc,
-    ) -> DomRoot<Event> {
+    ) -> bool {
         let event = Event::new(&self.global(), name, bubbles, cancelable, can_gc);
         event.set_composed(composed.into());
-        event.fire(self, can_gc);
-        event
+        event.fire(self, can_gc)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener>
+    /// and <https://dom.spec.whatwg.org/#add-an-event-listener>
     pub(crate) fn add_event_listener(
         &self,
         ty: DOMString,
         listener: Option<Rc<EventListener>>,
         options: AddEventListenerOptions,
     ) {
+        if let Some(signal) = options.signal.as_ref() {
+            // Step 2. If listener’s signal is not null and is aborted, then return.
+            if signal.aborted() {
+                return;
+            }
+            // Step 6. If listener’s signal is not null, then add the following abort steps to it:
+            signal.add(&AbortAlgorithm::DomEventListener(
+                RemovableDomEventListener {
+                    event_target: Dom::from_ref(self),
+                    ty: ty.clone(),
+                    listener: listener.clone(),
+                    options: options.parent.clone(),
+                },
+            ));
+        }
+        // Step 3. If listener’s callback is null, then return.
         let listener = match listener {
             Some(l) => l,
             None => return,
         };
         let mut handlers = self.handlers.borrow_mut();
-        let entries = match handlers.entry(Atom::from(ty)) {
+        let ty = Atom::from(ty);
+        let entries = match handlers.entry(ty.clone()) {
             Occupied(entry) => entry.into_mut(),
             Vacant(entry) => entry.insert(EventListeners(vec![])),
         };
@@ -970,27 +981,32 @@ impl EventTarget {
         } else {
             ListenerPhase::Bubbling
         };
+        // Step 4. If listener’s passive is null, then set it to the default passive value given listener’s type and eventTarget.
         let new_entry = Rc::new(RefCell::new(EventListenerEntry {
             phase,
             listener: EventListenerType::Additive(listener),
             once: options.once,
-            passive: options.passive,
+            passive: options.passive.unwrap_or(self.default_passive_value(&ty)),
             removed: false,
         }));
 
+        // Step 5. If eventTarget’s event listener list does not contain
+        // an event listener whose type is listener’s type, callback is listener’s callback,
+        // and capture is listener’s capture, then append listener to eventTarget’s event listener list.
         if !entries.contains(&new_entry) {
             entries.push(new_entry);
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>
+    /// and <https://dom.spec.whatwg.org/#remove-an-event-listener>
     pub(crate) fn remove_event_listener(
         &self,
         ty: DOMString,
-        listener: Option<Rc<EventListener>>,
-        options: EventListenerOptions,
+        listener: &Option<Rc<EventListener>>,
+        options: &EventListenerOptions,
     ) {
-        let Some(ref listener) = listener else {
+        let Some(listener) = listener else {
             return;
         };
         let mut handlers = self.handlers.borrow_mut();
@@ -1000,14 +1016,12 @@ impl EventTarget {
             } else {
                 ListenerPhase::Bubbling
             };
-            let old_entry = Rc::new(RefCell::new(EventListenerEntry {
-                phase,
-                listener: EventListenerType::Additive(listener.clone()),
-                once: false,
-                passive: None,
-                removed: false,
-            }));
-            if let Some(position) = entries.iter().position(|e| *e == old_entry) {
+            let listener_type = EventListenerType::Additive(listener.clone());
+            if let Some(position) = entries
+                .iter()
+                .position(|e| e.borrow().listener == listener_type && e.borrow().phase == phase)
+            {
+                // Step 2. Set listener’s removed to true and remove listener from eventTarget’s event listener list.
                 entries.remove(position).borrow_mut().removed = true;
             }
         }
@@ -1055,6 +1069,7 @@ impl EventTarget {
             // * A is not a node
             // * A’s root is not a shadow root
             // * B is a node and A’s root is a shadow-including inclusive ancestor of B
+            // then return A.
             let Some(a_node) = a.downcast::<Node>() else {
                 return a;
             };
@@ -1086,7 +1101,7 @@ impl EventTarget {
 }
 
 impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
-    // https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-eventtarget>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -1095,7 +1110,7 @@ impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
         Ok(EventTarget::new(global, proto, can_gc))
     }
 
-    // https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-addeventlistener>
     fn AddEventListener(
         &self,
         ty: DOMString,
@@ -1105,20 +1120,20 @@ impl EventTargetMethods<crate::DomTypeHolder> for EventTarget {
         self.add_event_listener(ty, listener, options.convert())
     }
 
-    // https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-removeeventlistener>
     fn RemoveEventListener(
         &self,
         ty: DOMString,
         listener: Option<Rc<EventListener>>,
         options: EventListenerOptionsOrBoolean,
     ) {
-        self.remove_event_listener(ty, listener, options.convert())
+        self.remove_event_listener(ty, &listener, &options.convert())
     }
 
-    // https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent
+    /// <https://dom.spec.whatwg.org/#dom-eventtarget-dispatchevent>
     fn DispatchEvent(&self, event: &Event, can_gc: CanGc) -> Fallible<bool> {
         if event.dispatching() || !event.initialized() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         event.set_trusted(false);
         Ok(self.dispatch_event(event, can_gc))
@@ -1132,13 +1147,20 @@ impl VirtualMethods for EventTarget {
 }
 
 impl Convert<AddEventListenerOptions> for AddEventListenerOptionsOrBoolean {
+    /// <https://dom.spec.whatwg.org/#event-flatten-more>
     fn convert(self) -> AddEventListenerOptions {
+        // Step 1. Let capture be the result of flattening options.
+        // Step 5. Return capture, passive, once, and signal.
         match self {
+            // Step 4. If options is a dictionary:
             AddEventListenerOptionsOrBoolean::AddEventListenerOptions(options) => options,
             AddEventListenerOptionsOrBoolean::Boolean(capture) => AddEventListenerOptions {
                 parent: EventListenerOptions { capture },
+                // Step 2. Let once be false.
                 once: false,
+                // Step 3. Let passive and signal be null.
                 passive: None,
+                signal: None,
             },
         }
     }

@@ -15,8 +15,10 @@ use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::router::ROUTER;
 use js::jsapi::JSObject;
 use js::rust::MutableHandleValue;
-use js::typedarray::Float32Array;
+use js::typedarray::HeapFloat32Array;
 use profile_traits::ipc;
+use rustc_hash::FxBuildHasher;
+use script_bindings::trace::RootedTraceableBox;
 use stylo_atoms::Atom;
 use webxr_api::{
     self, ApiSpace, ContextId as WebXRContextId, Display, EntityTypes, EnvironmentBlendMode,
@@ -95,7 +97,7 @@ pub(crate) struct XRSession {
     current_raf_callback_list: DomRefCell<Vec<(i32, Option<Rc<XRFrameRequestCallback>>)>>,
     input_sources: Dom<XRInputSourceArray>,
     // Any promises from calling end()
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     end_promises: DomRefCell<Vec<Rc<Promise>>>,
     /// <https://immersive-web.github.io/webxr/#ended>
     ended: Cell<bool>,
@@ -103,7 +105,8 @@ pub(crate) struct XRSession {
     #[no_trace]
     next_hit_test_id: Cell<HitTestId>,
     #[ignore_malloc_size_of = "defined in webxr"]
-    pending_hit_test_promises: DomRefCell<HashMapTracedValues<HitTestId, Rc<Promise>>>,
+    pending_hit_test_promises:
+        DomRefCell<HashMapTracedValues<HitTestId, Rc<Promise>, FxBuildHasher>>,
     /// Opaque framebuffers need to know the session is "outside of a requestAnimationFrame"
     /// <https://immersive-web.github.io/webxr/#opaque-framebuffer>
     outside_raf: Cell<bool>,
@@ -111,7 +114,7 @@ pub(crate) struct XRSession {
     #[no_trace]
     input_frames: DomRefCell<HashMap<InputId, InputFrame>>,
     framerate: Cell<f32>,
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     update_framerate_promise: DomRefCell<Option<Rc<Promise>>>,
     reference_spaces: DomRefCell<Vec<Dom<XRReferenceSpace>>>,
 }
@@ -142,7 +145,7 @@ impl XRSession {
             end_promises: DomRefCell::new(vec![]),
             ended: Cell::new(false),
             next_hit_test_id: Cell::new(HitTestId(0)),
-            pending_hit_test_promises: DomRefCell::new(HashMapTracedValues::new()),
+            pending_hit_test_promises: DomRefCell::new(HashMapTracedValues::new_fx()),
             outside_raf: Cell::new(true),
             input_frames: DomRefCell::new(HashMap::new()),
             framerate: Cell::new(0.0),
@@ -660,7 +663,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     // https://www.w3.org/TR/webxr/#dom-xrsession-onframeratechange
     event_handler!(frameratechange, GetOnframeratechange, SetOnframeratechange);
 
-    // https://immersive-web.github.io/webxr/#dom-xrsession-renderstate
+    /// <https://immersive-web.github.io/webxr/#dom-xrsession-renderstate>
     fn RenderState(&self) -> DomRoot<XRRenderState> {
         self.active_render_state.get()
     }
@@ -669,24 +672,24 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     fn UpdateRenderState(&self, init: &XRRenderStateInit, _: InRealm) -> ErrorResult {
         // Step 2
         if self.ended.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         // Step 3:
         if let Some(Some(ref layer)) = init.baseLayer {
             if Dom::from_ref(layer.session()) != Dom::from_ref(self) {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             }
         }
 
         // Step 4:
         if init.inlineVerticalFieldOfView.is_some() && self.is_immersive() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // https://immersive-web.github.io/layers/#updaterenderstatechanges
         // Step 1.
         if init.baseLayer.is_some() && (self.has_layers_feature() || init.layers.is_some()) {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
 
         if let Some(Some(ref layers)) = init.layers {
@@ -843,14 +846,14 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
         if !self.is_immersive() &&
             (ty == XRReferenceSpaceType::Bounded_floor || ty == XRReferenceSpaceType::Unbounded)
         {
-            p.reject_error(Error::NotSupported, can_gc);
+            p.reject_error(Error::NotSupported(None), can_gc);
             return p;
         }
 
         match ty {
             XRReferenceSpaceType::Unbounded => {
                 // XXXmsub2 figure out how to support this
-                p.reject_error(Error::NotSupported, can_gc)
+                p.reject_error(Error::NotSupported(None), can_gc)
             },
             ty => {
                 if ty != XRReferenceSpaceType::Viewer &&
@@ -864,7 +867,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                         .iter()
                         .any(|f| *f == s)
                     {
-                        p.reject_error(Error::NotSupported, can_gc);
+                        p.reject_error(Error::NotSupported(None), can_gc);
                         return p;
                     }
                 }
@@ -924,7 +927,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
         p
     }
 
-    // https://immersive-web.github.io/hit-test/#dom-xrsession-requesthittestsource
+    /// <https://immersive-web.github.io/hit-test/#dom-xrsession-requesthittestsource>
     fn RequestHitTestSource(&self, options: &XRHitTestOptionsInit, can_gc: CanGc) -> Rc<Promise> {
         let p = Promise::new(&self.global(), can_gc);
 
@@ -935,7 +938,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
             .iter()
             .any(|f| f == "hit-test")
         {
-            p.reject_error(Error::NotSupported, can_gc);
+            p.reject_error(Error::NotSupported(None), can_gc);
             return p;
         }
 
@@ -999,7 +1002,11 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
     }
 
     /// <https://www.w3.org/TR/webxr/#dom-xrsession-supportedframerates>
-    fn GetSupportedFrameRates(&self, cx: JSContext, can_gc: CanGc) -> Option<Float32Array> {
+    fn GetSupportedFrameRates(
+        &self,
+        cx: JSContext,
+        can_gc: CanGc,
+    ) -> Option<RootedTraceableBox<HeapFloat32Array>> {
         let session = self.session.borrow();
         if self.mode == XRSessionMode::Inline || session.supported_frame_rates().is_empty() {
             None
@@ -1043,7 +1050,7 @@ impl XRSessionMethods<crate::DomTypeHolder> for XRSession {
                 supported_frame_rates.is_empty() ||
                 self.ended.get()
             {
-                promise.reject_error(Error::InvalidState, can_gc);
+                promise.reject_error(Error::InvalidState(None), can_gc);
                 return promise;
             }
 
@@ -1096,7 +1103,7 @@ pub(crate) struct BaseSpace;
 
 pub(crate) type BaseTransform = RigidTransform3D<f32, webxr_api::Native, BaseSpace>;
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn cast_transform<T, U, V, W>(
     transform: RigidTransform3D<f32, T, U>,
 ) -> RigidTransform3D<f32, V, W> {

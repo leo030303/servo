@@ -8,24 +8,23 @@ use std::sync::Arc;
 
 use canvas_traits::canvas::{
     CompositionOptions, CompositionOrBlending, CompositionStyle, FillOrStrokeStyle, FillRule,
-    LineOptions, Path, ShadowOptions,
+    LineOptions, Path, ShadowOptions, TextRun,
 };
 use compositing_traits::SerializableImageData;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
-use fonts::{ByteIndex, FontIdentifier, FontTemplateRefMethods as _};
+use fonts::FontIdentifier;
 use ipc_channel::ipc::IpcSharedMemory;
 use kurbo::Shape;
 use pixels::{Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
-use range::Range;
 use vello_cpu::{kurbo, peniko};
 use webrender_api::{ImageDescriptor, ImageDescriptorFlags};
 
 use crate::backend::{Convert, GenericDrawTarget};
-use crate::canvas_data::{Filter, TextRun};
+use crate::canvas_data::Filter;
 
 thread_local! {
     /// The shared font cache used by all canvases that render on a thread.
-    static SHARED_FONT_CACHE: RefCell<HashMap<FontIdentifier, peniko::Font>> = RefCell::default();
+    static SHARED_FONT_CACHE: RefCell<HashMap<FontIdentifier, peniko::FontData>> = RefCell::default();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
@@ -89,10 +88,13 @@ impl VelloCPUDrawTarget {
                 self.ignore_clips(|self_| {
                     self_.ctx.set_transform(kurbo::Affine::IDENTITY);
                     self_.ctx.set_paint(vello_cpu::Image {
-                        source: vello_cpu::ImageSource::Pixmap(Arc::new(self_.pixmap.clone())),
-                        x_extend: peniko::Extend::Pad,
-                        y_extend: peniko::Extend::Pad,
-                        quality: peniko::ImageQuality::Low,
+                        image: vello_cpu::ImageSource::Pixmap(Arc::new(self_.pixmap.clone())),
+                        sampler: peniko::ImageSampler {
+                            x_extend: peniko::Extend::Pad,
+                            y_extend: peniko::Extend::Pad,
+                            quality: peniko::ImageQuality::Low,
+                            alpha: 1.0,
+                        },
                     });
                     self_.ctx.fill_rect(&kurbo::Rect::from_origin_size(
                         (0., 0.),
@@ -190,10 +192,13 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
             // self_.push_layer(Some(rect.to_path(0.1)), Some(peniko::Compose::Copy.into()), None, None);
 
             self_.ctx.set_paint(vello_cpu::Image {
-                source: vello_cpu::ImageSource::Pixmap(surface),
-                x_extend: peniko::Extend::Pad,
-                y_extend: peniko::Extend::Pad,
-                quality: peniko::ImageQuality::Low,
+                image: vello_cpu::ImageSource::Pixmap(surface),
+                sampler: peniko::ImageSampler {
+                    x_extend: peniko::Extend::Pad,
+                    y_extend: peniko::Extend::Pad,
+                    quality: peniko::ImageQuality::Low,
+                    alpha: 1.0,
+                },
             });
             self_.ctx.fill_rect(&rect);
 
@@ -224,14 +229,17 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
         self.with_composition(composition_options.composition_operation, move |self_| {
             self_.ctx.set_transform(transform.cast().into());
             self_.ctx.set_paint(vello_cpu::Image {
-                source: vello_cpu::ImageSource::Pixmap(surface),
-                x_extend: peniko::Extend::Pad,
-                y_extend: peniko::Extend::Pad,
-                // we should only do bicubic when scaling up
-                quality: if scale_up {
-                    filter.convert()
-                } else {
-                    peniko::ImageQuality::Low
+                image: vello_cpu::ImageSource::Pixmap(surface),
+                sampler: peniko::ImageSampler {
+                    x_extend: peniko::Extend::Pad,
+                    y_extend: peniko::Extend::Pad,
+                    // we should only do bicubic when scaling up
+                    quality: if scale_up {
+                        filter.convert()
+                    } else {
+                        peniko::ImageQuality::Low
+                    },
+                    alpha: 1.0,
                 },
             });
             self_.ctx.set_paint_transform(
@@ -282,7 +290,6 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
     fn fill_text(
         &mut self,
         text_runs: Vec<TextRun>,
-        start: Point2D<f32>,
         style: FillOrStrokeStyle,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
@@ -291,46 +298,32 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
         self.ctx.set_paint(paint(style, composition_options.alpha));
         self.ctx.set_transform(transform.cast().into());
         self.with_composition(composition_options.composition_operation, |self_| {
-            let mut advance = 0.;
-            for run in text_runs.iter() {
-                let glyphs = &run.glyphs;
-
-                let template = &run.font.template;
-
+            for text_run in text_runs.iter() {
                 SHARED_FONT_CACHE.with(|font_cache| {
-                    let identifier = template.identifier();
-                    if !font_cache.borrow().contains_key(&identifier) {
-                        let Ok(font) = run.font.font_data_and_index() else {
+                    let identifier = &text_run.font.identifier;
+                    if !font_cache.borrow().contains_key(identifier) {
+                        let Some(font_data_and_index) = text_run.font.font_data_and_index() else {
                             return;
                         };
-                        let font = font.clone().convert();
+                        let font = font_data_and_index.convert();
                         font_cache.borrow_mut().insert(identifier.clone(), font);
                     }
 
                     let font_cache = font_cache.borrow();
-                    let Some(font) = font_cache.get(&identifier) else {
+                    let Some(font) = font_cache.get(identifier) else {
                         return;
                     };
-
                     self_
                         .ctx
                         .glyph_run(font)
-                        .font_size(run.font.descriptor.pt_size.to_f32_px())
-                        .fill_glyphs(
-                            glyphs
-                                .iter_glyphs_for_byte_range(&Range::new(ByteIndex(0), glyphs.len()))
-                                .map(|glyph| {
-                                    let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
-                                    let x = advance + start.x + glyph_offset.x.to_f32_px();
-                                    let y = start.y + glyph_offset.y.to_f32_px();
-                                    advance += glyph.advance().to_f32_px();
-                                    vello_cpu::Glyph {
-                                        id: glyph.id(),
-                                        x,
-                                        y,
-                                    }
-                                }),
-                        );
+                        .font_size(text_run.pt_size)
+                        .fill_glyphs(text_run.glyphs_and_positions.iter().map(
+                            |glyph_and_position| vello_cpu::Glyph {
+                                id: glyph_and_position.id,
+                                x: glyph_and_position.point.x,
+                                y: glyph_and_position.point.y,
+                            },
+                        ));
                 });
             }
         })
@@ -400,6 +393,50 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
         })
     }
 
+    fn stroke_text(
+        &mut self,
+        text_runs: Vec<TextRun>,
+        style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        self.ensure_drawing();
+        self.ctx.set_paint(paint(style, composition_options.alpha));
+        self.ctx.set_stroke(line_options.convert());
+        self.ctx.set_transform(transform.cast().into());
+        self.with_composition(composition_options.composition_operation, |self_| {
+            for text_run in text_runs.iter() {
+                SHARED_FONT_CACHE.with(|font_cache| {
+                    let identifier = &text_run.font.identifier;
+                    if !font_cache.borrow().contains_key(identifier) {
+                        let Some(font_data_and_index) = text_run.font.font_data_and_index() else {
+                            return;
+                        };
+                        let font = font_data_and_index.convert();
+                        font_cache.borrow_mut().insert(identifier.clone(), font);
+                    }
+
+                    let font_cache = font_cache.borrow();
+                    let Some(font) = font_cache.get(identifier) else {
+                        return;
+                    };
+                    self_
+                        .ctx
+                        .glyph_run(font)
+                        .font_size(text_run.pt_size)
+                        .stroke_glyphs(text_run.glyphs_and_positions.iter().map(
+                            |glyph_and_position| vello_cpu::Glyph {
+                                id: glyph_and_position.id,
+                                x: glyph_and_position.point.x,
+                                y: glyph_and_position.point.y,
+                            },
+                        ));
+                });
+            }
+        })
+    }
+
     fn stroke_rect(
         &mut self,
         rect: &Rect<f32>,
@@ -456,16 +493,17 @@ impl GenericDrawTarget for VelloCPUDrawTarget {
     }
 }
 
-fn snapshot_as_pixmap(data: Snapshot) -> Arc<vello_cpu::Pixmap> {
-    let size = data.size().cast();
-    let (data, _, _) = data.to_vec(
-        Some(SnapshotAlphaMode::Transparent {
+fn snapshot_as_pixmap(mut snapshot: Snapshot) -> Arc<vello_cpu::Pixmap> {
+    let size = snapshot.size().cast();
+    snapshot.transform(
+        SnapshotAlphaMode::Transparent {
             premultiplied: true,
-        }),
-        Some(SnapshotPixelFormat::RGBA),
+        },
+        SnapshotPixelFormat::RGBA,
     );
+
     Arc::new(vello_cpu::Pixmap::from_parts(
-        bytemuck::cast_vec(data),
+        bytemuck::cast_vec(snapshot.into()),
         size.width,
         size.height,
     ))
@@ -498,18 +536,21 @@ impl Convert<vello_cpu::PaintType> for FillOrStrokeStyle {
             Surface(surface_style) => {
                 let pixmap = snapshot_as_pixmap(surface_style.surface_data.to_owned());
                 vello_cpu::PaintType::Image(vello_cpu::Image {
-                    source: vello_cpu::ImageSource::Pixmap(pixmap),
-                    x_extend: if surface_style.repeat_x {
-                        peniko::Extend::Repeat
-                    } else {
-                        peniko::Extend::Pad
+                    image: vello_cpu::ImageSource::Pixmap(pixmap),
+                    sampler: peniko::ImageSampler {
+                        x_extend: if surface_style.repeat_x {
+                            peniko::Extend::Repeat
+                        } else {
+                            peniko::Extend::Pad
+                        },
+                        y_extend: if surface_style.repeat_y {
+                            peniko::Extend::Repeat
+                        } else {
+                            peniko::Extend::Pad
+                        },
+                        quality: peniko::ImageQuality::Low,
+                        alpha: 1.0,
                     },
-                    y_extend: if surface_style.repeat_y {
-                        peniko::Extend::Repeat
-                    } else {
-                        peniko::Extend::Pad
-                    },
-                    quality: peniko::ImageQuality::Low,
                 })
             },
         }
@@ -530,7 +571,7 @@ fn paint(style: FillOrStrokeStyle, alpha: f64) -> vello_cpu::PaintType {
                 vello_cpu::PaintType::Gradient(gradient.multiply_alpha(alpha as f32))
             },
             vello_cpu::PaintType::Image(mut image) => {
-                match &mut image.source {
+                match &mut image.image {
                     vello_cpu::ImageSource::Pixmap(pixmap) => Arc::get_mut(pixmap)
                         .expect("pixmap should not be shared with anyone at this point")
                         .multiply_alpha((alpha * 255.0) as u8),

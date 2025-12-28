@@ -55,24 +55,24 @@ impl Client {
         self.active_worker.get()
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn set_controller(&self, worker: &ServiceWorker) {
         self.active_worker.set(Some(worker));
     }
 }
 
 impl ClientMethods<crate::DomTypeHolder> for Client {
-    // https://w3c.github.io/ServiceWorker/#client-url-attribute
+    /// <https://w3c.github.io/ServiceWorker/#client-url-attribute>
     fn Url(&self) -> USVString {
         USVString(self.url.as_str().to_owned())
     }
 
-    // https://w3c.github.io/ServiceWorker/#client-frametype
+    /// <https://w3c.github.io/ServiceWorker/#client-frametype>
     fn FrameType(&self) -> FrameType {
         self.frame_type
     }
 
-    // https://w3c.github.io/ServiceWorker/#client-id
+    /// <https://w3c.github.io/ServiceWorker/#client-id>
     fn Id(&self) -> DOMString {
         let uid_str = format!("{}", self.id);
         DOMString::from_string(uid_str)

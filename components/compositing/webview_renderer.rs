@@ -2,9 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::collections::hash_map::{Entry, Keys};
+use std::cell::Cell;
+use std::collections::hash_map::Entry;
 use std::rc::Rc;
 
 use base::id::{PipelineId, WebViewId};
@@ -14,39 +13,45 @@ use compositing_traits::viewport_description::{
 };
 use compositing_traits::{PipelineExitSource, SendableFrameTree, WebViewTrait};
 use constellation_traits::{EmbedderToConstellationMessage, WindowSizeType};
+use crossbeam_channel::Sender;
 use embedder_traits::{
-    AnimationState, CompositorHitTestResult, InputEvent, MouseButton, MouseButtonAction,
-    MouseButtonEvent, MouseMoveEvent, ScrollEvent as EmbedderScrollEvent, ShutdownState,
-    TouchEvent, TouchEventResult, TouchEventType, TouchId, ViewportDetails,
+    AnimationState, InputEvent, InputEventAndId, InputEventId, InputEventResult, MouseButton,
+    MouseButtonAction, MouseButtonEvent, MouseMoveEvent, PaintHitTestResult, Scroll,
+    ScrollEvent as EmbedderScrollEvent, TouchEvent, TouchEventType, ViewportDetails, WebViewPoint,
+    WheelEvent,
 };
-use euclid::{Point2D, Scale, Vector2D};
-use fnv::FnvHashSet;
+use euclid::{Scale, Vector2D};
 use log::{debug, warn};
 use malloc_size_of::MallocSizeOf;
+use rustc_hash::FxHashMap;
 use servo_geometry::DeviceIndependentPixel;
-use style_traits::{CSSPixel, PinchZoomFactor};
-use webrender_api::units::{DeviceIntPoint, DevicePixel, DevicePoint, DeviceRect, LayoutVector2D};
-use webrender_api::{ExternalScrollId, HitTestFlags, ScrollLocation};
+use style_traits::CSSPixel;
+use webrender::RenderApi;
+use webrender_api::units::{DevicePixel, DevicePoint, DeviceRect, DeviceVector2D, LayoutVector2D};
+use webrender_api::{DocumentId, ExternalScrollId, ScrollLocation};
 
-use crate::compositor::{PipelineDetails, ServoRenderer};
-use crate::touch::{TouchHandler, TouchMoveAction, TouchMoveAllowed, TouchSequenceState};
+use crate::paint::RepaintReason;
+use crate::painter::Painter;
+use crate::pinch_zoom::PinchZoom;
+use crate::pipeline_details::PipelineDetails;
+use crate::refresh_driver::BaseRefreshDriver;
+use crate::touch::{PendingTouchInputEvent, TouchHandler, TouchMoveAllowed, TouchSequenceState};
 
 #[derive(Clone, Copy)]
-struct ScrollEvent {
+pub(crate) struct ScrollEvent {
     /// Scroll by this offset, or to Start or End
-    scroll_location: ScrollLocation,
-    /// Apply changes to the frame at this location
-    cursor: DeviceIntPoint,
+    pub scroll: Scroll,
+    /// Scroll the scroll node that is found at this point.
+    pub point: DevicePoint,
     /// The number of OS events that have been coalesced together into this one event.
-    event_count: u32,
+    pub event_count: u32,
 }
 
 #[derive(Clone, Copy)]
-enum ScrollZoomEvent {
-    /// A pinch zoom event that magnifies the view by the given factor.
-    PinchZoom(f32),
-    /// A zoom event that establishes the initial zoom from the viewport meta tag.
-    InitialViewportZoom(f32),
+pub(crate) enum ScrollZoomEvent {
+    /// A pinch zoom event that magnifies the view by the given factor from the given
+    /// center point.
+    PinchZoom(f32, DevicePoint),
     /// A scroll event that scrolls the scroll node at the given location by the
     /// given amount.
     Scroll(ScrollEvent),
@@ -54,7 +59,11 @@ enum ScrollZoomEvent {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ScrollResult {
-    pub hit_test_result: CompositorHitTestResult,
+    pub hit_test_result: PaintHitTestResult,
+    /// The [`ExternalScrollId`] of the node that was actually scrolled.
+    ///
+    /// Note that this is an inclusive ancestor of `external_scroll_id` in
+    /// [`Self::hit_test_result`].
     pub external_scroll_id: ExternalScrollId,
     pub offset: LayoutVector2D,
 }
@@ -79,52 +88,83 @@ pub(crate) struct WebViewRenderer {
     pub root_pipeline_id: Option<PipelineId>,
     /// The rectangle of the [`WebView`] in device pixels, which is the viewport.
     pub rect: DeviceRect,
-    /// Tracks details about each active pipeline that the compositor knows about.
-    pub pipelines: HashMap<PipelineId, PipelineDetails>,
-    /// Data that is shared by all WebView renderers.
-    pub(crate) global: Rc<RefCell<ServoRenderer>>,
+    /// Tracks details about each active pipeline that `Paint` knows about.
+    pub pipelines: FxHashMap<PipelineId, PipelineDetails>,
     /// Pending scroll/zoom events.
     pending_scroll_zoom_events: Vec<ScrollZoomEvent>,
+    /// A map of pending wheel events. These are events that have been sent to script,
+    /// but are waiting for processing. When they are handled by script, they may trigger
+    /// scroll events depending on whether `preventDefault()` was called on the event.
+    pending_wheel_events: FxHashMap<InputEventId, WheelEvent>,
     /// Touch input state machine
     touch_handler: TouchHandler,
     /// "Desktop-style" zoom that resizes the viewport to fit the window.
     pub page_zoom: Scale<f32, CSSPixel, DeviceIndependentPixel>,
-    /// "Mobile-style" zoom that does not reflow the page.
-    pinch_zoom: PinchZoomFactor,
+    /// "Mobile-style" zoom that does not reflow the page. When there is no [`PinchZoom`] a
+    /// zoom factor of 1.0 is implied and the [`PinchZoom::transform`] will be the identity.
+    pinch_zoom: PinchZoom,
     /// The HiDPI scale factor for the `WebView` associated with this renderer. This is controlled
     /// by the embedding layer.
     hidpi_scale_factor: Scale<f32, DeviceIndependentPixel, DevicePixel>,
+    /// Whether or not this [`WebViewRenderer`] is hidden.
+    hidden: bool,
     /// Whether or not this [`WebViewRenderer`] isn't throttled and has a pipeline with
     /// active animations or animation frame callbacks.
     animating: bool,
     /// A [`ViewportDescription`] for this [`WebViewRenderer`], which contains the limitations
     /// and initial values for zoom derived from the `viewport` meta tag in web content.
     viewport_description: Option<ViewportDescription>,
+
+    //
+    // Data that is shared with the parent renderer.
+    //
+    /// The channel on which messages can be sent to the constellation.
+    embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
+    /// The [`BaseRefreshDriver`] which manages the painting of `WebView`s during animations.
+    refresh_driver: Rc<BaseRefreshDriver>,
+    /// The active webrender document.
+    webrender_document: DocumentId,
 }
 
 impl WebViewRenderer {
     pub(crate) fn new(
-        global: Rc<RefCell<ServoRenderer>>,
         renderer_webview: Box<dyn WebViewTrait>,
         viewport_details: ViewportDetails,
+        embedder_to_constellation_sender: Sender<EmbedderToConstellationMessage>,
+        refresh_driver: Rc<BaseRefreshDriver>,
+        webrender_document: DocumentId,
     ) -> Self {
         let hidpi_scale_factor = viewport_details.hidpi_scale_factor;
         let size = viewport_details.size * viewport_details.hidpi_scale_factor;
+        let rect = DeviceRect::from_origin_and_size(DevicePoint::origin(), size);
+        let webview_id = renderer_webview.id();
         Self {
-            id: renderer_webview.id(),
+            id: webview_id,
             webview: renderer_webview,
             root_pipeline_id: None,
-            rect: DeviceRect::from_origin_and_size(DevicePoint::origin(), size),
+            rect,
             pipelines: Default::default(),
-            touch_handler: TouchHandler::new(),
-            global,
+            touch_handler: TouchHandler::new(webview_id),
             pending_scroll_zoom_events: Default::default(),
+            pending_wheel_events: Default::default(),
             page_zoom: DEFAULT_PAGE_ZOOM,
-            pinch_zoom: PinchZoomFactor::new(1.0),
+            pinch_zoom: PinchZoom::new(rect),
             hidpi_scale_factor: Scale::new(hidpi_scale_factor.0),
+            hidden: false,
             animating: false,
             viewport_description: None,
+            embedder_to_constellation_sender,
+            refresh_driver,
+            webrender_document,
         }
+    }
+
+    fn hit_test(&self, webrender_api: &RenderApi, point: DevicePoint) -> Vec<PaintHitTestResult> {
+        Painter::hit_test_at_point_with_api_and_document(
+            webrender_api,
+            self.webrender_document,
+            point,
+        )
     }
 
     pub(crate) fn animation_callbacks_running(&self) -> bool {
@@ -133,12 +173,19 @@ impl WebViewRenderer {
             .any(PipelineDetails::animation_callbacks_running)
     }
 
-    pub(crate) fn pipeline_ids(&self) -> Keys<'_, PipelineId, PipelineDetails> {
-        self.pipelines.keys()
-    }
-
     pub(crate) fn animating(&self) -> bool {
         self.animating
+    }
+
+    pub(crate) fn hidden(&self) -> bool {
+        self.hidden
+    }
+
+    /// Set whether this [`WebViewRenderer`] is in the hidden state or not. Return `true` if the
+    /// value changed or `false` otherwise.
+    pub(crate) fn set_hidden(&mut self, new_value: bool) -> bool {
+        let old_value = std::mem::replace(&mut self.hidden, new_value);
+        new_value != old_value
     }
 
     /// Returns the [`PipelineDetails`] for the given [`PipelineId`], creating it if needed.
@@ -181,8 +228,6 @@ impl WebViewRenderer {
         }
 
         self.set_frame_tree_on_pipeline_details(frame_tree, None);
-        self.reset_scroll_tree_for_unattached_pipelines(frame_tree);
-        self.send_scroll_positions_to_layout_for_pipeline(pipeline_id);
     }
 
     pub(crate) fn send_scroll_positions_to_layout_for_pipeline(&self, pipeline_id: PipelineId) {
@@ -200,7 +245,7 @@ impl WebViewRenderer {
             return;
         }
 
-        let _ = self.global.borrow().constellation_sender.send(
+        let _ = self.embedder_to_constellation_sender.send(
             EmbedderToConstellationMessage::SetScrollStates(pipeline_id, scroll_offsets),
         );
     }
@@ -218,32 +263,6 @@ impl WebViewRenderer {
         for kid in &frame_tree.children {
             self.set_frame_tree_on_pipeline_details(kid, Some(pipeline_id));
         }
-    }
-
-    pub(crate) fn reset_scroll_tree_for_unattached_pipelines(
-        &mut self,
-        frame_tree: &SendableFrameTree,
-    ) {
-        // TODO(mrobinson): Eventually this can selectively preserve the scroll trees
-        // state for some unattached pipelines in order to preserve scroll position when
-        // navigating backward and forward.
-        fn collect_pipelines(
-            pipelines: &mut FnvHashSet<PipelineId>,
-            frame_tree: &SendableFrameTree,
-        ) {
-            pipelines.insert(frame_tree.pipeline.id);
-            for kid in &frame_tree.children {
-                collect_pipelines(pipelines, kid);
-            }
-        }
-
-        let mut attached_pipelines: FnvHashSet<PipelineId> = FnvHashSet::default();
-        collect_pipelines(&mut attached_pipelines, frame_tree);
-
-        self.pipelines
-            .iter_mut()
-            .filter(|(id, _)| !attached_pipelines.contains(id))
-            .for_each(|(_, details)| details.scroll_tree.reset_all_scroll_offsets());
     }
 
     /// Sets or unsets the animations-running flag for the given pipeline. Returns
@@ -303,26 +322,37 @@ impl WebViewRenderer {
         self.webview.set_animating(self.animating());
     }
 
-    /// On a Window refresh tick (e.g. vsync)
-    pub(crate) fn on_vsync(&mut self) {
-        if let Some(fling_action) = self.touch_handler.on_vsync() {
-            self.on_scroll_window_event(
-                ScrollLocation::Delta(-fling_action.delta),
-                fling_action.cursor,
-            );
-        }
+    /// Update touch-based animations (currently just fling) during a `RefreshDriver`-based
+    /// frame tick. Returns `true` if we should continue observing frames (the fling is ongoing)
+    /// or `false` if we should stop observing frames (the fling has finished).
+    pub(crate) fn update_touch_handling_at_new_frame_start(&mut self) -> bool {
+        let Some(fling_action) = self.touch_handler.notify_new_frame_start() else {
+            return false;
+        };
+
+        self.on_scroll_window_event(
+            Scroll::Delta((-fling_action.delta).into()),
+            fling_action.cursor,
+        );
+        true
     }
 
-    pub(crate) fn dispatch_input_event_with_hit_testing(&self, mut event: InputEvent) -> bool {
-        let event_point = event.point();
+    fn dispatch_input_event_with_hit_testing(
+        &mut self,
+        render_api: &RenderApi,
+        event: InputEventAndId,
+    ) -> bool {
+        let event_point = event
+            .event
+            .point()
+            .map(|point| point.as_device_point(self.device_pixels_per_page_pixel()));
         let hit_test_result = match event_point {
             Some(point) => {
-                let hit_test_result = self
-                    .global
-                    .borrow()
-                    .hit_test_at_point(point)
-                    .into_iter()
-                    .nth(0);
+                let hit_test_result = match event.event {
+                    InputEvent::Touch(_) => self.touch_handler.get_hit_test_result_cache_value(),
+                    _ => None,
+                }
+                .or_else(|| self.hit_test(render_api, point).into_iter().nth(0));
                 if hit_test_result.is_none() {
                     warn!("Empty hit test result for input event, ignoring.");
                     return false;
@@ -332,21 +362,7 @@ impl WebViewRenderer {
             None => None,
         };
 
-        match event {
-            InputEvent::Touch(ref mut touch_event) => {
-                touch_event.init_sequence_id(self.touch_handler.current_sequence_id);
-            },
-            InputEvent::MouseMove(_) => {
-                self.global.borrow_mut().last_mouse_move_position = event_point;
-            },
-            InputEvent::MouseLeftViewport(_) => {
-                self.global.borrow_mut().last_mouse_move_position = None;
-            },
-            InputEvent::MouseButton(_) | InputEvent::Wheel(_) => {},
-            _ => unreachable!("Unexpected input event type: {event:?}"),
-        }
-
-        if let Err(error) = self.global.borrow().constellation_sender.send(
+        if let Err(error) = self.embedder_to_constellation_sender.send(
             EmbedderToConstellationMessage::ForwardInputEvent(self.id, event, hit_test_result),
         ) {
             warn!("Sending event to constellation failed ({error:?}).");
@@ -356,100 +372,87 @@ impl WebViewRenderer {
         }
     }
 
-    pub(crate) fn notify_input_event(&mut self, event: InputEvent) {
-        if self.global.borrow().shutdown_state() != ShutdownState::NotShuttingDown {
+    pub(crate) fn notify_input_event(
+        &mut self,
+        render_api: &RenderApi,
+        repaint_reason: &Cell<RepaintReason>,
+        event_and_id: InputEventAndId,
+    ) {
+        if let InputEvent::Touch(touch_event) = event_and_id.event {
+            self.on_touch_event(render_api, repaint_reason, touch_event, event_and_id.id);
             return;
         }
 
-        if let InputEvent::Touch(event) = event {
-            self.on_touch_event(event);
-            return;
+        if let InputEvent::Wheel(wheel_event) = event_and_id.event {
+            self.pending_wheel_events
+                .insert(event_and_id.id, wheel_event);
         }
 
-        if self.global.borrow().convert_mouse_to_touch {
-            match event {
-                InputEvent::MouseButton(event) => {
-                    match (event.button, event.action) {
-                        (MouseButton::Left, MouseButtonAction::Down) => self.on_touch_down(
-                            TouchEvent::new(TouchEventType::Down, TouchId(0), event.point),
-                        ),
-                        (MouseButton::Left, MouseButtonAction::Up) => self.on_touch_up(
-                            TouchEvent::new(TouchEventType::Up, TouchId(0), event.point),
-                        ),
-                        _ => {},
-                    }
-                    return;
-                },
-                InputEvent::MouseMove(event) => {
-                    if let Some(state) = self.touch_handler.try_get_current_touch_sequence() {
-                        // We assume that the debug option `-Z convert-mouse-to-touch` will only
-                        // be used on devices without native touch input, so we can directly
-                        // reuse the touch handler for tracking the state of pressed buttons.
-                        match state.state {
-                            TouchSequenceState::Touching | TouchSequenceState::Panning { .. } => {
-                                self.on_touch_move(TouchEvent::new(
-                                    TouchEventType::Move,
-                                    TouchId(0),
-                                    event.point,
-                                ));
-                            },
-                            TouchSequenceState::MultiTouch => {
-                                // Multitouch simulation currently is not implemented.
-                                // Since we only get one mouse move event, we would need to
-                                // dispatch one mouse move event per currently pressed mouse button.
-                            },
-                            TouchSequenceState::Pinching => {
-                                // We only have one mouse button, so Pinching should be impossible.
-                                #[cfg(debug_assertions)]
-                                log::error!(
-                                    "Touch handler is in Pinching state, which should be unreachable with \
-                                -Z convert-mouse-to-touch debug option."
-                                );
-                            },
-                            TouchSequenceState::PendingFling { .. } |
-                            TouchSequenceState::Flinging { .. } |
-                            TouchSequenceState::PendingClick(_) |
-                            TouchSequenceState::Finished => {
-                                // Mouse movement without a button being pressed is not
-                                // translated to touch events.
-                            },
-                        }
-                    }
-                    // We don't want to (directly) dispatch mouse events when simulating touch input.
-                    return;
-                },
-                _ => {},
-            }
-        }
-
-        self.dispatch_input_event_with_hit_testing(event);
+        self.dispatch_input_event_with_hit_testing(render_api, event_and_id);
     }
 
-    fn send_touch_event(&mut self, event: TouchEvent) -> bool {
-        self.dispatch_input_event_with_hit_testing(InputEvent::Touch(event))
-    }
+    fn send_touch_event(
+        &mut self,
+        render_api: &RenderApi,
+        event: TouchEvent,
+        id: InputEventId,
+    ) -> bool {
+        let cancelable = event.is_cancelable();
+        let event_type = event.event_type;
 
-    pub(crate) fn on_touch_event(&mut self, event: TouchEvent) {
-        if self.global.borrow().shutdown_state() != ShutdownState::NotShuttingDown {
-            return;
+        let input_event_and_id = InputEventAndId {
+            event: InputEvent::Touch(event),
+            id,
+        };
+
+        let result = self.dispatch_input_event_with_hit_testing(render_api, input_event_and_id);
+
+        // We only post-process events that are actually cancelable. Uncancelable ones
+        // are processed immediately and can be ignored once they have been sent to the
+        // Constellation.
+        if cancelable && result {
+            self.touch_handler
+                .add_pending_touch_input_event(id, event_type);
         }
 
+        result
+    }
+
+    pub(crate) fn on_touch_event(
+        &mut self,
+        render_api: &RenderApi,
+        repaint_reason: &Cell<RepaintReason>,
+        event: TouchEvent,
+        id: InputEventId,
+    ) {
         match event.event_type {
-            TouchEventType::Down => self.on_touch_down(event),
-            TouchEventType::Move => self.on_touch_move(event),
-            TouchEventType::Up => self.on_touch_up(event),
-            TouchEventType::Cancel => self.on_touch_cancel(event),
+            TouchEventType::Down => self.on_touch_down(render_api, event, id),
+            TouchEventType::Move => self.on_touch_move(render_api, event, id),
+            TouchEventType::Up => self.on_touch_up(render_api, event, id),
+            TouchEventType::Cancel => self.on_touch_cancel(render_api, event, id),
         }
+
+        self.touch_handler
+            .add_touch_move_refresh_observer_if_necessary(
+                self.refresh_driver.clone(),
+                repaint_reason,
+            );
     }
 
-    fn on_touch_down(&mut self, event: TouchEvent) {
-        self.touch_handler.on_touch_down(event.id, event.point);
-        self.send_touch_event(event);
+    fn on_touch_down(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) {
+        let point = event
+            .point
+            .as_device_point(self.device_pixels_per_page_pixel());
+        self.touch_handler.on_touch_down(event.id, point);
+        self.send_touch_event(render_api, event, id);
     }
 
-    fn on_touch_move(&mut self, mut event: TouchEvent) {
-        let action: TouchMoveAction = self.touch_handler.on_touch_move(event.id, event.point);
-        if TouchMoveAction::NoAction != action {
+    fn on_touch_move(&mut self, render_api: &RenderApi, mut event: TouchEvent, id: InputEventId) {
+        let point = event
+            .point
+            .as_device_point(self.device_pixels_per_page_pixel());
+        let action = self.touch_handler.on_touch_move(event.id, point);
+        if let Some(action) = action {
             // if first move processed and allowed, we directly process the move event,
             // without waiting for the script handler.
             if self
@@ -458,30 +461,7 @@ impl WebViewRenderer {
             {
                 // https://w3c.github.io/touch-events/#cancelability
                 event.disable_cancelable();
-                match action {
-                    TouchMoveAction::Scroll(delta, point) => self.on_scroll_window_event(
-                        ScrollLocation::Delta(LayoutVector2D::from_untyped(delta.to_untyped())),
-                        point.cast(),
-                    ),
-                    TouchMoveAction::Zoom(magnification, scroll_delta) => {
-                        let cursor = Point2D::new(-1, -1); // Make sure this hits the base layer.
-
-                        // The order of these events doesn't matter, because zoom is handled by
-                        // a root display list and the scroll event here is handled by the scroll
-                        // applied to the content display list.
-                        self.pending_scroll_zoom_events
-                            .push(ScrollZoomEvent::PinchZoom(magnification));
-                        self.pending_scroll_zoom_events
-                            .push(ScrollZoomEvent::Scroll(ScrollEvent {
-                                scroll_location: ScrollLocation::Delta(
-                                    LayoutVector2D::from_untyped(scroll_delta.to_untyped()),
-                                ),
-                                cursor,
-                                event_count: 1,
-                            }));
-                    },
-                    _ => {},
-                }
+                self.pending_scroll_zoom_events.push(action);
             }
             // When the event is touchmove, if the script thread is processing the touch
             // move event, we skip sending the event to the script thread.
@@ -489,7 +469,7 @@ impl WebViewRenderer {
             if !self
                 .touch_handler
                 .is_handling_touch_move(self.touch_handler.current_sequence_id) &&
-                self.send_touch_event(event) &&
+                self.send_touch_event(render_api, event, id) &&
                 event.is_cancelable()
             {
                 self.touch_handler
@@ -498,229 +478,206 @@ impl WebViewRenderer {
         }
     }
 
-    fn on_touch_up(&mut self, event: TouchEvent) {
-        self.touch_handler.on_touch_up(event.id, event.point);
-        self.send_touch_event(event);
+    fn on_touch_up(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) {
+        let point = event
+            .point
+            .as_device_point(self.device_pixels_per_page_pixel());
+        self.touch_handler.on_touch_up(event.id, point);
+        self.send_touch_event(render_api, event, id);
     }
 
-    fn on_touch_cancel(&mut self, event: TouchEvent) {
-        // Send the event to script.
-        self.touch_handler.on_touch_cancel(event.id, event.point);
-        self.send_touch_event(event);
+    fn on_touch_cancel(&mut self, render_api: &RenderApi, event: TouchEvent, id: InputEventId) {
+        let point = event
+            .point
+            .as_device_point(self.device_pixels_per_page_pixel());
+        self.touch_handler.on_touch_cancel(event.id, point);
+        self.send_touch_event(render_api, event, id);
     }
 
-    pub(crate) fn on_touch_event_processed(&mut self, result: TouchEventResult) {
-        match result {
-            TouchEventResult::DefaultPrevented(sequence_id, event_type) => {
-                debug!(
-                    "Touch event {:?} in sequence {:?} prevented!",
-                    event_type, sequence_id
-                );
-                match event_type {
-                    TouchEventType::Down => {
-                        // prevents both click and move
-                        self.touch_handler.prevent_click(sequence_id);
-                        self.touch_handler.prevent_move(sequence_id);
-                        self.touch_handler
-                            .remove_pending_touch_move_action(sequence_id);
-                    },
-                    TouchEventType::Move => {
-                        // script thread processed the touch move event, mark this false.
-                        if let Some(info) = self.touch_handler.get_touch_sequence_mut(sequence_id) {
-                            info.prevent_move = TouchMoveAllowed::Prevented;
-                            if let TouchSequenceState::PendingFling { .. } = info.state {
-                                info.state = TouchSequenceState::Finished;
-                            }
-                            self.touch_handler.set_handling_touch_move(
-                                self.touch_handler.current_sequence_id,
-                                false,
-                            );
-                            self.touch_handler
-                                .remove_pending_touch_move_action(sequence_id);
-                        }
-                    },
-                    TouchEventType::Up => {
-                        // Note: We don't have to consider PendingFling here, since we handle that
-                        // in the DefaultAllowed case of the touch_move event.
-                        // Note: Removing can and should fail, if we still have an active Fling,
-                        let Some(info) =
-                            &mut self.touch_handler.get_touch_sequence_mut(sequence_id)
-                        else {
-                            // The sequence ID could already be removed, e.g. if Fling finished,
-                            // before the touch_up event was handled (since fling can start
-                            // immediately if move was previously allowed, and clicks are anyway not
-                            // happening from fling).
-                            return;
-                        };
-                        match info.state {
-                            TouchSequenceState::PendingClick(_) => {
-                                info.state = TouchSequenceState::Finished;
-                                self.touch_handler.remove_touch_sequence(sequence_id);
-                            },
-                            TouchSequenceState::Flinging { .. } => {
-                                // We can't remove the touch sequence yet
-                            },
-                            TouchSequenceState::Finished => {
-                                self.touch_handler.remove_touch_sequence(sequence_id);
-                            },
-                            TouchSequenceState::Touching |
-                            TouchSequenceState::Panning { .. } |
-                            TouchSequenceState::Pinching |
-                            TouchSequenceState::MultiTouch |
-                            TouchSequenceState::PendingFling { .. } => {
-                                // It's possible to transition from Pinch to pan, Which means that
-                                // a touch_up event for a pinch might have arrived here, but we
-                                // already transitioned to pan or even PendingFling.
-                                // We don't need to do anything in these cases though.
-                            },
-                        }
-                    },
-                    TouchEventType::Cancel => {
-                        // We could still have pending event handlers, so we remove the pending
-                        // actions, and try to remove the touch sequence.
-                        self.touch_handler
-                            .remove_pending_touch_move_action(sequence_id);
-                        self.touch_handler.try_remove_touch_sequence(sequence_id);
-                    },
-                }
-            },
-            TouchEventResult::DefaultAllowed(sequence_id, event_type) => {
-                debug!(
-                    "Touch event {:?} in sequence {:?} allowed",
-                    event_type, sequence_id
-                );
-                match event_type {
-                    TouchEventType::Down => {},
-                    TouchEventType::Move => {
-                        if let Some(action) =
-                            self.touch_handler.pending_touch_move_action(sequence_id)
-                        {
-                            match action {
-                                TouchMoveAction::Scroll(delta, point) => self
-                                    .on_scroll_window_event(
-                                        ScrollLocation::Delta(LayoutVector2D::from_untyped(
-                                            delta.to_untyped(),
-                                        )),
-                                        point.cast(),
-                                    ),
-                                TouchMoveAction::Zoom(magnification, scroll_delta) => {
-                                    let cursor = Point2D::new(-1, -1);
-                                    // Make sure this hits the base layer.
-                                    // The order of these events doesn't matter, because zoom is handled by
-                                    // a root display list and the scroll event here is handled by the scroll
-                                    // applied to the content display list.
-                                    self.pending_scroll_zoom_events
-                                        .push(ScrollZoomEvent::PinchZoom(magnification));
-                                    self.pending_scroll_zoom_events
-                                        .push(ScrollZoomEvent::Scroll(ScrollEvent {
-                                            scroll_location: ScrollLocation::Delta(
-                                                LayoutVector2D::from_untyped(
-                                                    scroll_delta.to_untyped(),
-                                                ),
-                                            ),
-                                            cursor,
-                                            event_count: 1,
-                                        }));
-                                },
-                                TouchMoveAction::NoAction => {
-                                    // This shouldn't happen, but we can also just ignore it.
-                                },
-                            }
-                            self.touch_handler
-                                .remove_pending_touch_move_action(sequence_id);
+    fn on_touch_event_processed(
+        &mut self,
+        render_api: &RenderApi,
+        pending_touch_input_event: PendingTouchInputEvent,
+        result: InputEventResult,
+    ) {
+        let PendingTouchInputEvent {
+            sequence_id,
+            event_type,
+        } = pending_touch_input_event;
+
+        if result.contains(InputEventResult::DefaultPrevented) {
+            debug!(
+                "Touch event {:?} in sequence {:?} prevented!",
+                event_type, sequence_id
+            );
+            match event_type {
+                TouchEventType::Down => {
+                    // prevents both click and move
+                    self.touch_handler.prevent_click(sequence_id);
+                    self.touch_handler.prevent_move(sequence_id);
+                    self.touch_handler
+                        .remove_pending_touch_move_actions(sequence_id);
+                },
+                TouchEventType::Move => {
+                    // script thread processed the touch move event, mark this false.
+                    if let Some(info) = self.touch_handler.get_touch_sequence_mut(sequence_id) {
+                        info.prevent_move = TouchMoveAllowed::Prevented;
+                        if let TouchSequenceState::PendingFling { .. } = info.state {
+                            info.state = TouchSequenceState::Finished;
                         }
                         self.touch_handler
                             .set_handling_touch_move(self.touch_handler.current_sequence_id, false);
-                        if let Some(info) = self.touch_handler.get_touch_sequence_mut(sequence_id) {
-                            if info.prevent_move == TouchMoveAllowed::Pending {
-                                info.prevent_move = TouchMoveAllowed::Allowed;
-                                if let TouchSequenceState::PendingFling { velocity, cursor } =
-                                    info.state
-                                {
-                                    info.state = TouchSequenceState::Flinging { velocity, cursor }
-                                }
+                        self.touch_handler
+                            .remove_pending_touch_move_actions(sequence_id);
+                    }
+                },
+                TouchEventType::Up => {
+                    // Note: We don't have to consider PendingFling here, since we handle that
+                    // in the DefaultAllowed case of the touch_move event.
+                    // Note: Removing can and should fail, if we still have an active Fling,
+                    let Some(info) = &mut self.touch_handler.get_touch_sequence_mut(sequence_id)
+                    else {
+                        // The sequence ID could already be removed, e.g. if Fling finished,
+                        // before the touch_up event was handled (since fling can start
+                        // immediately if move was previously allowed, and clicks are anyway not
+                        // happening from fling).
+                        return;
+                    };
+                    match info.state {
+                        TouchSequenceState::PendingClick(_) => {
+                            info.state = TouchSequenceState::Finished;
+                            self.touch_handler.remove_touch_sequence(sequence_id);
+                        },
+                        TouchSequenceState::Flinging { .. } => {
+                            // We can't remove the touch sequence yet
+                        },
+                        TouchSequenceState::Finished => {
+                            self.touch_handler.remove_touch_sequence(sequence_id);
+                        },
+                        TouchSequenceState::Touching |
+                        TouchSequenceState::Panning { .. } |
+                        TouchSequenceState::Pinching |
+                        TouchSequenceState::MultiTouch |
+                        TouchSequenceState::PendingFling { .. } => {
+                            // It's possible to transition from Pinch to pan, Which means that
+                            // a touch_up event for a pinch might have arrived here, but we
+                            // already transitioned to pan or even PendingFling.
+                            // We don't need to do anything in these cases though.
+                        },
+                    }
+                },
+                TouchEventType::Cancel => {
+                    // We could still have pending event handlers, so we remove the pending
+                    // actions, and try to remove the touch sequence.
+                    self.touch_handler
+                        .remove_pending_touch_move_actions(sequence_id);
+                    self.touch_handler.try_remove_touch_sequence(sequence_id);
+                },
+            }
+        } else {
+            debug!(
+                "Touch event {:?} in sequence {:?} allowed",
+                event_type, sequence_id
+            );
+            match event_type {
+                TouchEventType::Down => {},
+                TouchEventType::Move => {
+                    self.pending_scroll_zoom_events.extend(
+                        self.touch_handler
+                            .take_pending_touch_move_actions(sequence_id),
+                    );
+                    self.touch_handler
+                        .set_handling_touch_move(self.touch_handler.current_sequence_id, false);
+                    if let Some(info) = self.touch_handler.get_touch_sequence_mut(sequence_id) {
+                        if info.prevent_move == TouchMoveAllowed::Pending {
+                            info.prevent_move = TouchMoveAllowed::Allowed;
+                            if let TouchSequenceState::PendingFling { velocity, point } = info.state
+                            {
+                                info.state = TouchSequenceState::Flinging { velocity, point }
                             }
                         }
-                    },
-                    TouchEventType::Up => {
-                        let Some(info) = self.touch_handler.get_touch_sequence_mut(sequence_id)
-                        else {
-                            // The sequence was already removed because there is no default action.
-                            return;
-                        };
-                        match info.state {
-                            TouchSequenceState::PendingClick(point) => {
-                                info.state = TouchSequenceState::Finished;
-                                // PreventDefault from touch_down may have been processed after
-                                // touch_up already occurred.
-                                if !info.prevent_click {
-                                    self.simulate_mouse_click(point);
-                                }
-                                self.touch_handler.remove_touch_sequence(sequence_id);
-                            },
-                            TouchSequenceState::Flinging { .. } => {
-                                // We can't remove the touch sequence yet
-                            },
-                            TouchSequenceState::Finished => {
-                                self.touch_handler.remove_touch_sequence(sequence_id);
-                            },
-                            TouchSequenceState::Panning { .. } |
-                            TouchSequenceState::Pinching |
-                            TouchSequenceState::PendingFling { .. } => {
-                                // It's possible to transition from Pinch to pan, Which means that
-                                // a touch_up event for a pinch might have arrived here, but we
-                                // already transitioned to pan or even PendingFling.
-                                // We don't need to do anything in these cases though.
-                            },
-                            TouchSequenceState::MultiTouch | TouchSequenceState::Touching => {
-                                // We transitioned to touching from multi-touch or pinching.
-                            },
-                        }
-                    },
-                    TouchEventType::Cancel => {
-                        self.touch_handler
-                            .remove_pending_touch_move_action(sequence_id);
-                        self.touch_handler.try_remove_touch_sequence(sequence_id);
-                    },
-                }
-            },
+                    }
+                },
+                TouchEventType::Up => {
+                    let Some(info) = self.touch_handler.get_touch_sequence_mut(sequence_id) else {
+                        // The sequence was already removed because there is no default action.
+                        return;
+                    };
+                    match info.state {
+                        TouchSequenceState::PendingClick(point) => {
+                            info.state = TouchSequenceState::Finished;
+                            // PreventDefault from touch_down may have been processed after
+                            // touch_up already occurred.
+                            if !info.prevent_click {
+                                self.simulate_mouse_click(render_api, point);
+                            }
+                            self.touch_handler.remove_touch_sequence(sequence_id);
+                        },
+                        TouchSequenceState::Flinging { .. } => {
+                            // We can't remove the touch sequence yet
+                        },
+                        TouchSequenceState::Finished => {
+                            self.touch_handler.remove_touch_sequence(sequence_id);
+                        },
+                        TouchSequenceState::Panning { .. } |
+                        TouchSequenceState::Pinching |
+                        TouchSequenceState::PendingFling { .. } => {
+                            // It's possible to transition from Pinch to pan, Which means that
+                            // a touch_up event for a pinch might have arrived here, but we
+                            // already transitioned to pan or even PendingFling.
+                            // We don't need to do anything in these cases though.
+                        },
+                        TouchSequenceState::MultiTouch | TouchSequenceState::Touching => {
+                            // We transitioned to touching from multi-touch or pinching.
+                        },
+                    }
+                },
+                TouchEventType::Cancel => {
+                    self.touch_handler
+                        .remove_pending_touch_move_actions(sequence_id);
+                    self.touch_handler.try_remove_touch_sequence(sequence_id);
+                },
+            }
         }
     }
 
     /// <http://w3c.github.io/touch-events/#mouse-events>
-    fn simulate_mouse_click(&mut self, point: DevicePoint) {
+    fn simulate_mouse_click(&mut self, render_api: &RenderApi, point: DevicePoint) {
         let button = MouseButton::Left;
-        self.dispatch_input_event_with_hit_testing(InputEvent::MouseMove(MouseMoveEvent::new(
-            point,
-        )));
-        self.dispatch_input_event_with_hit_testing(InputEvent::MouseButton(MouseButtonEvent::new(
-            MouseButtonAction::Down,
-            button,
-            point,
-        )));
-        self.dispatch_input_event_with_hit_testing(InputEvent::MouseButton(MouseButtonEvent::new(
-            MouseButtonAction::Up,
-            button,
-            point,
-        )));
+        self.dispatch_input_event_with_hit_testing(
+            render_api,
+            InputEvent::MouseMove(MouseMoveEvent::new_compatibility_for_touch(point.into())).into(),
+        );
+        self.dispatch_input_event_with_hit_testing(
+            render_api,
+            InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Down,
+                button,
+                point.into(),
+            ))
+            .into(),
+        );
+        self.dispatch_input_event_with_hit_testing(
+            render_api,
+            InputEvent::MouseButton(MouseButtonEvent::new(
+                MouseButtonAction::Up,
+                button,
+                point.into(),
+            ))
+            .into(),
+        );
     }
 
-    pub(crate) fn notify_scroll_event(
-        &mut self,
-        scroll_location: ScrollLocation,
-        cursor: DeviceIntPoint,
-    ) {
-        if self.global.borrow().shutdown_state() != ShutdownState::NotShuttingDown {
-            return;
-        }
-        self.on_scroll_window_event(scroll_location, cursor);
+    pub(crate) fn notify_scroll_event(&mut self, scroll: Scroll, point: WebViewPoint) {
+        let point = point.as_device_point(self.device_pixels_per_page_pixel());
+        self.on_scroll_window_event(scroll, point);
     }
 
-    fn on_scroll_window_event(&mut self, scroll_location: ScrollLocation, cursor: DeviceIntPoint) {
+    fn on_scroll_window_event(&mut self, scroll: Scroll, cursor: DevicePoint) {
         self.pending_scroll_zoom_events
             .push(ScrollZoomEvent::Scroll(ScrollEvent {
-                scroll_location,
-                cursor,
+                scroll,
+                point: cursor,
                 event_count: 1,
             }));
     }
@@ -733,22 +690,22 @@ impl WebViewRenderer {
     /// It is up to the caller to ensure that these events update the rendering appropriately.
     pub(crate) fn process_pending_scroll_and_pinch_zoom_events(
         &mut self,
+        render_api: &RenderApi,
     ) -> (PinchZoomResult, Option<ScrollResult>) {
         if self.pending_scroll_zoom_events.is_empty() {
             return (PinchZoomResult::DidNotPinchZoom, None);
         }
 
-        // Batch up all scroll events into one, or else we'll do way too much painting.
+        // Batch up all scroll events and changes to pinch zoom into a single change, or
+        // else we'll do way too much painting.
         let mut combined_scroll_event: Option<ScrollEvent> = None;
-        let mut base_page_zoom = self.pinch_zoom_level().get();
-        let mut combined_magnification = 1.0;
+        let mut new_pinch_zoom = self.pinch_zoom;
+        let device_pixels_per_page_pixel = self.device_pixels_per_page_pixel();
+
         for scroll_event in self.pending_scroll_zoom_events.drain(..) {
             match scroll_event {
-                ScrollZoomEvent::PinchZoom(magnification) => {
-                    combined_magnification *= magnification
-                },
-                ScrollZoomEvent::InitialViewportZoom(magnification) => {
-                    base_page_zoom = magnification
+                ScrollZoomEvent::PinchZoom(factor, center) => {
+                    new_pinch_zoom.zoom(factor, center);
                 },
                 ScrollZoomEvent::Scroll(scroll_event_info) => {
                     let combined_event = match combined_scroll_event.as_mut() {
@@ -759,27 +716,27 @@ impl WebViewRenderer {
                         Some(combined_event) => combined_event,
                     };
 
-                    match (
-                        combined_event.scroll_location,
-                        scroll_event_info.scroll_location,
-                    ) {
-                        (ScrollLocation::Delta(old_delta), ScrollLocation::Delta(new_delta)) => {
+                    match (combined_event.scroll, scroll_event_info.scroll) {
+                        (Scroll::Delta(old_delta), Scroll::Delta(new_delta)) => {
                             // Mac OS X sometimes delivers scroll events out of vsync during a
                             // fling. This causes events to get bunched up occasionally, causing
                             // nasty-looking "pops". To mitigate this, during a fling we average
                             // deltas instead of summing them.
-                            let old_event_count = Scale::new(combined_event.event_count as f32);
+                            let old_event_count = combined_event.event_count as f32;
                             combined_event.event_count += 1;
-                            let new_event_count = Scale::new(combined_event.event_count as f32);
-                            combined_event.scroll_location = ScrollLocation::Delta(
-                                (old_delta * old_event_count + new_delta) / new_event_count,
-                            );
+                            let new_event_count = combined_event.event_count as f32;
+                            let old_delta =
+                                old_delta.as_device_vector(device_pixels_per_page_pixel);
+                            let new_delta =
+                                new_delta.as_device_vector(device_pixels_per_page_pixel);
+                            let delta = (old_delta * old_event_count + new_delta) / new_event_count;
+                            combined_event.scroll = Scroll::Delta(delta.into());
                         },
-                        (ScrollLocation::Start, _) | (ScrollLocation::End, _) => {
+                        (Scroll::Start, _) | (Scroll::End, _) => {
                             // Once we see Start or End, we shouldn't process any more events.
                             break;
                         },
-                        (_, ScrollLocation::Start) | (_, ScrollLocation::End) => {
+                        (_, Scroll::Start) | (_, Scroll::End) => {
                             // If this is an event which is scrolling to the start or end of the page,
                             // disregard other pending events and exit the loop.
                             *combined_event = scroll_event_info;
@@ -790,75 +747,91 @@ impl WebViewRenderer {
             }
         }
 
+        // When zoomed in via pinch zoom, first try to move the center of the zoom and use the rest
+        // of the delta for scrolling. This allows moving the zoomed into viewport around in the
+        // unzoomed viewport before actually scrolling the underlying layers.
+        if let Some(combined_scroll_event) = combined_scroll_event.as_mut() {
+            new_pinch_zoom.pan(
+                &mut combined_scroll_event.scroll,
+                self.device_pixels_per_page_pixel(),
+            )
+        }
+
         let scroll_result = combined_scroll_event.and_then(|combined_event| {
             self.scroll_node_at_device_point(
-                combined_event.cursor.to_f32(),
-                combined_event.scroll_location,
+                render_api,
+                combined_event.point.to_f32(),
+                combined_event.scroll,
             )
         });
-        if let Some(scroll_result) = scroll_result.clone() {
+        if let Some(ref scroll_result) = scroll_result {
             self.send_scroll_positions_to_layout_for_pipeline(
                 scroll_result.hit_test_result.pipeline_id,
             );
             self.dispatch_scroll_event(
                 scroll_result.external_scroll_id,
-                scroll_result.hit_test_result,
+                scroll_result.hit_test_result.clone(),
             );
+        } else {
+            self.touch_handler.stop_fling_if_needed();
         }
 
-        let pinch_zoom_result =
-            match self.set_pinch_zoom_level(base_page_zoom * combined_magnification) {
-                true => PinchZoomResult::DidPinchZoom,
-                false => PinchZoomResult::DidNotPinchZoom,
-            };
-
-        (pinch_zoom_result, scroll_result)
+        (self.set_pinch_zoom(new_pinch_zoom), scroll_result)
     }
 
-    /// Perform a hit test at the given [`DevicePoint`] and apply the [`ScrollLocation`]
+    /// Perform a hit test at the given [`DevicePoint`] and apply the [`Scroll`]
     /// scrolling to the applicable scroll node under that point. If a scroll was
     /// performed, returns the hit test result contains [`PipelineId`] of the node
     /// scrolled, the id, and the final scroll delta.
     fn scroll_node_at_device_point(
         &mut self,
+        render_api: &RenderApi,
         cursor: DevicePoint,
-        scroll_location: ScrollLocation,
+        scroll: Scroll,
     ) -> Option<ScrollResult> {
-        let scroll_location = match scroll_location {
-            ScrollLocation::Delta(delta) => {
+        let scroll_location = match scroll {
+            Scroll::Delta(delta) => {
                 let device_pixels_per_page = self.device_pixels_per_page_pixel();
-                let scaled_delta = (Vector2D::from_untyped(delta.to_untyped()) /
-                    device_pixels_per_page)
-                    .to_untyped();
-                let calculated_delta = LayoutVector2D::from_untyped(scaled_delta);
-                ScrollLocation::Delta(calculated_delta)
+                let calculate_delta =
+                    delta.as_device_vector(device_pixels_per_page) / device_pixels_per_page;
+                ScrollLocation::Delta(calculate_delta.cast_unit())
             },
-            // Leave ScrollLocation unchanged if it is Start or End location.
-            ScrollLocation::Start | ScrollLocation::End => scroll_location,
+            Scroll::Start => ScrollLocation::Start,
+            Scroll::End => ScrollLocation::End,
         };
 
-        let hit_test_results = self
-            .global
-            .borrow()
-            .hit_test_at_point_with_flags(cursor, HitTestFlags::FIND_ALL);
+        let hit_test_results: Vec<_> = self
+            .touch_handler
+            .get_hit_test_result_cache_value()
+            .map(|result| vec![result])
+            .unwrap_or_else(|| self.hit_test(render_api, cursor));
 
         // Iterate through all hit test results, processing only the first node of each pipeline.
         // This is needed to propagate the scroll events from a pipeline representing an iframe to
         // its ancestor pipelines.
         let mut previous_pipeline_id = None;
-        for hit_test_result in hit_test_results.iter() {
+        for hit_test_result in hit_test_results {
             let pipeline_details = self.pipelines.get_mut(&hit_test_result.pipeline_id)?;
-            if previous_pipeline_id.replace(&hit_test_result.pipeline_id) !=
-                Some(&hit_test_result.pipeline_id)
+            if previous_pipeline_id.replace(hit_test_result.pipeline_id) !=
+                Some(hit_test_result.pipeline_id)
             {
                 let scroll_result = pipeline_details.scroll_tree.scroll_node_or_ancestor(
-                    &hit_test_result.external_scroll_id,
+                    hit_test_result.external_scroll_id,
                     scroll_location,
                     ScrollType::InputEvents,
                 );
                 if let Some((external_scroll_id, offset)) = scroll_result {
+                    // We would like to cache the hit test for the node that that actually scrolls
+                    // while panning, which we don't know until right now (as some nodes
+                    // might be at the end of their scroll area). In particular, directionality of
+                    // scroll matters. That's why this is done here and not as soon as the touch
+                    // starts.
+                    self.touch_handler.set_hit_test_result_cache_value(
+                        hit_test_result.clone(),
+                        self.device_pixels_per_page_pixel(),
+                    );
                     return Some(ScrollResult {
-                        hit_test_result: hit_test_result.clone(),
+                        hit_test_result,
                         external_scroll_id,
                         offset,
                     });
@@ -868,37 +841,91 @@ impl WebViewRenderer {
         None
     }
 
+    /// Scroll the viewport (root pipeline, root scroll node) of this WebView, but first
+    /// attempting to pan the pinch zoom viewport. This is called when processing
+    /// key-based scrolling from script.
+    pub(crate) fn scroll_viewport_by_delta(
+        &mut self,
+        delta: LayoutVector2D,
+    ) -> (PinchZoomResult, Vec<ScrollResult>) {
+        let device_pixels_per_page_pixel = self.device_pixels_per_page_pixel();
+        let delta_in_device_pixels = delta.cast_unit() * device_pixels_per_page_pixel;
+        let remaining = self.pinch_zoom.pan_with_device_scroll(
+            Scroll::Delta(delta_in_device_pixels.into()),
+            device_pixels_per_page_pixel,
+        );
+
+        let pinch_zoom_result = match remaining == delta_in_device_pixels {
+            true => PinchZoomResult::DidNotPinchZoom,
+            false => PinchZoomResult::DidPinchZoom,
+        };
+        if remaining == Vector2D::zero() {
+            return (pinch_zoom_result, vec![]);
+        }
+
+        let Some(root_pipeline_id) = self.root_pipeline_id else {
+            return (pinch_zoom_result, vec![]);
+        };
+        let Some(root_pipeline) = self.pipelines.get_mut(&root_pipeline_id) else {
+            return (pinch_zoom_result, vec![]);
+        };
+
+        let remaining = remaining / device_pixels_per_page_pixel;
+        let Some((external_scroll_id, offset)) = root_pipeline.scroll_tree.scroll_node_or_ancestor(
+            ExternalScrollId(0, root_pipeline_id.into()),
+            ScrollLocation::Delta(remaining.cast_unit()),
+            // These are initiated only by keyboard events currently.
+            ScrollType::InputEvents,
+        ) else {
+            return (pinch_zoom_result, vec![]);
+        };
+
+        let hit_test_result = PaintHitTestResult {
+            pipeline_id: root_pipeline_id,
+            // It's difficult to get a good value for this as it needs to be piped
+            // all the way through script and back here.
+            point_in_viewport: Default::default(),
+            external_scroll_id,
+        };
+
+        self.send_scroll_positions_to_layout_for_pipeline(root_pipeline_id);
+        self.dispatch_scroll_event(external_scroll_id, hit_test_result.clone());
+
+        let scroll_result = ScrollResult {
+            hit_test_result,
+            external_scroll_id,
+            offset,
+        };
+        (pinch_zoom_result, vec![scroll_result])
+    }
+
     fn dispatch_scroll_event(
         &self,
         external_id: ExternalScrollId,
-        hit_test_result: CompositorHitTestResult,
+        hit_test_result: PaintHitTestResult,
     ) {
-        let event = InputEvent::Scroll(EmbedderScrollEvent { external_id });
+        let event = InputEvent::Scroll(EmbedderScrollEvent { external_id }).into();
         let msg = EmbedderToConstellationMessage::ForwardInputEvent(
             self.id,
             event,
             Some(hit_test_result),
         );
-        if let Err(e) = self.global.borrow().constellation_sender.send(msg) {
+        if let Err(e) = self.embedder_to_constellation_sender.send(msg) {
             warn!("Sending scroll event to constellation failed ({:?}).", e);
         }
     }
 
-    pub(crate) fn pinch_zoom_level(&self) -> Scale<f32, DevicePixel, DevicePixel> {
-        Scale::new(self.pinch_zoom.get())
+    pub(crate) fn pinch_zoom(&self) -> PinchZoom {
+        self.pinch_zoom
     }
 
-    fn set_pinch_zoom_level(&mut self, mut zoom: f32) -> bool {
-        if let Some(viewport) = self.viewport_description.as_ref() {
-            zoom = viewport.clamp_zoom(zoom);
+    fn set_pinch_zoom(&mut self, requested_pinch_zoom: PinchZoom) -> PinchZoomResult {
+        if requested_pinch_zoom == self.pinch_zoom {
+            return PinchZoomResult::DidNotPinchZoom;
         }
 
-        let old_zoom = std::mem::replace(&mut self.pinch_zoom, PinchZoomFactor::new(zoom));
-        old_zoom != self.pinch_zoom
-    }
-
-    pub(crate) fn page_zoom(&mut self) -> Scale<f32, CSSPixel, DeviceIndependentPixel> {
-        self.page_zoom
+        self.pinch_zoom = requested_pinch_zoom;
+        PinchZoomResult::DidPinchZoom
     }
 
     pub(crate) fn set_page_zoom(
@@ -923,7 +950,7 @@ impl WebViewRenderer {
             .and_then(|pipeline_id| self.pipelines.get(&pipeline_id))
             .and_then(|pipeline| pipeline.viewport_scale)
             .unwrap_or_else(|| self.page_zoom * self.hidpi_scale_factor);
-        viewport_scale * self.pinch_zoom_level()
+        viewport_scale * self.pinch_zoom.zoom_factor()
     }
 
     /// The current viewport scale (hidpi scale and page zoom and not pinch
@@ -936,20 +963,14 @@ impl WebViewRenderer {
         self.page_zoom * self.hidpi_scale_factor
     }
 
-    /// Simulate a pinch zoom
-    pub(crate) fn set_pinch_zoom(&mut self, magnification: f32) {
-        if self.global.borrow().shutdown_state() != ShutdownState::NotShuttingDown {
+    /// Adjust the pinch zoom of the [`WebView`] by the given zoom delta.
+    pub(crate) fn adjust_pinch_zoom(&mut self, magnification: f32, center: DevicePoint) {
+        if magnification == 1.0 {
             return;
         }
 
-        // TODO: Scroll to keep the center in view?
         self.pending_scroll_zoom_events
-            .push(ScrollZoomEvent::PinchZoom(
-                self.viewport_description
-                    .clone()
-                    .unwrap_or_default()
-                    .clamp_zoom(magnification),
-            ));
+            .push(ScrollZoomEvent::PinchZoom(magnification, center));
     }
 
     fn send_window_size_message(&self) {
@@ -957,17 +978,16 @@ impl WebViewRenderer {
         // to device pixels, but not including any pinch zoom.
         let device_pixel_ratio = self.device_pixels_per_page_pixel_not_including_pinch_zoom();
         let initial_viewport = self.rect.size().to_f32() / device_pixel_ratio;
-        let msg = EmbedderToConstellationMessage::ChangeViewportDetails(
-            self.id,
-            ViewportDetails {
-                hidpi_scale_factor: device_pixel_ratio,
-                size: initial_viewport,
-            },
-            WindowSizeType::Resize,
+        let _ = self.embedder_to_constellation_sender.send(
+            EmbedderToConstellationMessage::ChangeViewportDetails(
+                self.id,
+                ViewportDetails {
+                    hidpi_scale_factor: device_pixel_ratio,
+                    size: initial_viewport,
+                },
+                WindowSizeType::Resize,
+            ),
         );
-        if let Err(e) = self.global.borrow().constellation_sender.send(msg) {
-            warn!("Sending window resize to constellation failed ({:?}).", e);
-        }
     }
 
     /// Set the `hidpi_scale_factor` for this renderer, returning `true` if the value actually changed.
@@ -989,17 +1009,15 @@ impl WebViewRenderer {
         let old_rect = std::mem::replace(&mut self.rect, new_rect);
         if old_rect.size() != self.rect.size() {
             self.send_window_size_message();
+            self.pinch_zoom.resize_unscaled_viewport(new_rect);
         }
         old_rect != self.rect
     }
 
     pub fn set_viewport_description(&mut self, viewport_description: ViewportDescription) {
-        self.pending_scroll_zoom_events
-            .push(ScrollZoomEvent::InitialViewportZoom(
-                viewport_description
-                    .clone()
-                    .clamp_zoom(viewport_description.initial_scale.get()),
-            ));
+        self.set_page_zoom(Scale::new(
+            viewport_description.clamp_page_zoom(viewport_description.initial_scale.get()),
+        ));
         self.viewport_description = Some(viewport_description);
     }
 
@@ -1011,6 +1029,34 @@ impl WebViewRenderer {
             .values()
             .map(|pipeline| pipeline.scroll_tree.size_of(ops))
             .sum::<usize>()
+    }
+
+    pub(crate) fn notify_input_event_handled(
+        &mut self,
+        render_api: &RenderApi,
+        repaint_reason: &Cell<RepaintReason>,
+        id: InputEventId,
+        result: InputEventResult,
+    ) {
+        if let Some(pending_touch_input_event) =
+            self.touch_handler.take_pending_touch_input_event(id)
+        {
+            self.on_touch_event_processed(render_api, pending_touch_input_event, result);
+            self.touch_handler
+                .add_touch_move_refresh_observer_if_necessary(
+                    self.refresh_driver.clone(),
+                    repaint_reason,
+                );
+        }
+
+        if let Some(wheel_event) = self.pending_wheel_events.remove(&id) {
+            if !result.contains(InputEventResult::DefaultPrevented) {
+                // A scroll delta for a wheel event is the inverse of the wheel delta.
+                let scroll_delta =
+                    DeviceVector2D::new(-wheel_event.delta.x as f32, -wheel_event.delta.y as f32);
+                self.notify_scroll_event(Scroll::Delta(scroll_delta.into()), wheel_event.point);
+            }
+        }
     }
 }
 

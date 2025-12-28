@@ -15,13 +15,13 @@ pub mod hsts;
 pub mod http_cache;
 pub mod http_loader;
 pub mod image_cache;
-pub mod indexeddb;
 pub mod local_directory_listing;
 pub mod protocols;
 pub mod request_interceptor;
 pub mod resource_thread;
-mod storage_thread;
 pub mod subresource_integrity;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 mod websocket_loader;
 
 /// An implementation of the [Fetch specification](https://fetch.spec.whatwg.org/)
@@ -35,6 +35,6 @@ pub mod fetch {
 /// A module for re-exports of items used in unit tests.
 pub mod test {
     pub use crate::decoder::DECODER_BUFFER_SIZE;
-    pub use crate::hosts::{parse_hostsfile, replace_host_table};
+    pub use crate::hosts::parse_hostsfile;
     pub use crate::http_loader::HttpState;
 }

@@ -7,12 +7,14 @@ use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 use std::ops::Deref;
 
+use base::Epoch;
 /// Receiver type used in WebGLCommands.
 pub use base::generic_channel::GenericReceiver as WebGLReceiver;
 /// Sender type used in WebGLCommands.
 pub use base::generic_channel::GenericSender as WebGLSender;
 /// Result type for send()/recv() calls in in WebGLCommands.
 pub use base::generic_channel::SendResult as WebGLSendResult;
+use base::id::PainterId;
 use euclid::default::{Rect, Size2D};
 use glow::{
     self as gl, NativeBuffer, NativeFence, NativeFramebuffer, NativeProgram, NativeQuery,
@@ -66,6 +68,7 @@ pub struct WebGLCommandBacktrace {
 }
 
 /// WebGL Threading API entry point that lives in the constellation.
+#[derive(Clone)]
 pub struct WebGLThreads(pub WebGLSender<WebGLMsg>);
 
 impl WebGLThreads {
@@ -76,10 +79,15 @@ impl WebGLThreads {
     }
 
     /// Sends a exit message to close the WebGLThreads and release all WebGLContexts.
-    pub fn exit(&self, sender: IpcSender<()>) -> Result<(), &'static str> {
+    pub fn exit(&self, sender: IpcSender<()>) -> WebGLSendResult {
+        self.0.send(WebGLMsg::Exit(sender))
+    }
+
+    /// Inform the WebGLThreads that WebRender has finished rendering a particular WebGL context,
+    /// and if it was marked for deletion, it can now be released.
+    pub fn finished_rendering_to_context(&self, context_id: WebGLContextId) -> WebGLSendResult {
         self.0
-            .send(WebGLMsg::Exit(sender))
-            .map_err(|_| "Failed to send Exit message")
+            .send(WebGLMsg::FinishedRenderingToContext(context_id))
     }
 }
 
@@ -88,11 +96,14 @@ impl WebGLThreads {
 pub enum WebGLMsg {
     /// Creates a new WebGLContext.
     CreateContext(
+        PainterId,
         WebGLVersion,
         Size2D<u32>,
         GLContextAttributes,
         WebGLSender<Result<WebGLCreateContextResult, String>>,
     ),
+    /// Set an [`ImageKey`] on a `WebGLContext`.
+    SetImageKey(WebGLContextId, ImageKey),
     /// Resizes a WebGLContext.
     ResizeContext(WebGLContextId, Size2D<u32>, WebGLSender<Result<(), String>>),
     /// Drops a WebGLContext.
@@ -107,7 +118,11 @@ pub enum WebGLMsg {
     /// The third field contains the time (in ns) when the request
     /// was initiated. The u64 in the second field will be the time the
     /// request is fulfilled
-    SwapBuffers(Vec<WebGLContextId>, WebGLSender<u64>, u64),
+    SwapBuffers(Vec<WebGLContextId>, Option<Epoch>, u64),
+    /// Called when a [`Surface`] is returned from being used in WebRender and isn't
+    /// readily releaseable via the `SwapChain`. This can happen when the context is
+    /// released in the WebGLThread while the contents are being rendered by WebRender.
+    FinishedRenderingToContext(WebGLContextId),
     /// Frees all resources and closes the thread.
     Exit(IpcSender<()>),
 }
@@ -129,8 +144,6 @@ pub struct WebGLCreateContextResult {
     pub glsl_version: WebGLSLVersion,
     /// The GL API used by the context.
     pub api_type: GlType,
-    /// The WebRender image key.
-    pub image_key: ImageKey,
 }
 
 /// Defines the WebGL version
@@ -178,6 +191,14 @@ impl WebGLMsgSender {
     pub fn send(&self, command: WebGLCommand, backtrace: WebGLCommandBacktrace) -> WebGLSendResult {
         self.sender
             .send(WebGLMsg::WebGLCommand(self.ctx_id, command, backtrace))
+    }
+
+    /// Set an [`ImageKey`] on this WebGL context.
+    #[inline]
+    pub fn set_image_key(&self, image_key: ImageKey) {
+        let _ = self
+            .sender
+            .send(WebGLMsg::SetImageKey(self.ctx_id, image_key));
     }
 
     /// Send a resize message
@@ -607,7 +628,6 @@ macro_rules! define_resource_id {
             }
         }
 
-        #[allow(unsafe_code)]
         impl<'de> ::serde::Deserialize<'de> for $name {
             fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where

@@ -18,31 +18,30 @@ use std::rc::Rc;
 
 use canvas_traits::canvas::{
     CompositionOptions, CompositionOrBlending, CompositionStyle, FillOrStrokeStyle, FillRule,
-    LineOptions, Path, ShadowOptions,
+    LineOptions, Path, ShadowOptions, TextRun,
 };
 use compositing_traits::SerializableImageData;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
-use fonts::{ByteIndex, FontIdentifier, FontTemplateRefMethods as _};
+use fonts::FontIdentifier;
 use ipc_channel::ipc::IpcSharedMemory;
 use kurbo::Shape as _;
 use pixels::{Snapshot, SnapshotAlphaMode, SnapshotPixelFormat};
-use range::Range;
 use vello::wgpu::{
     BackendOptions, Backends, Buffer, BufferDescriptor, BufferUsages, COPY_BYTES_PER_ROW_ALIGNMENT,
     CommandEncoderDescriptor, Device, Extent3d, Instance, InstanceDescriptor, InstanceFlags,
-    MapMode, Origin3d, Queue, TexelCopyBufferInfo, TexelCopyBufferLayout, TexelCopyTextureInfoBase,
-    Texture, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor,
+    MapMode, MemoryBudgetThresholds, Origin3d, Queue, TexelCopyBufferInfo, TexelCopyBufferLayout,
+    TexelCopyTextureInfoBase, Texture, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages, TextureView, TextureViewDescriptor,
 };
 use vello::{kurbo, peniko};
 use webrender_api::{ImageDescriptor, ImageDescriptorFlags};
 
 use crate::backend::{Convert as _, GenericDrawTarget};
-use crate::canvas_data::{Filter, TextRun};
+use crate::canvas_data::Filter;
 
 thread_local! {
     /// The shared font cache used by all canvases that render on a thread.
-    static SHARED_FONT_CACHE: RefCell<HashMap<FontIdentifier, peniko::Font>> = RefCell::default();
+    static SHARED_FONT_CACHE: RefCell<HashMap<FontIdentifier, peniko::FontData>> = RefCell::default();
 }
 
 pub(crate) struct VelloDrawTarget {
@@ -55,7 +54,7 @@ pub(crate) struct VelloDrawTarget {
     state: State,
     render_texture: Texture,
     render_texture_view: TextureView,
-    render_image: peniko::Image,
+    render_image: peniko::ImageBrush,
     padded_byte_width: u32,
     rendered_buffer: Buffer,
 }
@@ -89,18 +88,18 @@ impl VelloDrawTarget {
             view_formats: &[],
         });
         let render_texture_view = render_texture.create_view(&TextureViewDescriptor::default());
-        let render_image = peniko::Image {
-            data: vec![].into(),
-            format: peniko::ImageFormat::Rgba8,
-            width: size.width,
-            height: size.height,
-            x_extend: peniko::Extend::Pad,
-            y_extend: peniko::Extend::Pad,
-            quality: peniko::ImageQuality::Low,
-            alpha: 1.0,
+        let render_image = peniko::ImageBrush {
+            image: peniko::ImageData {
+                data: vec![].into(),
+                format: peniko::ImageFormat::Rgba8,
+                width: size.width,
+                height: size.height,
+                alpha_type: peniko::ImageAlphaType::Alpha,
+            },
+            sampler: peniko::ImageSampler::default(),
         };
         renderer.borrow_mut().override_image(
-            &render_image,
+            &render_image.image,
             Some(TexelCopyTextureInfoBase {
                 texture: render_texture.clone(),
                 mip_level: 0,
@@ -161,8 +160,7 @@ impl VelloDrawTarget {
         f(self);
         // push all clip layers back
         for path in &self.clips {
-            self.scene
-                .push_layer(peniko::Mix::Clip, 1.0, kurbo::Affine::IDENTITY, &path.0);
+            self.scene.push_clip_layer(kurbo::Affine::IDENTITY, &path.0);
         }
     }
 
@@ -211,6 +209,7 @@ impl GenericDrawTarget for VelloDrawTarget {
             backends,
             flags,
             backend_options,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
         });
         let mut context = vello::util::RenderContext {
             instance,
@@ -273,15 +272,20 @@ impl GenericDrawTarget for VelloDrawTarget {
             self_.scene.fill(
                 peniko::Fill::NonZero,
                 kurbo::Affine::IDENTITY,
-                &peniko::Image {
-                    data: peniko::Blob::from(surface),
-                    format: peniko::ImageFormat::Rgba8,
-                    width: source.size.width as u32,
-                    height: source.size.height as u32,
-                    x_extend: peniko::Extend::Pad,
-                    y_extend: peniko::Extend::Pad,
-                    quality: peniko::ImageQuality::Low,
-                    alpha: 1.0,
+                &peniko::ImageBrush {
+                    image: peniko::ImageData {
+                        data: peniko::Blob::from(surface),
+                        format: peniko::ImageFormat::Rgba8,
+                        width: source.size.width as u32,
+                        height: source.size.height as u32,
+                        alpha_type: peniko::ImageAlphaType::Alpha,
+                    },
+                    sampler: peniko::ImageSampler {
+                        x_extend: peniko::Extend::Pad,
+                        y_extend: peniko::Extend::Pad,
+                        quality: peniko::ImageQuality::Low,
+                        alpha: 1.0,
+                    },
                 },
                 Some(kurbo::Affine::translate(destination.to_vec2())),
                 &rect,
@@ -316,20 +320,25 @@ impl GenericDrawTarget for VelloDrawTarget {
             self_.scene.fill(
                 peniko::Fill::NonZero,
                 transform.cast().into(),
-                &peniko::Image {
-                    data: peniko::Blob::from(surface),
-                    format: peniko::ImageFormat::Rgba8,
-                    width: source.size.width as u32,
-                    height: source.size.height as u32,
-                    x_extend: peniko::Extend::Pad,
-                    y_extend: peniko::Extend::Pad,
-                    // we should only do bicubic when scaling up
-                    quality: if scale_up {
-                        filter.convert()
-                    } else {
-                        peniko::ImageQuality::Low
+                &peniko::ImageBrush {
+                    image: peniko::ImageData {
+                        data: peniko::Blob::from(surface),
+                        format: peniko::ImageFormat::Rgba8,
+                        width: source.size.width as u32,
+                        height: source.size.height as u32,
+                        alpha_type: peniko::ImageAlphaType::Alpha,
                     },
-                    alpha: composition_options.alpha as f32,
+                    sampler: peniko::ImageSampler {
+                        x_extend: peniko::Extend::Pad,
+                        y_extend: peniko::Extend::Pad,
+                        // we should only do bicubic when scaling up
+                        quality: if scale_up {
+                            filter.convert()
+                        } else {
+                            peniko::ImageQuality::Low
+                        },
+                        alpha: composition_options.alpha as f32,
+                    },
                 },
                 Some(
                     kurbo::Affine::translate((dest.origin.x, dest.origin.y)).pre_scale_non_uniform(
@@ -381,7 +390,6 @@ impl GenericDrawTarget for VelloDrawTarget {
     fn fill_text(
         &mut self,
         text_runs: Vec<TextRun>,
-        start: Point2D<f32>,
         style: FillOrStrokeStyle,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
@@ -390,24 +398,19 @@ impl GenericDrawTarget for VelloDrawTarget {
         let pattern = convert_to_brush(style, composition_options);
         let transform = transform.cast().into();
         self.with_composition(composition_options.composition_operation, |self_| {
-            let mut advance = 0.;
-            for run in text_runs.iter() {
-                let glyphs = &run.glyphs;
-
-                let template = &run.font.template;
-
+            for text_run in text_runs.iter() {
                 SHARED_FONT_CACHE.with(|font_cache| {
-                    let identifier = template.identifier();
-                    if !font_cache.borrow().contains_key(&identifier) {
-                        let Ok(font) = run.font.font_data_and_index() else {
+                    let identifier = &text_run.font.identifier;
+                    if !font_cache.borrow().contains_key(identifier) {
+                        let Some(font_data_and_index) = text_run.font.font_data_and_index() else {
                             return;
                         };
-                        let font = font.clone().convert();
+                        let font = font_data_and_index.convert();
                         font_cache.borrow_mut().insert(identifier.clone(), font);
                     }
 
                     let font_cache = font_cache.borrow();
-                    let Some(font) = font_cache.get(&identifier) else {
+                    let Some(font) = font_cache.get(identifier) else {
                         return;
                     };
 
@@ -416,21 +419,16 @@ impl GenericDrawTarget for VelloDrawTarget {
                         .draw_glyphs(font)
                         .transform(transform)
                         .brush(&pattern)
-                        .font_size(run.font.descriptor.pt_size.to_f32_px())
+                        .font_size(text_run.pt_size)
                         .draw(
                             peniko::Fill::NonZero,
-                            glyphs
-                                .iter_glyphs_for_byte_range(&Range::new(ByteIndex(0), glyphs.len()))
-                                .map(|glyph| {
-                                    let glyph_offset = glyph.offset().unwrap_or(Point2D::zero());
-                                    let x = advance + start.x + glyph_offset.x.to_f32_px();
-                                    let y = start.y + glyph_offset.y.to_f32_px();
-                                    advance += glyph.advance().to_f32_px();
-                                    vello::Glyph {
-                                        id: glyph.id(),
-                                        x,
-                                        y,
-                                    }
+                            text_run
+                                .glyphs_and_positions
+                                .iter()
+                                .map(|glyph_and_position| vello::Glyph {
+                                    id: glyph_and_position.id,
+                                    x: glyph_and_position.point.x,
+                                    y: glyph_and_position.point.y,
                                 }),
                         );
                 });
@@ -467,8 +465,7 @@ impl GenericDrawTarget for VelloDrawTarget {
     }
 
     fn push_clip(&mut self, path: &Path, _fill_rule: FillRule, transform: Transform2D<f64>) {
-        self.scene
-            .push_layer(peniko::Mix::Clip, 1.0, transform.cast().into(), &path.0);
+        self.scene.push_clip_layer(transform.cast().into(), &path.0);
         let mut path = path.clone();
         path.transform(transform.cast());
         self.clips.push(path);
@@ -503,6 +500,57 @@ impl GenericDrawTarget for VelloDrawTarget {
                 None,
                 &path.0,
             );
+        })
+    }
+
+    fn stroke_text(
+        &mut self,
+        text_runs: Vec<TextRun>,
+        style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        self.ensure_drawing();
+        let pattern = convert_to_brush(style, composition_options);
+        let transform = transform.cast().into();
+        let line_options: kurbo::Stroke = line_options.convert();
+        self.with_composition(composition_options.composition_operation, |self_| {
+            for text_run in text_runs.iter() {
+                SHARED_FONT_CACHE.with(|font_cache| {
+                    let identifier = &text_run.font.identifier;
+                    if !font_cache.borrow().contains_key(identifier) {
+                        let Some(font_data_and_index) = text_run.font.font_data_and_index() else {
+                            return;
+                        };
+                        let font = font_data_and_index.convert();
+                        font_cache.borrow_mut().insert(identifier.clone(), font);
+                    }
+
+                    let font_cache = font_cache.borrow();
+                    let Some(font) = font_cache.get(identifier) else {
+                        return;
+                    };
+
+                    self_
+                        .scene
+                        .draw_glyphs(font)
+                        .transform(transform)
+                        .brush(&pattern)
+                        .font_size(text_run.pt_size)
+                        .draw(
+                            &line_options,
+                            text_run
+                                .glyphs_and_positions
+                                .iter()
+                                .map(|glyph_and_position| vello::Glyph {
+                                    id: glyph_and_position.id,
+                                    x: glyph_and_position.point.x,
+                                    y: glyph_and_position.point.y,
+                                }),
+                        );
+                });
+            }
         })
     }
 
@@ -542,7 +590,7 @@ impl GenericDrawTarget for VelloDrawTarget {
             };
             let data = SerializableImageData::Raw(if let Some(data) = data {
                 let mut data = IpcSharedMemory::from_bytes(data);
-                #[allow(unsafe_code)]
+                #[expect(unsafe_code)]
                 unsafe {
                     pixels::generic_transform_inplace::<1, false, false>(data.deref_mut());
                 };
@@ -598,7 +646,7 @@ impl Drop for VelloDrawTarget {
     fn drop(&mut self) {
         self.renderer
             .borrow_mut()
-            .override_image(&self.render_image, None);
+            .override_image(&self.render_image.image, None);
     }
 }
 
@@ -639,8 +687,7 @@ impl VelloDrawTarget {
         self.scene.reset();
         // push all clip layers back
         for path in &self.clips {
-            self.scene
-                .push_layer(peniko::Mix::Clip, 1.0, kurbo::Affine::IDENTITY, &path.0);
+            self.scene.push_clip_layer(kurbo::Affine::IDENTITY, &path.0);
         }
     }
 

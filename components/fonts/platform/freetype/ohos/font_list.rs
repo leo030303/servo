@@ -33,7 +33,7 @@ static OHOS_FONTS_DIR: &str = env!("OHOS_SDK_FONTS_DIR");
 #[cfg(not(ohos_mock))]
 static OHOS_FONTS_DIR: &str = "/system/fonts";
 
-#[allow(unused)]
+#[expect(unused)]
 #[derive(Clone, Copy, Debug, Default)]
 // HarmonyOS only comes in Condensed and Normal variants
 enum FontWidth {
@@ -81,11 +81,14 @@ struct FontList {
 fn enumerate_font_files() -> io::Result<Vec<PathBuf>> {
     let mut font_list = vec![];
     for elem in fs::read_dir(OHOS_FONTS_DIR)?.flatten() {
-        if elem.file_type().unwrap().is_file() {
+        if elem.file_type().is_ok_and(|file_type| file_type.is_file()) {
             let name = elem.file_name();
             let raw_name = name.as_bytes();
             if raw_name.ends_with(b".ttf".as_ref()) || raw_name.ends_with(b".ttc".as_ref()) {
-                debug!("Found font {}", elem.file_name().to_str().unwrap());
+                debug!(
+                    "Found font: {}",
+                    String::from_utf8_lossy(elem.file_name().as_bytes())
+                );
                 font_list.push(elem.path())
             }
         }
@@ -425,7 +428,7 @@ impl FontList {
 }
 
 // Functions used by SystemFontService
-pub fn for_each_available_family<F>(mut callback: F)
+pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
     F: FnMut(String),
 {
@@ -437,14 +440,15 @@ where
     }
 }
 
-pub fn for_each_variation<F>(family_name: &str, mut callback: F)
+pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
 where
     F: FnMut(FontTemplate),
 {
     let mut produce_font = |font: &Font| {
         let local_font_identifier = LocalFontIdentifier {
             path: Atom::from(font.filepath.clone()),
-            variation_index: 0,
+            face_index: 0,
+            named_instance_index: 0,
         };
         let stretch = font.width.into();
         let weight = font
@@ -467,6 +471,7 @@ where
         callback(FontTemplate::new(
             FontIdentifier::Local(local_font_identifier),
             descriptor,
+            None,
             None,
         ));
     };
@@ -565,7 +570,9 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
     families
 }
 
-pub fn default_system_generic_font_family(generic: GenericFontFamily) -> LowercaseFontFamilyName {
+pub(crate) fn default_system_generic_font_family(
+    generic: GenericFontFamily,
+) -> LowercaseFontFamilyName {
     let default_font = "HarmonyOS Sans".into();
     match generic {
         GenericFontFamily::Monospace => {

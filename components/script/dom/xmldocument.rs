@@ -2,9 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::rc::Rc;
+
 use data_url::mime::Mime;
 use dom_struct::dom_struct;
 use net_traits::request::InsecureRequestsPolicy;
+use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
 use script_traits::DocumentActivity;
 use servo_url::{MutableOrigin, ServoUrl};
 
@@ -17,6 +20,7 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
+use crate::dom::customelementregistry::CustomElementReactionStack;
 use crate::dom::document::{Document, DocumentSource, HasBrowsingContext, IsHTMLDocument};
 use crate::dom::location::Location;
 use crate::dom::node::Node;
@@ -44,6 +48,7 @@ impl XMLDocument {
         doc_loader: DocumentLoader,
         inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
         has_trustworthy_ancestor_origin: bool,
+        custom_element_reaction_stack: Rc<CustomElementReactionStack>,
     ) -> XMLDocument {
         XMLDocument {
             document: Document::new_inherited(
@@ -64,6 +69,8 @@ impl XMLDocument {
                 false,
                 inherited_insecure_requests_policy,
                 has_trustworthy_ancestor_origin,
+                custom_element_reaction_stack,
+                window.Document().creation_sandboxing_flag_set(),
             ),
         }
     }
@@ -82,6 +89,7 @@ impl XMLDocument {
         doc_loader: DocumentLoader,
         inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
         has_trustworthy_ancestor_origin: bool,
+        custom_element_reaction_stack: Rc<CustomElementReactionStack>,
         can_gc: CanGc,
     ) -> DomRoot<XMLDocument> {
         let doc = reflect_dom_object(
@@ -98,6 +106,7 @@ impl XMLDocument {
                 doc_loader,
                 inherited_insecure_requests_policy,
                 has_trustworthy_ancestor_origin,
+                custom_element_reaction_stack,
             )),
             window,
             can_gc,
@@ -111,17 +120,17 @@ impl XMLDocument {
 }
 
 impl XMLDocumentMethods<crate::DomTypeHolder> for XMLDocument {
-    // https://html.spec.whatwg.org/multipage/#dom-document-location
+    /// <https://html.spec.whatwg.org/multipage/#dom-document-location>
     fn GetLocation(&self) -> Option<DomRoot<Location>> {
         self.upcast::<Document>().GetLocation()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names
+    /// <https://html.spec.whatwg.org/multipage/#dom-tree-accessors:supported-property-names>
     fn SupportedPropertyNames(&self) -> Vec<DOMString> {
         self.upcast::<Document>().SupportedPropertyNames()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-tree-accessors:dom-document-nameditem-filter
+    /// <https://html.spec.whatwg.org/multipage/#dom-tree-accessors:dom-document-nameditem-filter>
     fn NamedGetter(&self, name: DOMString, can_gc: CanGc) -> Option<NamedPropertyValue> {
         self.upcast::<Document>().NamedGetter(name, can_gc)
     }

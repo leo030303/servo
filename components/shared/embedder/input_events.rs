@@ -2,28 +2,70 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use bitflags::bitflags;
 use keyboard_types::{Code, CompositionEvent, Key, KeyState, Location, Modifiers};
-use log::error;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 use webrender_api::ExternalScrollId;
-use webrender_api::units::DevicePoint;
 
-use crate::WebDriverMessageId;
+use crate::WebViewPoint;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct InputEventId(usize);
+
+static INPUT_EVENT_ID: AtomicUsize = AtomicUsize::new(0);
+
+impl InputEventId {
+    fn new() -> Self {
+        Self(INPUT_EVENT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+bitflags! {
+    #[derive(Clone, Copy, Default, Deserialize, PartialEq, Serialize)]
+    pub struct InputEventResult: u8 {
+        /// Whether or not this input event's default behavior was prevented via script.
+        const DefaultPrevented = 1 << 0;
+        /// Whether or not the WebView handled this event. Some events have default handlers in
+        /// Servo, such as keyboard events that insert characters in `<input>` areas. When these
+        /// handlers are triggered, this flag is included. This can be used to prevent triggering
+        /// behavior (such as keybindings) when the WebView has already consumed the event for its
+        /// own purpose.
+        const Consumed = 1 << 1;
+    }
+}
 
 /// An input event that is sent from the embedder to Servo.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum InputEvent {
     EditingAction(EditingActionEvent),
+    #[cfg(feature = "gamepad")]
     Gamepad(GamepadEvent),
     Ime(ImeEvent),
     Keyboard(KeyboardEvent),
     MouseButton(MouseButtonEvent),
-    MouseMove(MouseMoveEvent),
     MouseLeftViewport(MouseLeftViewportEvent),
+    MouseMove(MouseMoveEvent),
+    Scroll(ScrollEvent),
     Touch(TouchEvent),
     Wheel(WheelEvent),
-    Scroll(ScrollEvent),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct InputEventAndId {
+    pub event: InputEvent,
+    pub id: InputEventId,
+}
+
+impl From<InputEvent> for InputEventAndId {
+    fn from(event: InputEvent) -> Self {
+        Self {
+            event,
+            id: InputEventId::new(),
+        }
+    }
 }
 
 /// An editing action that should be performed on a `WebView`.
@@ -35,9 +77,10 @@ pub enum EditingActionEvent {
 }
 
 impl InputEvent {
-    pub fn point(&self) -> Option<DevicePoint> {
+    pub fn point(&self) -> Option<WebViewPoint> {
         match self {
             InputEvent::EditingAction(..) => None,
+            #[cfg(feature = "gamepad")]
             InputEvent::Gamepad(..) => None,
             InputEvent::Ime(..) => None,
             InputEvent::Keyboard(..) => None,
@@ -49,61 +92,17 @@ impl InputEvent {
             InputEvent::Scroll(..) => None,
         }
     }
-
-    pub fn webdriver_message_id(&self) -> Option<WebDriverMessageId> {
-        match self {
-            InputEvent::EditingAction(..) => None,
-            InputEvent::Gamepad(..) => None,
-            InputEvent::Ime(..) => None,
-            InputEvent::Keyboard(event) => event.webdriver_id,
-            InputEvent::MouseButton(event) => event.webdriver_id,
-            InputEvent::MouseMove(event) => event.webdriver_id,
-            InputEvent::MouseLeftViewport(..) => None,
-            InputEvent::Touch(..) => None,
-            InputEvent::Wheel(event) => event.webdriver_id,
-            InputEvent::Scroll(..) => None,
-        }
-    }
-
-    pub fn with_webdriver_message_id(mut self, webdriver_id: Option<WebDriverMessageId>) -> Self {
-        match self {
-            InputEvent::EditingAction(..) => {},
-            InputEvent::Gamepad(..) => {},
-            InputEvent::Ime(..) => {},
-            InputEvent::Keyboard(ref mut event) => {
-                event.webdriver_id = webdriver_id;
-            },
-            InputEvent::MouseButton(ref mut event) => {
-                event.webdriver_id = webdriver_id;
-            },
-            InputEvent::MouseMove(ref mut event) => {
-                event.webdriver_id = webdriver_id;
-            },
-            InputEvent::MouseLeftViewport(..) => {},
-            InputEvent::Touch(..) => {},
-            InputEvent::Wheel(ref mut event) => {
-                event.webdriver_id = webdriver_id;
-            },
-            InputEvent::Scroll(..) => {},
-        };
-
-        self
-    }
 }
 
-/// Recreate KeyboardEvent from keyboard_types to pair it with webdriver_id,
-/// which is used for webdriver action synchronization.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct KeyboardEvent {
     pub event: ::keyboard_types::KeyboardEvent,
-    webdriver_id: Option<WebDriverMessageId>,
 }
 
 impl KeyboardEvent {
     pub fn new(keyboard_event: ::keyboard_types::KeyboardEvent) -> Self {
         Self {
             event: keyboard_event,
-            webdriver_id: None,
         }
     }
 
@@ -140,22 +139,20 @@ impl KeyboardEvent {
 pub struct MouseButtonEvent {
     pub action: MouseButtonAction,
     pub button: MouseButton,
-    pub point: DevicePoint,
-    webdriver_id: Option<WebDriverMessageId>,
+    pub point: WebViewPoint,
 }
 
 impl MouseButtonEvent {
-    pub fn new(action: MouseButtonAction, button: MouseButton, point: DevicePoint) -> Self {
+    pub fn new(action: MouseButtonAction, button: MouseButton, point: WebViewPoint) -> Self {
         Self {
             action,
             button,
             point,
-            webdriver_id: None,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum MouseButton {
     Left,
     Middle,
@@ -195,8 +192,6 @@ impl From<MouseButton> for i16 {
 /// The types of mouse events
 #[derive(Clone, Copy, Debug, Deserialize, MallocSizeOf, PartialEq, Serialize)]
 pub enum MouseButtonAction {
-    /// Mouse button clicked
-    Click,
     /// Mouse button down
     Down,
     /// Mouse button up
@@ -205,15 +200,22 @@ pub enum MouseButtonAction {
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct MouseMoveEvent {
-    pub point: DevicePoint,
-    webdriver_id: Option<WebDriverMessageId>,
+    pub point: WebViewPoint,
+    pub is_compatibility_event_for_touch: bool,
 }
 
 impl MouseMoveEvent {
-    pub fn new(point: DevicePoint) -> Self {
+    pub fn new(point: WebViewPoint) -> Self {
         Self {
             point,
-            webdriver_id: None,
+            is_compatibility_event_for_touch: false,
+        }
+    }
+
+    pub fn new_compatibility_for_touch(point: WebViewPoint) -> Self {
+        Self {
+            point,
+            is_compatibility_event_for_touch: true,
         }
     }
 }
@@ -242,62 +244,23 @@ pub enum TouchEventType {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TouchId(pub i32);
 
-/// An ID for a sequence of touch events between a `Down` and the `Up` or `Cancel` event.
-/// The ID is the same for all events between `Down` and `Up` or `Cancel`
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct TouchSequenceId(u32);
-
-impl TouchSequenceId {
-    pub const fn new() -> Self {
-        Self(0)
-    }
-
-    /// Increments the ID for the next touch sequence.
-    ///
-    /// The increment is wrapping, since we can assume that the touch handler
-    /// script for touch sequence N will have finished processing by the time
-    /// we have wrapped around.
-    pub fn next(&mut self) {
-        self.0 = self.0.wrapping_add(1);
-    }
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct TouchEvent {
     pub event_type: TouchEventType,
     pub id: TouchId,
-    pub point: DevicePoint,
+    pub point: WebViewPoint,
     /// cancelable default value is true, once the first move has been processed by script disable it.
     cancelable: bool,
-    /// The sequence_id will be set by servo's touch handler.
-    sequence_id: Option<TouchSequenceId>,
 }
 
 impl TouchEvent {
-    pub fn new(event_type: TouchEventType, id: TouchId, point: DevicePoint) -> Self {
+    pub fn new(event_type: TouchEventType, id: TouchId, point: WebViewPoint) -> Self {
         TouchEvent {
             event_type,
             id,
             point,
-            sequence_id: None,
             cancelable: true,
         }
-    }
-    /// Embedders should ignore this.
-    #[doc(hidden)]
-    pub fn init_sequence_id(&mut self, sequence_id: TouchSequenceId) {
-        if self.sequence_id.is_none() {
-            self.sequence_id = Some(sequence_id);
-        } else {
-            // We could allow embedders to set the sequence ID.
-            error!("Sequence ID already set.");
-        }
-    }
-
-    #[doc(hidden)]
-    pub fn expect_sequence_id(&self) -> TouchSequenceId {
-        self.sequence_id.expect("Sequence ID not initialized")
     }
 
     #[doc(hidden)]
@@ -338,17 +301,12 @@ pub struct WheelDelta {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 pub struct WheelEvent {
     pub delta: WheelDelta,
-    pub point: DevicePoint,
-    webdriver_id: Option<WebDriverMessageId>,
+    pub point: WebViewPoint,
 }
 
 impl WheelEvent {
-    pub fn new(delta: WheelDelta, point: DevicePoint) -> Self {
-        WheelEvent {
-            delta,
-            point,
-            webdriver_id: None,
-        }
+    pub fn new(delta: WheelDelta, point: WebViewPoint) -> Self {
+        WheelEvent { delta, point }
     }
 }
 
@@ -363,12 +321,14 @@ pub enum ImeEvent {
     Dismissed,
 }
 
+#[cfg(feature = "gamepad")]
 #[derive(
     Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
 )]
 /// Index of gamepad in list of system's connected gamepads
 pub struct GamepadIndex(pub usize);
 
+#[cfg(feature = "gamepad")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// The minimum and maximum values that can be reported for axis or button input from this gamepad
 pub struct GamepadInputBounds {
@@ -378,6 +338,7 @@ pub struct GamepadInputBounds {
     pub button_bounds: (f64, f64),
 }
 
+#[cfg(feature = "gamepad")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// The haptic effects supported by this gamepad
 pub struct GamepadSupportedHapticEffects {
@@ -387,6 +348,7 @@ pub struct GamepadSupportedHapticEffects {
     pub supports_trigger_rumble: bool,
 }
 
+#[cfg(feature = "gamepad")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// The type of Gamepad event
 pub enum GamepadEvent {
@@ -406,6 +368,7 @@ pub enum GamepadEvent {
     Updated(GamepadIndex, GamepadUpdateType),
 }
 
+#[cfg(feature = "gamepad")]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// The type of Gamepad input being updated
 pub enum GamepadUpdateType {

@@ -7,10 +7,9 @@ use std::collections::HashMap;
 use gilrs::ff::{BaseEffect, BaseEffectType, Effect, EffectBuilder, Repeat, Replay, Ticks};
 use gilrs::{EventType, Gilrs};
 use log::{debug, warn};
-use servo::ipc_channel::ipc::IpcSender;
 use servo::{
     GamepadEvent, GamepadHapticEffectType, GamepadIndex, GamepadInputBounds,
-    GamepadSupportedHapticEffects, GamepadUpdateType, WebView,
+    GamepadSupportedHapticEffects, GamepadUpdateType, InputEvent, IpcSender, WebView,
 };
 
 pub struct HapticEffect {
@@ -128,7 +127,7 @@ impl GamepadSupport {
             }
 
             if let Some(event) = gamepad_event {
-                active_webview.notify_input_event(servo::InputEvent::Gamepad(event));
+                active_webview.notify_input_event(InputEvent::Gamepad(event));
             }
         }
     }

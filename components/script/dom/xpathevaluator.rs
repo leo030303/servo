@@ -6,13 +6,12 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
 
-use super::bindings::error::Error;
 use crate::dom::bindings::codegen::Bindings::XPathEvaluatorBinding::XPathEvaluatorMethods;
-use crate::dom::bindings::codegen::Bindings::XPathExpressionBinding::XPathExpression_Binding::XPathExpressionMethods;
 use crate::dom::bindings::codegen::Bindings::XPathNSResolverBinding::XPathNSResolver;
 use crate::dom::bindings::error::Fallible;
-use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
+use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::node::Node;
@@ -20,6 +19,7 @@ use crate::dom::window::Window;
 use crate::dom::xpathexpression::XPathExpression;
 use crate::dom::xpathresult::XPathResult;
 use crate::script_runtime::CanGc;
+use crate::xpath::parse_expression;
 
 #[dom_struct]
 pub(crate) struct XPathEvaluator {
@@ -63,16 +63,16 @@ impl XPathEvaluatorMethods<crate::DomTypeHolder> for XPathEvaluator {
     fn CreateExpression(
         &self,
         expression: DOMString,
-        _resolver: Option<Rc<XPathNSResolver>>,
+        resolver: Option<Rc<XPathNSResolver>>,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<XPathExpression>> {
-        let global = self.global();
-        let window = global.as_window();
-        // NB: this function is *not* Fallible according to the spec, so we swallow any parsing errors and
-        // just pass a None as the expression... it's not great.
-        let parsed_expression = crate::xpath::parse(&expression).map_err(|_e| Error::Syntax)?;
+        let parsed_expression = parse_expression(
+            &expression.str(),
+            resolver,
+            self.window.Document().is_html_document(),
+        )?;
         Ok(XPathExpression::new(
-            window,
+            &self.window,
             None,
             can_gc,
             parsed_expression,
@@ -88,23 +88,19 @@ impl XPathEvaluatorMethods<crate::DomTypeHolder> for XPathEvaluator {
     /// <https://dom.spec.whatwg.org/#dom-xpathevaluatorbase-evaluate>
     fn Evaluate(
         &self,
-        expression_str: DOMString,
+        expression: DOMString,
         context_node: &Node,
-        _resolver: Option<Rc<XPathNSResolver>>,
+        resolver: Option<Rc<XPathNSResolver>>,
         result_type: u16,
         result: Option<&XPathResult>,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<XPathResult>> {
-        let global = self.global();
-        let window = global.as_window();
-        let parsed_expression = crate::xpath::parse(&expression_str).map_err(|_| Error::Syntax)?;
-        let expression = XPathExpression::new(window, None, can_gc, parsed_expression);
-        XPathExpressionMethods::<crate::DomTypeHolder>::Evaluate(
-            &*expression,
-            context_node,
-            result_type,
-            result,
-            can_gc,
-        )
+        let parsed_expression = parse_expression(
+            &expression.str(),
+            resolver,
+            self.window.Document().is_html_document(),
+        )?;
+        let expression = XPathExpression::new(&self.window, None, can_gc, parsed_expression);
+        expression.evaluate_internal(context_node, result_type, result, can_gc)
     }
 }

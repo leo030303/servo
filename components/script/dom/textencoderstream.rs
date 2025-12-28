@@ -17,7 +17,7 @@ use js::rust::{
     HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
     MutableHandleValue as SafeMutableHandleValue, ToString,
 };
-use js::typedarray::Uint8Array;
+use js::typedarray::Uint8;
 use script_bindings::conversions::SafeToJSValConvertible;
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
@@ -47,7 +47,7 @@ enum ConvertedInput<'a> {
 ///
 /// See below for the `ToString` procedure in spec:
 /// <https://tc39.es/ecma262/multipage/abstract-operations.html#sec-tostring>
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn jsval_to_primitive(
     cx: SafeJSContext,
     global: &GlobalScope,
@@ -121,7 +121,6 @@ impl Encoder {
     }
 
     /// Encode an input slice of code unit into unicode scalar values
-    #[allow(unsafe_code)]
     fn encode_from_code_units(&self, input: &[u16]) -> String {
         // <https://encoding.spec.whatwg.org/#encode-and-enqueue-a-chunk>
         //
@@ -211,7 +210,7 @@ fn code_point_type(value: u16) -> CodePointType {
 }
 
 /// <https://encoding.spec.whatwg.org/#encode-and-enqueue-a-chunk>
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn encode_and_enqueue_a_chunk(
     cx: SafeJSContext,
     global: &GlobalScope,
@@ -275,17 +274,16 @@ pub(crate) fn encode_and_enqueue_a_chunk(
     // Step 4.2.2.1 Let chunk be the result of creating a Uint8Array object
     //      given output and encoder’s relevant realm.
     rooted!(in(*cx) let mut js_object = ptr::null_mut::<JSObject>());
-    let chunk: Uint8Array = create_buffer_source(cx, output, js_object.handle_mut(), can_gc)
+    let chunk = create_buffer_source::<Uint8>(cx, output, js_object.handle_mut(), can_gc)
         .map_err(|_| Error::Type("Cannot convert byte sequence to Uint8Array".to_owned()))?;
     rooted!(in(*cx) let mut rval = UndefinedValue());
-    chunk.safe_to_jsval(cx, rval.handle_mut());
+    chunk.safe_to_jsval(cx, rval.handle_mut(), can_gc);
     // Step 4.2.2.2 Enqueue chunk into encoder’s transform.
     controller.enqueue(cx, global, rval.handle(), can_gc)?;
     Ok(())
 }
 
 /// <https://encoding.spec.whatwg.org/#encode-and-flush>
-#[allow(unsafe_code)]
 pub(crate) fn encode_and_flush(
     cx: SafeJSContext,
     global: &GlobalScope,
@@ -298,13 +296,15 @@ pub(crate) fn encode_and_flush(
         // Step 1.1 Let chunk be the result of creating a Uint8Array object
         //      given « 0xEF, 0xBF, 0xBD » and encoder’s relevant realm.
         rooted!(in(*cx) let mut js_object = ptr::null_mut::<JSObject>());
-        let chunk: Uint8Array =
-            create_buffer_source(cx, &[0xEF_u8, 0xBF, 0xBD], js_object.handle_mut(), can_gc)
-                .map_err(|_| {
-                    Error::Type("Cannot convert byte sequence to Uint8Array".to_owned())
-                })?;
+        let chunk = create_buffer_source::<Uint8>(
+            cx,
+            &[0xEF_u8, 0xBF, 0xBD],
+            js_object.handle_mut(),
+            can_gc,
+        )
+        .map_err(|_| Error::Type("Cannot convert byte sequence to Uint8Array".to_owned()))?;
         rooted!(in(*cx) let mut rval = UndefinedValue());
-        chunk.safe_to_jsval(cx, rval.handle_mut());
+        chunk.safe_to_jsval(cx, rval.handle_mut(), can_gc);
         // Step 1.2 Enqueue chunk into encoder’s transform.
         return controller.enqueue(cx, global, rval.handle(), can_gc);
     }
@@ -361,7 +361,6 @@ impl TextEncoderStream {
     }
 }
 
-#[allow(non_snake_case)]
 impl TextEncoderStreamMethods<DomTypeHolder> for TextEncoderStream {
     /// <https://encoding.spec.whatwg.org/#dom-textencoderstream>
     fn Constructor(

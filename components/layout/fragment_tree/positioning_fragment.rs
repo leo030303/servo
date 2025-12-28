@@ -18,14 +18,10 @@ use crate::geom::PhysicalRect;
 #[derive(MallocSizeOf)]
 pub(crate) struct PositioningFragment {
     pub base: BaseFragment,
-    pub rect: PhysicalRect<Au>,
     pub children: Vec<Fragment>,
 
     /// The scrollable overflow of this anonymous fragment's children.
     scrollable_overflow: Option<PhysicalRect<Au>>,
-
-    /// The style of the fragment.
-    pub style: ServoArc<ComputedValues>,
 
     /// This [`PositioningFragment`]'s containing block rectangle in coordinates relative to
     /// the initial containing block, but not taking into account any transforms.
@@ -38,7 +34,7 @@ impl PositioningFragment {
         rect: PhysicalRect<Au>,
         children: Vec<Fragment>,
     ) -> ArcRefCell<Self> {
-        Self::new_with_base_fragment(BaseFragment::anonymous(), style, rect, children)
+        Self::new_with_base_fragment_info(BaseFragmentInfo::anonymous(), style, rect, children)
     }
 
     pub fn new_empty(
@@ -46,19 +42,17 @@ impl PositioningFragment {
         rect: PhysicalRect<Au>,
         style: ServoArc<ComputedValues>,
     ) -> ArcRefCell<Self> {
-        Self::new_with_base_fragment(base_fragment_info.into(), style, rect, Vec::new())
+        Self::new_with_base_fragment_info(base_fragment_info, style, rect, Vec::new())
     }
 
-    fn new_with_base_fragment(
-        base: BaseFragment,
+    fn new_with_base_fragment_info(
+        base_fragment_info: BaseFragmentInfo,
         style: ServoArc<ComputedValues>,
         rect: PhysicalRect<Au>,
         children: Vec<Fragment>,
     ) -> ArcRefCell<Self> {
         ArcRefCell::new(PositioningFragment {
-            base,
-            style,
-            rect,
+            base: BaseFragment::new(base_fragment_info, style.into(), rect),
             children,
             scrollable_overflow: None,
             cumulative_containing_block_rect: PhysicalRect::zero(),
@@ -80,7 +74,7 @@ impl PositioningFragment {
                 acc.union(
                     &child
                         .calculate_scrollable_overflow_for_parent()
-                        .translate(self.rect.origin.to_vector()),
+                        .translate(self.base.rect.origin.to_vector()),
                 )
             },
         ));
@@ -98,7 +92,7 @@ impl PositioningFragment {
                 \nbase={:?}\
                 \nrect={:?}\
                 \nscrollable_overflow={:?}",
-            self.base, self.rect, self.scrollable_overflow
+            self.base, self.base.rect, self.scrollable_overflow
         ));
 
         for child in &self.children {

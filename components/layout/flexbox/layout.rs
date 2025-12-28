@@ -261,7 +261,7 @@ impl FlexLineItem<'_> {
         }
 
         if style.clone_position() == Position::Relative {
-            fragment.content_rect.origin += relative_adjustement(style, containing_block)
+            fragment.base.rect.origin += relative_adjustement(style, containing_block)
                 .to_physical_size(containing_block.style.writing_mode)
         }
 
@@ -311,7 +311,7 @@ impl FlexContainerConfig {
     fn resolve_align_self_for_child(&self, child_style: &ComputedValues) -> AlignFlags {
         self.resolve_reversable_flex_alignment(
             child_style
-                .resolve_align_self(self.align_items, AlignItems(AlignFlags::STRETCH))
+                .resolve_align_self(self.align_items, AlignFlags::STRETCH)
                 .0,
             self.flex_wrap_is_reversed,
         )
@@ -319,7 +319,7 @@ impl FlexContainerConfig {
 
     fn resolve_justify_content_for_child(&self) -> AlignFlags {
         self.resolve_reversable_flex_alignment(
-            self.justify_content.0.primary(),
+            self.justify_content.primary(),
             self.flex_direction_is_reversed,
         )
     }
@@ -718,7 +718,7 @@ impl FlexContainer {
         let num_lines = initial_line_layouts.len();
         let resolved_align_content: AlignFlags = {
             // Computed value from the style system
-            let align_content_style = flex_context.config.align_content.0.primary();
+            let align_content_style = flex_context.config.align_content.primary();
             let mut is_safe = align_content_style.flags() == AlignFlags::SAFE;
 
             // From https://drafts.csswg.org/css-align/#distribution-flex
@@ -865,7 +865,7 @@ impl FlexContainer {
                 let physical_line_position =
                     flow_relative_line_position.to_physical_size(self.style.writing_mode);
                 for (fragment, _) in &mut final_line_layout.item_fragments {
-                    fragment.borrow_mut().content_rect.origin += physical_line_position;
+                    fragment.borrow_mut().base.rect.origin += physical_line_position;
                 }
                 final_line_layout.item_fragments
             })
@@ -1239,6 +1239,7 @@ impl InitialFlexLineLayout<'_> {
             frozen: Cell<bool>,
             target_main_size: Cell<Au>,
             flex_factor: f32,
+            min_max_violation_kind: Cell<Ordering>,
         }
 
         // > 1. Determine the used flex factor. Sum the outer hypothetical main sizes of all
@@ -1286,6 +1287,8 @@ impl InitialFlexLineLayout<'_> {
                     frozen,
                     target_main_size,
                     flex_factor,
+                    // The actual violation will be computed later.
+                    min_max_violation_kind: Cell::new(Ordering::Equal),
                 }
             })
             .collect();
@@ -1391,14 +1394,19 @@ impl InitialFlexLineLayout<'_> {
             // > If the item’s target main size was made smaller by this, it’s a max
             // > violation. If the item’s target main size was made larger by this, it’s a
             // > min violation.
-            let violation = |item: &FlexibleLengthResolutionItem| {
-                let size = item.target_main_size.get();
-                let clamped = size.clamp_between_extremums(
+            let mut total_violation = Au::zero();
+            for item in unfrozen_items() {
+                let unclamped = item.target_main_size.get();
+                let clamped = unclamped.clamp_between_extremums(
                     item.item.content_min_main_size,
                     item.item.content_max_main_size,
                 );
-                clamped - size
-            };
+                item.target_main_size.set(clamped);
+                // We represent min violations with Ordering::Greater, and max violations
+                // with Ordering::Less.
+                item.min_max_violation_kind.set(clamped.cmp(&unclamped));
+                total_violation += clamped - unclamped;
+            }
 
             // > 5. e. Freeze over-flexed items. The total violation is the sum of the
             // > adjustments from the previous step ∑(clamped size - unclamped size). If the
@@ -1406,7 +1414,6 @@ impl InitialFlexLineLayout<'_> {
             // > - Zero:  Freeze all items.
             // > - Positive: Freeze all the items with min violations.
             // > - Negative:  Freeze all the items with max violations.
-            let total_violation: Au = unfrozen_items().map(violation).sum();
             match total_violation.cmp(&Au::zero()) {
                 Ordering::Equal => {
                     // “Freeze all items.”
@@ -1414,29 +1421,9 @@ impl InitialFlexLineLayout<'_> {
                     let remaining_free_space = free_space(true);
                     return (main_sizes(items), remaining_free_space);
                 },
-                Ordering::Greater => {
-                    // “Freeze all the items with min violations.”
-                    // “If the item’s target main size was made larger by [clamping],
-                    //  it’s a min violation.”
-                    for item in items.iter() {
-                        if violation(item) > Au::zero() {
-                            item.target_main_size.set(item.item.content_min_main_size);
-                            item.frozen.set(true);
-                            frozen_count += 1;
-                        }
-                    }
-                },
-                Ordering::Less => {
-                    // Negative total violation
-                    // “Freeze all the items with max violations.”
-                    // “If the item’s target main size was made smaller by [clamping],
-                    //  it’s a max violation.”
-                    for item in items.iter() {
-                        if violation(item) < Au::zero() {
-                            let Some(max_size) = item.item.content_max_main_size else {
-                                unreachable!()
-                            };
-                            item.target_main_size.set(max_size);
+                total_violation_kind => {
+                    for item in unfrozen_items() {
+                        if item.min_max_violation_kind.get() == total_violation_kind {
                             item.frozen.set(true);
                             frozen_count += 1;
                         }
@@ -1610,7 +1597,7 @@ impl InitialFlexLineLayout<'_> {
         // In addition to the spec at https://www.w3.org/TR/css-align-3/ this implementation follows
         // the resolution of https://github.com/w3c/csswg-drafts/issues/10154
         let resolved_justify_content: AlignFlags = {
-            let justify_content_style = flex_context.config.justify_content.0.primary();
+            let justify_content_style = flex_context.config.justify_content.primary();
 
             // Inital values from the style system
             let mut resolved_justify_content = justify_content_style.value();
@@ -2050,7 +2037,7 @@ impl FlexItemBox {
         let flex_axis = config.flex_axis;
         let style = self.style();
         let cross_axis_is_item_block_axis = cross_axis_is_item_block_axis(
-            containing_block.writing_mode.is_horizontal(),
+            containing_block.style.writing_mode.is_horizontal(),
             style.writing_mode.is_horizontal(),
             flex_axis,
         );
@@ -2180,7 +2167,7 @@ impl FlexItemBox {
                 // The main axis is the inline axis, so we can get the content size from the normal
                 // preferred widths calculation.
                 let constraint_space =
-                    ConstraintSpace::new(cross_size, style.writing_mode, preferred_aspect_ratio);
+                    ConstraintSpace::new(cross_size, style, preferred_aspect_ratio);
                 let content_sizes = flex_item
                     .inline_content_sizes(layout_context, &constraint_space)
                     .sizes;
@@ -2586,9 +2573,8 @@ impl FlexItemBox {
         block_size: SizeConstraint,
         preferred_aspect_ratio: Option<AspectRatio>,
     ) -> ContentSizes {
-        let writing_mode = self.independent_formatting_context.style().writing_mode;
-        let constraint_space =
-            ConstraintSpace::new(block_size, writing_mode, preferred_aspect_ratio);
+        let style = self.independent_formatting_context.style();
+        let constraint_space = ConstraintSpace::new(block_size, style, preferred_aspect_ratio);
         self.independent_formatting_context
             .inline_content_sizes(flex_context.layout_context, &constraint_space)
             .sizes

@@ -4,11 +4,8 @@
 
 use std::cmp::{max, min};
 use std::ops::Range;
-use std::path::PathBuf;
-use std::time::SystemTime;
 
-use base::id::WebViewId;
-use embedder_traits::FilterPattern;
+use embedder_traits::{EmbedderControlId, EmbedderControlResponse, FilePickerRequest};
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
 use num_traits::ToPrimitive;
@@ -23,6 +20,7 @@ use crate::blob_url_store::{BlobBuf, BlobURLStoreError};
 pub type FileOrigin = String;
 
 /// A token modulating access to a file for a blob URL.
+#[derive(Clone)]
 pub enum FileTokenCheck {
     /// Checking against a token not required,
     /// used for accessing a file
@@ -122,35 +120,13 @@ impl RelativePos {
     }
 }
 
-/// Response to file selection request
-#[derive(Debug, Deserialize, Serialize)]
-pub struct SelectedFile {
-    pub id: Uuid,
-    pub filename: PathBuf,
-    pub modified: SystemTime,
-    pub size: u64,
-    // https://w3c.github.io/FileAPI/#dfn-type
-    pub type_string: String,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 pub enum FileManagerThreadMsg {
-    /// Select a single file. Last field is pre-selected file path for testing
-    SelectFile(
-        WebViewId,
-        Vec<FilterPattern>,
-        IpcSender<FileManagerResult<SelectedFile>>,
-        FileOrigin,
-        Option<PathBuf>,
-    ),
-
-    /// Select multiple files. Last field is pre-selected file paths for testing
+    /// Select a file or files.
     SelectFiles(
-        WebViewId,
-        Vec<FilterPattern>,
-        IpcSender<FileManagerResult<Vec<SelectedFile>>>,
-        FileOrigin,
-        Option<Vec<PathBuf>>,
+        EmbedderControlId,
+        FilePickerRequest,
+        IpcSender<EmbedderControlResponse>,
     ),
 
     /// Read FileID-indexed file in chunks, optionally check URL validity based on boolean flag

@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use base::generic_channel::GenericSender;
 use bluetooth_traits::{BluetoothError, BluetoothRequest, GATTType};
 use bluetooth_traits::{BluetoothResponse, BluetoothResponseResult};
 use bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
@@ -42,7 +43,6 @@ use js::jsval::{ObjectValue, UndefinedValue};
 use profile_traits::ipc as ProfiledIpc;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 
 const KEY_CONVERSION_ERROR: &str =
@@ -65,7 +65,7 @@ const BT_DESC_CONVERSION_ERROR: &str =
     "Can't convert to an IDL value of type BluetoothPermissionDescriptor";
 
 #[derive(JSTraceable, MallocSizeOf)]
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub(crate) struct AllowedBluetoothDevice {
     pub(crate) deviceId: DOMString,
     pub(crate) mayUseGATT: bool,
@@ -155,7 +155,7 @@ impl Bluetooth {
         reflect_dom_object(Box::new(Bluetooth::new_inherited()), global, can_gc)
     }
 
-    fn get_bluetooth_thread(&self) -> IpcSender<BluetoothRequest> {
+    fn get_bluetooth_thread(&self) -> GenericSender<BluetoothRequest> {
         self.global().as_window().bluetooth_thread()
     }
 
@@ -163,7 +163,7 @@ impl Bluetooth {
         &self.device_instance_map
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#request-bluetooth-devices
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#request-bluetooth-devices>
     fn request_bluetooth_devices(
         &self,
         p: &Rc<Promise>,
@@ -230,7 +230,7 @@ impl Bluetooth {
         if let PermissionState::Denied =
             descriptor_permission_state(PermissionName::Bluetooth, None)
         {
-            return p.reject_error(Error::NotFound, can_gc);
+            return p.reject_error(Error::NotFound(None), can_gc);
         }
 
         // Note: Step 3, 6 - 8 are implemented in
@@ -314,7 +314,7 @@ where
         };
         // Step 2.
         if uuid_is_blocklisted(canonicalized.as_ref(), Blocklist::All) {
-            p.reject_error(Security, can_gc);
+            p.reject_error(Security(None), can_gc);
             return p;
         }
         Some(canonicalized)
@@ -324,7 +324,7 @@ where
 
     // Step 3 - 4.
     if !connected {
-        p.reject_error(Network, can_gc);
+        p.reject_error(Network(None), can_gc);
         return p;
     }
 
@@ -348,7 +348,7 @@ where
     p
 }
 
-// https://webbluetoothcg.github.io/web-bluetooth/#bluetoothlescanfilterinit-canonicalizing
+/// <https://webbluetoothcg.github.io/web-bluetooth/#bluetoothlescanfilterinit-canonicalizing>
 fn canonicalize_filter(filter: &BluetoothLEScanFilterInit) -> Fallible<BluetoothScanfilter> {
     // Step 1.
     if filter.services.is_none() &&
@@ -379,7 +379,7 @@ fn canonicalize_filter(filter: &BluetoothLEScanFilterInit) -> Fallible<Bluetooth
 
                 // Step 3.4.
                 if uuid_is_blocklisted(uuid.as_ref(), Blocklist::All) {
-                    return Err(Security);
+                    return Err(Security(None));
                 }
 
                 services_vec.push(uuid);
@@ -432,7 +432,7 @@ fn canonicalize_filter(filter: &BluetoothLEScanFilterInit) -> Fallible<Bluetooth
             let mut map = HashMap::new();
             for (key, bdfi) in manufacturer_data_map.iter() {
                 // Step 7.1 - 7.2.
-                let manufacturer_id = match u16::from_str(key.as_ref()) {
+                let manufacturer_id = match key.str().parse::<u16>() {
                     Ok(id) => id,
                     Err(err) => {
                         return Err(Type(format!("{} {} {}", KEY_CONVERSION_ERROR, key, err)));
@@ -461,7 +461,7 @@ fn canonicalize_filter(filter: &BluetoothLEScanFilterInit) -> Fallible<Bluetooth
             }
             let mut map = HashMap::new();
             for (key, bdfi) in service_data_map.iter() {
-                let service_name = match u32::from_str(key.as_ref()) {
+                let service_name = match key.str().parse::<u32>() {
                     // Step 9.1.
                     Ok(number) => StringOrUnsignedLong::UnsignedLong(number),
                     // Step 9.2.
@@ -473,7 +473,7 @@ fn canonicalize_filter(filter: &BluetoothLEScanFilterInit) -> Fallible<Bluetooth
 
                 // Step 9.5.
                 if uuid_is_blocklisted(service.as_ref(), Blocklist::All) {
-                    return Err(Security);
+                    return Err(Security(None));
                 }
 
                 // Step 9.6: No need to convert to IDL values since this is only used by native code.
@@ -496,7 +496,7 @@ fn canonicalize_filter(filter: &BluetoothLEScanFilterInit) -> Fallible<Bluetooth
     ))
 }
 
-// https://webbluetoothcg.github.io/web-bluetooth/#bluetoothdatafilterinit-canonicalizing
+/// <https://webbluetoothcg.github.io/web-bluetooth/#bluetoothdatafilterinit-canonicalizing>
 fn canonicalize_bluetooth_data_filter_init(
     bdfi: &BluetoothDataFilterInit,
 ) -> Fallible<(Vec<u8>, Vec<u8>)> {
@@ -529,17 +529,17 @@ impl Convert<Error> for BluetoothError {
     fn convert(self) -> Error {
         match self {
             BluetoothError::Type(message) => Error::Type(message),
-            BluetoothError::Network => Error::Network,
-            BluetoothError::NotFound => Error::NotFound,
-            BluetoothError::NotSupported => Error::NotSupported,
-            BluetoothError::Security => Error::Security,
-            BluetoothError::InvalidState => Error::InvalidState,
+            BluetoothError::Network => Error::Network(None),
+            BluetoothError::NotFound => Error::NotFound(None),
+            BluetoothError::NotSupported => Error::NotSupported(None),
+            BluetoothError::Security => Error::Security(None),
+            BluetoothError::InvalidState => Error::InvalidState(None),
         }
     }
 }
 
 impl BluetoothMethods<crate::DomTypeHolder> for Bluetooth {
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-requestdevice
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-requestdevice>
     fn RequestDevice(
         &self,
         option: &RequestDeviceOptions,
@@ -568,7 +568,7 @@ impl BluetoothMethods<crate::DomTypeHolder> for Bluetooth {
         p
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-getavailability
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-getavailability>
     fn GetAvailability(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
         // Step 1. We did not override the method
@@ -635,19 +635,20 @@ impl PermissionAlgorithm for Bluetooth {
     fn create_descriptor(
         cx: JSContext,
         permission_descriptor_obj: *mut JSObject,
+        can_gc: CanGc,
     ) -> Result<BluetoothPermissionDescriptor, Error> {
         rooted!(in(*cx) let mut property = UndefinedValue());
         property
             .handle_mut()
             .set(ObjectValue(permission_descriptor_obj));
-        match BluetoothPermissionDescriptor::new(cx, property.handle()) {
+        match BluetoothPermissionDescriptor::new(cx, property.handle(), can_gc) {
             Ok(ConversionResult::Success(descriptor)) => Ok(descriptor),
             Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.into_owned())),
             Err(_) => Err(Error::Type(String::from(BT_DESC_CONVERSION_ERROR))),
         }
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#query-the-bluetooth-permission
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#query-the-bluetooth-permission>
     fn permission_query(
         _cx: JSContext,
         promise: &Rc<Promise>,
@@ -686,7 +687,7 @@ impl PermissionAlgorithm for Bluetooth {
                     continue;
                 }
             }
-            let device_id = String::from(allowed_device.deviceId.as_ref());
+            let device_id = String::from(allowed_device.deviceId.str());
 
             // Step 6.2.
             if let Some(ref filters) = descriptor.filters {
@@ -737,7 +738,7 @@ impl PermissionAlgorithm for Bluetooth {
         promise.resolve_native(status, CanGc::note());
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#request-the-bluetooth-permission
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#request-the-bluetooth-permission>
     fn permission_request(
         _cx: JSContext,
         promise: &Rc<Promise>,
@@ -764,7 +765,7 @@ impl PermissionAlgorithm for Bluetooth {
     }
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    // https://webbluetoothcg.github.io/web-bluetooth/#revoke-bluetooth-access
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#revoke-bluetooth-access>
     fn permission_revoke(
         _descriptor: &BluetoothPermissionDescriptor,
         status: &BluetoothPermissionResult,
@@ -791,7 +792,7 @@ impl PermissionAlgorithm for Bluetooth {
                 continue;
             }
             // Step 2.2 - 2.4
-            let _ = device.get_gatt().Disconnect(can_gc);
+            let _ = device.get_gatt(can_gc).Disconnect(can_gc);
         }
     }
 }

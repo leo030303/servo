@@ -29,7 +29,7 @@ impl AudioDestinationNode {
             options.unwrap_or(2, ChannelCountMode::Max, ChannelInterpretation::Speakers);
         AudioDestinationNode {
             node: AudioNode::new_inherited_for_id(
-                context.destination_node(),
+                Some(context.destination_node()),
                 context,
                 node_options,
                 1,
@@ -51,7 +51,7 @@ impl AudioDestinationNode {
 }
 
 impl AudioDestinationNodeMethods<crate::DomTypeHolder> for AudioDestinationNode {
-    // https://webaudio.github.io/web-audio-api/#dom-audiodestinationnode-maxchannelcount
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiodestinationnode-maxchannelcount>
     fn MaxChannelCount(&self) -> u32 {
         MAX_CHANNEL_COUNT
     }

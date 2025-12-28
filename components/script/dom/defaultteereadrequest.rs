@@ -50,22 +50,22 @@ pub(crate) struct DefaultTeeReadRequest {
     stream: Dom<ReadableStream>,
     branch_1: Dom<ReadableStream>,
     branch_2: Dom<ReadableStream>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     reading: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     read_again: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     canceled_1: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     clone_for_branch_2: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     cancel_promise: Rc<Promise>,
     tee_underlying_source: Dom<DefaultTeeUnderlyingSource>,
 }
 impl DefaultTeeReadRequest {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         stream: &ReadableStream,
@@ -117,16 +117,14 @@ impl DefaultTeeReadRequest {
             chunk: Heap::boxed(*chunk.handle()),
             tee_read_request: Dom::from_ref(self),
         };
-        let global = self.stream.global();
-        let microtask_queue = global.microtask_queue();
-        let cx = GlobalScope::get_cx();
-        microtask_queue.enqueue(
-            Microtask::ReadableStreamTeeReadRequest(tee_read_request_chunk),
-            cx,
-        );
+        self.stream
+            .global()
+            .enqueue_microtask(Microtask::ReadableStreamTeeReadRequest(
+                tee_read_request_chunk,
+            ));
     }
     /// <https://streams.spec.whatwg.org/#ref-for-read-request-chunk-steps%E2%91%A2>
-    #[allow(clippy::borrowed_box)]
+    #[expect(clippy::borrowed_box)]
     pub(crate) fn chunk_steps(&self, cx: SafeJSContext, chunk: &Box<Heap<JSVal>>, can_gc: CanGc) {
         let global = &self.stream.global();
         // Set readAgain to false.
@@ -143,7 +141,7 @@ impl DefaultTeeReadRequest {
             rooted!(in(*cx) let mut clone_result = UndefinedValue());
             let data = structuredclone::write(cx, chunk2_value.handle(), None).unwrap();
             // If cloneResult is an abrupt completion,
-            if structuredclone::read(global, data, clone_result.handle_mut()).is_err() {
+            if structuredclone::read(global, data, clone_result.handle_mut(), can_gc).is_err() {
                 // Perform ! ReadableStreamDefaultControllerError(branch_1.[[controller]], cloneResult.[[Value]]).
                 self.readable_stream_default_controller_error(
                     &self.branch_1,

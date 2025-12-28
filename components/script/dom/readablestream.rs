@@ -3,7 +3,6 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::ptr::{self};
 use std::rc::Rc;
@@ -14,11 +13,13 @@ use dom_struct::dom_struct;
 use ipc_channel::ipc::IpcSharedMemory;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
+use js::realm::CurrentRealm;
 use js::rust::{
     HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
     MutableHandleValue as SafeMutableHandleValue,
 };
 use js::typedarray::ArrayBufferViewU8;
+use rustc_hash::FxHashMap;
 use script_bindings::conversions::SafeToJSValConvertible;
 
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
@@ -44,6 +45,7 @@ use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_w
 use crate::dom::bindings::root::{DomRoot, MutNullableDom, Dom};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::bindings::utils::get_dictionary_property;
+use crate::dom::byteteeunderlyingsource::{ByteTeeCancelAlgorithm, ByteTeePullAlgorithm, ByteTeeUnderlyingSource};
 use crate::dom::countqueuingstrategy::{extract_high_water_mark, extract_size_algorithm};
 use crate::dom::readablestreamgenericreader::ReadableStreamGenericReader;
 use crate::dom::globalscope::GlobalScope;
@@ -52,7 +54,7 @@ use crate::dom::readablebytestreamcontroller::ReadableByteStreamController;
 use crate::dom::readablestreambyobreader::ReadableStreamBYOBReader;
 use crate::dom::readablestreamdefaultcontroller::ReadableStreamDefaultController;
 use crate::dom::readablestreamdefaultreader::{ReadRequest, ReadableStreamDefaultReader};
-use crate::dom::defaultteeunderlyingsource::TeeCancelAlgorithm;
+use crate::dom::defaultteeunderlyingsource::DefaultTeeCancelAlgorithm;
 use crate::dom::types::DefaultTeeUnderlyingSource;
 use crate::dom::underlyingsourcecontainer::UnderlyingSourceType;
 use crate::dom::writablestreamdefaultwriter::WritableStreamDefaultWriter;
@@ -65,11 +67,10 @@ use crate::dom::bindings::transferable::Transferable;
 use crate::dom::bindings::structuredclone::StructuredData;
 
 use super::bindings::buffer_source::HeapBufferSource;
-use super::bindings::codegen::Bindings::ReadableStreamBYOBReaderBinding::ReadableStreamBYOBReaderReadOptions;
 use super::readablestreambyobreader::ReadIntoRequest;
 
 /// State Machine for `PipeTo`.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, MallocSizeOf, PartialEq)]
 enum PipeToState {
     /// The starting state
     #[default]
@@ -91,7 +92,7 @@ enum PipeToState {
 }
 
 /// <https://streams.spec.whatwg.org/#rs-pipeTo-shutdown-with-action>
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, MallocSizeOf, PartialEq)]
 enum ShutdownAction {
     /// <https://streams.spec.whatwg.org/#writable-stream-abort>
     WritableStreamAbort,
@@ -124,11 +125,11 @@ pub(crate) struct PipeTo {
 
     /// Pending writes are needed when shutting down(with an action),
     /// because we can only finalize when all writes are finished.
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[ignore_malloc_size_of = "nested Rc"]
     pending_writes: Rc<RefCell<VecDeque<Rc<Promise>>>>,
 
     /// The state machine.
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[conditional_malloc_size_of]
     #[no_trace]
     state: Rc<RefCell<PipeToState>>,
 
@@ -143,7 +144,7 @@ pub(crate) struct PipeTo {
 
     /// The `shuttingDown` variable of
     /// <https://streams.spec.whatwg.org/#readable-stream-pipe-to>
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[conditional_malloc_size_of]
     shutting_down: Rc<Cell<bool>>,
 
     /// The abort reason of the abort signal,
@@ -158,12 +159,12 @@ pub(crate) struct PipeTo {
 
     /// The promise returned by a shutdown action.
     /// We keep it to only continue when it is not pending anymore.
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[ignore_malloc_size_of = "nested Rc"]
     shutdown_action_promise: Rc<RefCell<Option<Rc<Promise>>>>,
 
     /// The promise resolved or rejected at
     /// <https://streams.spec.whatwg.org/#rs-pipeTo-finalize>
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[conditional_malloc_size_of]
     result_promise: Rc<Promise>,
 }
 
@@ -212,8 +213,12 @@ impl Callback for PipeTo {
     /// - the current state.
     /// - the type of `result`.
     /// - the state of a stored promise(in some cases).
-    #[allow(unsafe_code)]
-    fn callback(&self, cx: SafeJSContext, result: SafeHandleValue, realm: InRealm, can_gc: CanGc) {
+    #[expect(unsafe_code)]
+    fn callback(&self, cx: &mut CurrentRealm, result: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let in_realm_proof = cx.into();
+        let realm = InRealm::Already(&in_realm_proof);
+        let cx = cx.into();
         let global = self.reader.global();
 
         // Note: we only care about the result of writes when they are rejected,
@@ -415,7 +420,7 @@ impl PipeTo {
 
     /// Try to write a chunk using the jsval, and returns wether it succeeded
     // It will fail if it is the last `done` chunk, or if it is not a chunk at all.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn write_chunk(
         &self,
         cx: SafeJSContext,
@@ -709,7 +714,7 @@ impl PipeTo {
                 self.writer.close_with_error_propagation(cx, global, can_gc)
             },
             ShutdownAction::Abort => {
-                // Note: implementation of the the `abortAlgorithm`
+                // Note: implementation of the `abortAlgorithm`
                 // of the signal associated with this piping operation.
 
                 // Let error be signal’s abort reason.
@@ -808,7 +813,7 @@ impl PipeTo {
 /// <https://streams.spec.whatwg.org/#readable-stream-cancel>.
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 struct SourceCancelPromiseFulfillmentHandler {
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[conditional_malloc_size_of]
     result: Rc<Promise>,
 }
 
@@ -816,7 +821,8 @@ impl Callback for SourceCancelPromiseFulfillmentHandler {
     /// The fulfillment handler for the reacting to sourceCancelPromise part of
     /// <https://streams.spec.whatwg.org/#readable-stream-cancel>.
     /// An implementation of <https://webidl.spec.whatwg.org/#dfn-perform-steps-once-promise-is-settled>
-    fn callback(&self, _cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         self.result.resolve_native(&(), can_gc);
     }
 }
@@ -825,7 +831,7 @@ impl Callback for SourceCancelPromiseFulfillmentHandler {
 /// <https://streams.spec.whatwg.org/#readable-stream-cancel>.
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 struct SourceCancelPromiseRejectionHandler {
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[conditional_malloc_size_of]
     result: Rc<Promise>,
 }
 
@@ -833,7 +839,8 @@ impl Callback for SourceCancelPromiseRejectionHandler {
     /// The rejection handler for the reacting to sourceCancelPromise part of
     /// <https://streams.spec.whatwg.org/#readable-stream-cancel>.
     /// An implementation of <https://webidl.spec.whatwg.org/#dfn-perform-steps-once-promise-is-settled>
-    fn callback(&self, _cx: SafeJSContext, v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         self.result.reject_native(&v, can_gc);
     }
 }
@@ -919,6 +926,29 @@ pub(crate) fn create_readable_stream(
 
     // Return stream.
     stream
+}
+
+/// <https://streams.spec.whatwg.org/#abstract-opdef-createreadablebytestream>
+#[cfg_attr(crown, allow(crown::unrooted_must_root))]
+pub(crate) fn readable_byte_stream_tee(
+    global: &GlobalScope,
+    underlying_source_type: UnderlyingSourceType,
+    can_gc: CanGc,
+) -> DomRoot<ReadableStream> {
+    // Let stream be a new ReadableStream.
+    // Perform ! InitializeReadableStream(stream).
+    let tee_stream = ReadableStream::new_with_proto(global, None, can_gc);
+
+    // Let controller be a new ReadableByteStreamController.
+    let controller = ReadableByteStreamController::new(underlying_source_type, 0.0, global, can_gc);
+
+    // Perform ? SetUpReadableByteStreamController(stream, controller, startAlgorithm, pullAlgorithm, cancelAlgorithm, 0, undefined).
+    controller
+        .setup(global, tee_stream.clone(), can_gc)
+        .expect("Setup of byte stream controller cannot fail");
+
+    // Return stream.
+    tee_stream
 }
 
 /// <https://streams.spec.whatwg.org/#rs-class>
@@ -1083,14 +1113,14 @@ impl ReadableStream {
         cx: SafeJSContext,
         read_into_request: &ReadIntoRequest,
         view: HeapBufferSource<ArrayBufferViewU8>,
-        options: &ReadableStreamBYOBReaderReadOptions,
+        min: u64,
         can_gc: CanGc,
     ) {
         match self.controller.borrow().as_ref() {
             Some(ControllerType::Byte(controller)) => controller
                 .get()
                 .expect("Stream should have controller.")
-                .perform_pull_into(cx, read_into_request, view, options, can_gc),
+                .perform_pull_into(cx, read_into_request, view, min, can_gc),
             _ => {
                 unreachable!(
                     "Pulling a chunk from a stream with a default controller using a BYOB reader"
@@ -1171,29 +1201,34 @@ impl ReadableStream {
 
         // Let reader be stream.[[reader]].
 
-        match self.reader.borrow().as_ref() {
-            Some(ReaderType::Default(reader)) => {
-                let Some(reader) = reader.get() else {
-                    // If reader is undefined, return.
-                    return;
-                };
+        let default_reader = {
+            let reader_ref = self.reader.borrow();
+            match reader_ref.as_ref() {
+                Some(ReaderType::Default(reader)) => reader.get(),
+                _ => None,
+            }
+        };
 
-                // Perform ! ReadableStreamDefaultReaderErrorReadRequests(reader, e).
-                reader.error(e, can_gc);
-            },
-            Some(ReaderType::BYOB(reader)) => {
-                let Some(reader) = reader.get() else {
-                    // If reader is undefined, return.
-                    return;
-                };
-
-                // Perform ! ReadableStreamBYOBReaderErrorReadIntoRequests(reader, e).
-                reader.error_read_into_requests(e, can_gc);
-            },
-            None => {
-                // If reader is undefined, return.
-            },
+        if let Some(reader) = default_reader {
+            // Perform ! ReadableStreamDefaultReaderErrorReadRequests(reader, e).
+            reader.error(e, can_gc);
+            return;
         }
+
+        let byob_reader = {
+            let reader_ref = self.reader.borrow();
+            match reader_ref.as_ref() {
+                Some(ReaderType::BYOB(reader)) => reader.get(),
+                _ => None,
+            }
+        };
+
+        if let Some(reader) = byob_reader {
+            // Perform ! ReadableStreamBYOBReaderErrorReadIntoRequests(reader, e).
+            reader.error_read_into_requests(e, can_gc);
+        }
+
+        // If reader is undefined, return.
     }
 
     /// <https://streams.spec.whatwg.org/#readablestream-storederror>
@@ -1299,6 +1334,17 @@ impl ReadableStream {
                 unreachable!(
                     "Getting default controller for a stream with a non-default controller"
                 )
+            },
+        }
+    }
+
+    pub(crate) fn get_byte_controller(&self) -> DomRoot<ReadableByteStreamController> {
+        match self.controller.borrow().as_ref() {
+            Some(ControllerType::Byte(controller)) => {
+                controller.get().expect("Stream should have controller.")
+            },
+            _ => {
+                unreachable!("Getting byte controller for a stream with a non-byte controller")
             },
         }
     }
@@ -1466,7 +1512,7 @@ impl ReadableStream {
                     // step 7 - Otherwise, perform readRequest’s chunk steps, given chunk.
                     let result = RootedTraceableBox::new(Heap::default());
                     result.set(*chunk);
-                    request.chunk_steps(result, can_gc);
+                    request.chunk_steps(result, &self.global(), can_gc);
                 }
             },
             _ => {
@@ -1529,27 +1575,39 @@ impl ReadableStream {
         // Set stream.[[state]] to "closed".
         self.state.set(ReadableStreamState::Closed);
         // Let reader be stream.[[reader]].
-        match self.reader.borrow().as_ref() {
-            Some(ReaderType::Default(reader)) => {
-                let Some(reader) = reader.get() else {
-                    // If reader is undefined, return.
-                    return;
-                };
-                // step 5 & 6
-                reader.close(can_gc);
-            },
-            Some(ReaderType::BYOB(reader)) => {
-                let Some(reader) = reader.get() else {
-                    // If reader is undefined, return.
-                    return;
-                };
 
-                reader.close(can_gc)
-            },
-            None => {
-                // If reader is undefined, return.
-            },
+        // NOTE: do not hold the RefCell borrow across reader.close(),
+        // or release() will panic when it tries to mut-borrow stream.reader.
+        // So we pull out the underlying DOM reader in a local, then drop the borrow.
+        let default_reader = {
+            let reader_ref = self.reader.borrow();
+            match reader_ref.as_ref() {
+                Some(ReaderType::Default(reader)) => reader.get(),
+                _ => None,
+            }
+        };
+
+        if let Some(reader) = default_reader {
+            // steps 5 & 6 for a default reader
+            reader.close(can_gc);
+            return;
         }
+
+        // Same for BYOB reader.
+        let byob_reader = {
+            let reader_ref = self.reader.borrow();
+            match reader_ref.as_ref() {
+                Some(ReaderType::BYOB(reader)) => reader.get(),
+                _ => None,
+            }
+        };
+
+        if let Some(reader) = byob_reader {
+            // steps 5 & 6 for a BYOB reader
+            reader.close(can_gc);
+        }
+
+        // If reader is undefined, return.
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-cancel>
@@ -1571,7 +1629,8 @@ impl ReadableStream {
         if self.is_errored() {
             let promise = Promise::new(global, can_gc);
             rooted!(in(*cx) let mut rval = UndefinedValue());
-            self.stored_error.safe_to_jsval(cx, rval.handle_mut());
+            self.stored_error
+                .safe_to_jsval(cx, rval.handle_mut(), can_gc);
             promise.reject_native(&rval.handle(), can_gc);
             return promise;
         }
@@ -1579,11 +1638,17 @@ impl ReadableStream {
         self.close(can_gc);
 
         // If reader is not undefined and reader implements ReadableStreamBYOBReader,
-        if let Some(ReaderType::BYOB(reader)) = self.reader.borrow().as_ref() {
-            if let Some(reader) = reader.get() {
-                // step 6.1, 6.2 & 6.3 of https://streams.spec.whatwg.org/#readable-stream-cancel
-                reader.cancel(can_gc);
+        let byob_reader = {
+            let reader_ref = self.reader.borrow();
+            match reader_ref.as_ref() {
+                Some(ReaderType::BYOB(reader)) => reader.get(),
+                _ => None,
             }
+        };
+
+        if let Some(reader) = byob_reader {
+            // step 6.1, 6.2 & 6.3 of https://streams.spec.whatwg.org/#readable-stream-cancel
+            reader.cancel(can_gc);
         }
 
         // Let sourceCancelPromise be ! stream.[[controller]].[[CancelSteps]](reason).
@@ -1632,6 +1697,103 @@ impl ReadableStream {
         *self.reader.borrow_mut() = new_reader;
     }
 
+    #[cfg_attr(crown, allow(crown::unrooted_must_root))]
+    /// <https://streams.spec.whatwg.org/#abstract-opdef-readablebytestreamtee>
+    fn byte_tee(&self, can_gc: CanGc) -> Fallible<Vec<DomRoot<ReadableStream>>> {
+        // Assert: stream implements ReadableStream.
+        // Assert: stream.[[controller]] implements ReadableByteStreamController.
+
+        // Let reader be ? AcquireReadableStreamDefaultReader(stream).
+        let reader = self.acquire_default_reader(can_gc)?;
+        let reader = Rc::new(RefCell::new(ReaderType::Default(MutNullableDom::new(
+            Some(&reader),
+        ))));
+
+        // Let reading be false.
+        let reading = Rc::new(Cell::new(false));
+
+        // Let readAgainForBranch1 be false.
+        let read_again_for_branch_1 = Rc::new(Cell::new(false));
+
+        // Let readAgainForBranch2 be false.
+        let read_again_for_branch_2 = Rc::new(Cell::new(false));
+
+        // Let canceled1 be false.
+        let canceled_1 = Rc::new(Cell::new(false));
+
+        // Let canceled2 be false.
+        let canceled_2 = Rc::new(Cell::new(false));
+
+        // Let reason1 be undefined.
+        let reason_1 = Rc::new(Heap::boxed(UndefinedValue()));
+
+        // Let reason2 be undefined.
+        let reason_2 = Rc::new(Heap::boxed(UndefinedValue()));
+
+        // Let cancelPromise be a new promise.
+        let cancel_promise = Promise::new(&self.global(), can_gc);
+        let reader_version = Rc::new(Cell::new(0));
+
+        let byte_tee_source_1 = ByteTeeUnderlyingSource::new(
+            reader.clone(),
+            self,
+            reading.clone(),
+            read_again_for_branch_1.clone(),
+            read_again_for_branch_2.clone(),
+            canceled_1.clone(),
+            canceled_2.clone(),
+            reason_1.clone(),
+            reason_2.clone(),
+            cancel_promise.clone(),
+            reader_version.clone(),
+            ByteTeeCancelAlgorithm::Cancel1Algorithm,
+            ByteTeePullAlgorithm::Pull1Algorithm,
+            can_gc,
+        );
+
+        let byte_tee_source_2 = ByteTeeUnderlyingSource::new(
+            reader.clone(),
+            self,
+            reading,
+            read_again_for_branch_1,
+            read_again_for_branch_2,
+            canceled_1,
+            canceled_2,
+            reason_1,
+            reason_2,
+            cancel_promise.clone(),
+            reader_version,
+            ByteTeeCancelAlgorithm::Cancel2Algorithm,
+            ByteTeePullAlgorithm::Pull2Algorithm,
+            can_gc,
+        );
+
+        // Set branch1 to ! CreateReadableByteStream(startAlgorithm, pull1Algorithm, cancel1Algorithm).
+        let branch_1 = readable_byte_stream_tee(
+            &self.global(),
+            UnderlyingSourceType::TeeByte(Dom::from_ref(&byte_tee_source_1)),
+            can_gc,
+        );
+        byte_tee_source_1.set_branch_1(&branch_1);
+        byte_tee_source_2.set_branch_1(&branch_1);
+
+        // Set branch2 to ! CreateReadableByteStream(startAlgorithm, pull2Algorithm, cancel2Algorithm).
+        let branch_2 = readable_byte_stream_tee(
+            &self.global(),
+            UnderlyingSourceType::TeeByte(Dom::from_ref(&byte_tee_source_2)),
+            can_gc,
+        );
+        byte_tee_source_1.set_branch_2(&branch_2);
+        byte_tee_source_2.set_branch_2(&branch_2);
+
+        // Perform forwardReaderError, given reader.
+        byte_tee_source_1.forward_reader_error(reader.clone(), can_gc);
+        byte_tee_source_2.forward_reader_error(reader, can_gc);
+
+        // Return « branch1, branch2 ».
+        Ok(vec![branch_1, branch_2])
+    }
+
     /// <https://streams.spec.whatwg.org/#abstract-opdef-readablestreamdefaulttee>
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn default_tee(
@@ -1646,9 +1808,6 @@ impl ReadableStream {
 
         // Let reader be ? AcquireReadableStreamDefaultReader(stream).
         let reader = self.acquire_default_reader(can_gc)?;
-        self.set_reader(Some(ReaderType::Default(MutNullableDom::new(Some(
-            &reader,
-        )))));
 
         // Let reading be false.
         let reading = Rc::new(Cell::new(false));
@@ -1677,7 +1836,7 @@ impl ReadableStream {
             reason_1.clone(),
             reason_2.clone(),
             cancel_promise.clone(),
-            TeeCancelAlgorithm::Cancel1Algorithm,
+            DefaultTeeCancelAlgorithm::Cancel1Algorithm,
             can_gc,
         );
 
@@ -1695,7 +1854,7 @@ impl ReadableStream {
             reason_1,
             reason_2,
             cancel_promise.clone(),
-            TeeCancelAlgorithm::Cancel2Algorithm,
+            DefaultTeeCancelAlgorithm::Cancel2Algorithm,
             can_gc,
         );
 
@@ -1725,7 +1884,7 @@ impl ReadableStream {
         tee_source_2.set_branch_2(&branch_2);
 
         // Upon rejection of reader.[[closedPromise]] with reason r,
-        reader.append_native_handler_to_closed_promise(
+        reader.default_tee_append_native_handler_to_closed_promise(
             &branch_1,
             &branch_2,
             canceled_1,
@@ -1842,7 +2001,7 @@ impl ReadableStream {
     }
 
     /// <https://streams.spec.whatwg.org/#readable-stream-tee>
-    fn tee(
+    pub(crate) fn tee(
         &self,
         clone_for_branch_2: bool,
         can_gc: CanGc,
@@ -1858,9 +2017,7 @@ impl ReadableStream {
             Some(ControllerType::Byte(_)) => {
                 // If stream.[[controller]] implements ReadableByteStreamController,
                 // return ? ReadableByteStreamTee(stream).
-                Err(Error::Type(
-                    "Teeing is not yet supported for byte streams".to_owned(),
-                ))
+                self.byte_tee(can_gc)
             },
             None => {
                 unreachable!("Stream should have a controller.");
@@ -1973,7 +2130,7 @@ impl ReadableStreamMethods<crate::DomTypeHolder> for ReadableStream {
         // converted to an IDL value of type UnderlyingSource.
         let underlying_source_dict = if !underlying_source_obj.is_null() {
             rooted!(in(*cx) let obj_val = ObjectValue(underlying_source_obj.get()));
-            match JsUnderlyingSource::new(cx, obj_val.handle()) {
+            match JsUnderlyingSource::new(cx, obj_val.handle(), can_gc) {
                 Ok(ConversionResult::Success(val)) => val,
                 Ok(ConversionResult::Failure(error)) => return Err(Error::Type(error.to_string())),
                 _ => {
@@ -2174,7 +2331,7 @@ impl ReadableStreamMethods<crate::DomTypeHolder> for ReadableStream {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 /// The initial steps for the message handler for both readable and writable cross realm transforms.
 /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
 /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
@@ -2194,22 +2351,25 @@ pub(crate) unsafe fn get_type_and_value_from_message(
 
     // Let type be ! Get(data, "type").
     rooted!(in(*cx) let mut type_ = UndefinedValue());
-    get_dictionary_property(
-        *cx,
-        data_object.handle(),
-        "type",
-        type_.handle_mut(),
-        can_gc,
-    )
+    unsafe {
+        get_dictionary_property(
+            *cx,
+            data_object.handle(),
+            "type",
+            type_.handle_mut(),
+            can_gc,
+        )
+    }
     .expect("Getting the type should not fail.");
 
     // Let value be ! Get(data, "value").
-    get_dictionary_property(*cx, data_object.handle(), "value", value, can_gc)
+    unsafe { get_dictionary_property(*cx, data_object.handle(), "value", value, can_gc) }
         .expect("Getting the value should not fail.");
 
     // Assert: type is a String.
-    let result = DOMString::safe_from_jsval(cx, type_.handle(), StringificationBehavior::Empty)
-        .expect("The type of the message should be a string");
+    let result =
+        DOMString::safe_from_jsval(cx, type_.handle(), StringificationBehavior::Empty, can_gc)
+            .expect("The type of the message should be a string");
     let ConversionResult::Success(type_string) = result else {
         unreachable!("The type of the message should be a string");
     };
@@ -2232,7 +2392,7 @@ pub(crate) struct CrossRealmTransformReadable {
 impl CrossRealmTransformReadable {
     /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformreadable>
     /// Add a handler for port’s message event with the following steps:
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn handle_message(
         &self,
         cx: SafeJSContext,
@@ -2286,7 +2446,7 @@ impl CrossRealmTransformReadable {
         // Let error be a new "DataCloneError" DOMException.
         let error = DOMException::new(global, DOMErrorName::DataCloneError, can_gc);
         rooted!(in(*cx) let mut rooted_error = UndefinedValue());
-        error.safe_to_jsval(cx, rooted_error.handle_mut());
+        error.safe_to_jsval(cx, rooted_error.handle_mut(), can_gc);
 
         // Perform ! CrossRealmTransformSendError(port, error).
         port.cross_realm_transform_send_error(rooted_error.handle(), can_gc);
@@ -2299,7 +2459,7 @@ impl CrossRealmTransformReadable {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 /// Get the `done` property of an object that a read promise resolved to.
 pub(crate) fn get_read_promise_done(
     cx: SafeJSContext,
@@ -2313,7 +2473,7 @@ pub(crate) fn get_read_promise_done(
         rooted!(in(*cx) let object = v.to_object());
         rooted!(in(*cx) let mut done = UndefinedValue());
         match get_dictionary_property(*cx, object.handle(), "done", done.handle_mut(), can_gc) {
-            Ok(true) => match bool::safe_from_jsval(cx, done.handle(), ()) {
+            Ok(true) => match bool::safe_from_jsval(cx, done.handle(), (), can_gc) {
                 Ok(ConversionResult::Success(val)) => Ok(val),
                 Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.to_string())),
                 _ => Err(Error::Type("Unknown format for done property.".to_string())),
@@ -2324,7 +2484,7 @@ pub(crate) fn get_read_promise_done(
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 /// Get the `value` property of an object that a read promise resolved to.
 pub(crate) fn get_read_promise_bytes(
     cx: SafeJSContext,
@@ -2345,6 +2505,7 @@ pub(crate) fn get_read_promise_bytes(
                     cx,
                     bytes.handle(),
                     ConversionBehavior::EnforceRange,
+                    can_gc,
                 ) {
                     Ok(ConversionResult::Success(val)) => Ok(val),
                     Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.to_string())),
@@ -2354,6 +2515,21 @@ pub(crate) fn get_read_promise_bytes(
             Ok(false) => Err(Error::Type("Promise has no value property.".to_string())),
             Err(()) => Err(Error::JSFailed),
         }
+    }
+}
+
+/// Convert a raw stream `chunk` JS value to `Vec<u8>`.
+/// This mirrors the conversion used inside `get_read_promise_bytes`,
+/// but operates on the raw chunk (no `{ value, done }` wrapper).
+pub(crate) fn bytes_from_chunk_jsval(
+    cx: SafeJSContext,
+    chunk: &RootedTraceableBox<Heap<JSVal>>,
+    can_gc: CanGc,
+) -> Result<Vec<u8>, Error> {
+    match Vec::<u8>::safe_from_jsval(cx, chunk.handle(), ConversionBehavior::EnforceRange, can_gc) {
+        Ok(ConversionResult::Success(vec)) => Ok(vec),
+        Ok(ConversionResult::Failure(error)) => Err(Error::Type(error.to_string())),
+        _ => Err(Error::Type("Unknown format for bytes read.".to_string())),
     }
 }
 
@@ -2434,7 +2610,7 @@ impl Transferable for ReadableStream {
     /// Note: we are relying on the port transfer, so the data returned here are related to the port.
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<MessagePortId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<MessagePortId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.port_impls,
             StructuredData::Writer(w) => &mut w.ports,

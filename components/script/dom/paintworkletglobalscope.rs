@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use base::id::PipelineId;
+use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::{Sender, unbounded};
 use dom_struct::dom_struct;
 use euclid::{Scale, Size2D};
@@ -42,11 +42,11 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomObject;
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::cssstylevalue::CSSStyleValue;
+use crate::dom::css::cssstylevalue::CSSStyleValue;
+use crate::dom::css::stylepropertymapreadonly::StylePropertyMapReadOnly;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::paintrenderingcontext2d::PaintRenderingContext2D;
 use crate::dom::paintsize::PaintSize;
-use crate::dom::stylepropertymapreadonly::StylePropertyMapReadOnly;
 use crate::dom::worklet::WorkletExecutor;
 use crate::dom::workletglobalscope::{WorkletGlobalScope, WorkletGlobalScopeInit, WorkletTask};
 use crate::script_runtime::CanGc;
@@ -57,7 +57,7 @@ pub(crate) struct PaintWorkletGlobalScope {
     /// The worklet global for this object
     worklet_global: WorkletGlobalScope,
     /// The image cache
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "ImageCache"]
     #[no_trace]
     image_cache: Arc<dyn ImageCache>,
     /// <https://drafts.css-houdini.org/css-paint-api/#paint-definitions>
@@ -85,10 +85,11 @@ pub(crate) struct PaintWorkletGlobalScope {
 }
 
 impl PaintWorkletGlobalScope {
-    #[allow(unsafe_code)]
     pub(crate) fn new(
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         base_url: ServoUrl,
+        inherited_secure_context: Option<bool>,
         executor: WorkletExecutor,
         init: &WorkletGlobalScopeInit,
     ) -> DomRoot<PaintWorkletGlobalScope> {
@@ -98,8 +99,10 @@ impl PaintWorkletGlobalScope {
         );
         let global = Box::new(PaintWorkletGlobalScope {
             worklet_global: WorkletGlobalScope::new_inherited(
+                webview_id,
                 pipeline_id,
                 base_url,
+                inherited_secure_context,
                 executor,
                 init,
             ),
@@ -220,8 +223,8 @@ impl PaintWorkletGlobalScope {
     }
 
     /// <https://drafts.css-houdini.org/css-paint-api/#invoke-a-paint-callback>
-    #[allow(clippy::too_many_arguments)]
-    #[allow(unsafe_code)]
+    #[expect(clippy::too_many_arguments)]
+    #[expect(unsafe_code)]
     fn invoke_a_paint_callback(
         &self,
         name: &Atom,
@@ -348,18 +351,18 @@ impl PaintWorkletGlobalScope {
             return self.invalid_image(size_in_dpx, missing_image_urls);
         }
 
-        let image_key = rendering_context.image_key();
+        rendering_context.update_rendering();
 
         DrawAPaintImageResult {
             width: size_in_dpx.width,
             height: size_in_dpx.height,
             format: PixelFormat::BGRA8,
-            image_key: Some(image_key),
+            image_key: Some(rendering_context.image_key()),
             missing_image_urls,
         }
     }
 
-    // https://drafts.csswg.org/css-images-4/#invalid-image
+    /// <https://drafts.csswg.org/css-images-4/#invalid-image>
     fn invalid_image(
         &self,
         size: Size2D<u32, DevicePixel>,
@@ -490,7 +493,7 @@ impl PaintDefinition {
 }
 
 impl PaintWorkletGlobalScopeMethods<crate::DomTypeHolder> for PaintWorkletGlobalScope {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     /// <https://drafts.css-houdini.org/css-paint-api/#dom-paintworkletglobalscope-registerpaint>
     fn RegisterPaint(&self, name: DOMString, paint_ctor: Rc<VoidFunction>) -> Fallible<()> {
@@ -508,25 +511,22 @@ impl PaintWorkletGlobalScopeMethods<crate::DomTypeHolder> for PaintWorkletGlobal
 
         // Step 2-3.
         if self.paint_definitions.borrow().contains_key(&name) {
-            return Err(Error::InvalidModification);
+            return Err(Error::InvalidModification(None));
         }
 
         // Step 4-6.
         let mut property_names: Vec<String> =
-            unsafe { get_property(*cx, paint_obj.handle(), "inputProperties", ()) }?
-                .unwrap_or_default();
+            get_property(cx, paint_obj.handle(), "inputProperties", ())?.unwrap_or_default();
         let properties = property_names.drain(..).map(Atom::from).collect();
 
         // Step 7-9.
         let input_arguments: Vec<String> =
-            unsafe { get_property(*cx, paint_obj.handle(), "inputArguments", ()) }?
-                .unwrap_or_default();
+            get_property(cx, paint_obj.handle(), "inputArguments", ())?.unwrap_or_default();
 
         // TODO: Steps 10-11.
 
         // Steps 12-13.
-        let alpha: bool =
-            unsafe { get_property(*cx, paint_obj.handle(), "alpha", ()) }?.unwrap_or(true);
+        let alpha: bool = get_property(cx, paint_obj.handle(), "alpha", ())?.unwrap_or(true);
 
         // Step 14
         if unsafe { !IsConstructor(paint_obj.get()) } {
@@ -535,9 +535,7 @@ impl PaintWorkletGlobalScopeMethods<crate::DomTypeHolder> for PaintWorkletGlobal
 
         // Steps 15-16
         rooted!(in(*cx) let mut prototype = UndefinedValue());
-        unsafe {
-            get_property_jsval(*cx, paint_obj.handle(), "prototype", prototype.handle_mut())?;
-        }
+        get_property_jsval(cx, paint_obj.handle(), "prototype", prototype.handle_mut())?;
         if !prototype.is_object() {
             return Err(Error::Type(String::from("Prototype is not an object.")));
         }
@@ -545,21 +543,14 @@ impl PaintWorkletGlobalScopeMethods<crate::DomTypeHolder> for PaintWorkletGlobal
 
         // Steps 17-18
         rooted!(in(*cx) let mut paint_function = UndefinedValue());
-        unsafe {
-            get_property_jsval(
-                *cx,
-                prototype.handle(),
-                "paint",
-                paint_function.handle_mut(),
-            )?;
-        }
+        get_property_jsval(cx, prototype.handle(), "paint", paint_function.handle_mut())?;
         if !paint_function.is_object() || unsafe { !IsCallable(paint_function.to_object()) } {
             return Err(Error::Type(String::from("Paint function is not callable.")));
         }
 
         // Step 19.
         let Some(context) = PaintRenderingContext2D::new(self, CanGc::note()) else {
-            return Err(Error::Operation);
+            return Err(Error::Operation(None));
         };
         let definition = PaintDefinition::new(
             paint_val.handle(),

@@ -33,7 +33,7 @@ impl ChannelSplitterNode {
         options: &ChannelSplitterOptions,
     ) -> Fallible<ChannelSplitterNode> {
         if options.numberOfOutputs < 1 || options.numberOfOutputs > MAX_CHANNEL_COUNT {
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         let node_options = options.parent.unwrap_or(
@@ -46,7 +46,7 @@ impl ChannelSplitterNode {
             node_options.mode != ChannelCountMode::Explicit ||
             node_options.interpretation != ChannelInterpretation::Discrete
         {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         let node = AudioNode::new_inherited(

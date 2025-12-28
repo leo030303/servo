@@ -6,6 +6,7 @@
 package org.servo.servoview;
 
 import android.app.Activity;
+import android.view.KeyEvent;
 import android.view.Surface;
 
 import org.servo.servoview.JNIServo.ServoCoordinates;
@@ -18,8 +19,6 @@ public class Servo {
     private static final String LOGTAG = "Servo";
     private JNIServo mJNI = new JNIServo();
     private RunCallback mRunCallback;
-    private boolean mShuttingDown;
-    private boolean mShutdownComplete;
     private boolean mSuspended;
     private Callbacks mServoCallbacks;
 
@@ -40,35 +39,6 @@ public class Servo {
 
     public void resetGfxCallbacks(GfxCallbacks gfxcb) {
       mServoCallbacks.resetGfxCallbacks(gfxcb);
-    }
-
-    public void shutdown() {
-        mShuttingDown = true;
-        FutureTask<Void> task = new FutureTask<>(new Callable<Void>() {
-            public Void call() throws Exception {
-                mJNI.requestShutdown();
-                // Wait until Servo gets back to us to finalize shutdown.
-                while (!mShutdownComplete) {
-                    try {
-                        Thread.sleep(10);
-                    } catch (Exception e) {
-                        mShutdownComplete = true;
-                        e.printStackTrace();
-                        return null;
-                    }
-                    mJNI.performUpdates();
-                }
-                mJNI.deinit();
-                return null;
-            }
-        });
-        mRunCallback.inGLThread(task);
-        // Block until task is complete.
-        try {
-            task.get();
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
     }
 
     public String version() {
@@ -111,6 +81,14 @@ public class Servo {
         mRunCallback.inGLThread(() -> mJNI.scroll(dx, dy, x, y));
     }
 
+    public void onKeyDown(int keyCode, KeyEvent event) {
+        mRunCallback.inGLThread(() -> mJNI.keydown(keyCode, event.getUnicodeChar()));
+    }
+
+    public void onKeyUp(int keyCode, KeyEvent event) {
+        mRunCallback.inGLThread(() -> mJNI.keyup(keyCode, event.getUnicodeChar()));
+    }
+
     public void touchDown(float x, float y, int pointerId) {
         mRunCallback.inGLThread(() -> mJNI.touchDown(x, y, pointerId));
     }
@@ -127,15 +105,15 @@ public class Servo {
         mRunCallback.inGLThread(() -> mJNI.touchCancel(x, y, pointerId));
     }
 
-    public void pinchZoomStart(float factor, int x, int y) {
+    public void pinchZoomStart(float factor, float x, float y) {
         mRunCallback.inGLThread(() -> mJNI.pinchZoomStart(factor, x, y));
     }
 
-    public void pinchZoom(float factor, int x, int y) {
+    public void pinchZoom(float factor, float x, float y) {
         mRunCallback.inGLThread(() -> mJNI.pinchZoom(factor, x, y));
     }
 
-    public void pinchZoomEnd(float factor, int x, int y) {
+    public void pinchZoomEnd(float factor, float x, float y) {
         mRunCallback.inGLThread(() -> mJNI.pinchZoomEnd(factor, x, y));
     }
 
@@ -158,10 +136,16 @@ public class Servo {
         mRunCallback.inGLThread(() -> mJNI.mediaSessionAction(action));
     }
 
+    public void setExperimentalMode(boolean enable) {
+        mRunCallback.inGLThread(() -> mJNI.setExperimentalMode(enable));
+    }
+
+    public void onDoFrame() {
+        mRunCallback.inGLThread(() -> mJNI.doFrame());
+    }
+
     public interface Client {
         void onAlert(String message);
-
-        boolean onAllowNavigation(String url);
 
         void onLoadStarted();
 
@@ -174,6 +158,9 @@ public class Servo {
         void onHistoryChanged(boolean canGoBack, boolean canGoForward);
 
         void onRedrawing(boolean redrawing);
+
+        void onImeShow();
+        void onImeHide();
 
         void onMediaSessionMetadata(String title, String artist, String album);
 
@@ -190,8 +177,6 @@ public class Servo {
 
     public interface GfxCallbacks {
         void flushGLBuffers();
-
-        void animationStateChanged(boolean animating);
 
         void makeCurrent();
     }
@@ -211,7 +196,7 @@ public class Servo {
         }
 
         public void wakeup() {
-            if (!mSuspended && !mShuttingDown) {
+            if (!mSuspended) {
                 mRunCallback.inGLThread(() -> mJNI.performUpdates());
             }
         }
@@ -230,16 +215,12 @@ public class Servo {
             mRunCallback.inUIThread(() -> mClient.onAlert(message));
         }
 
-        public void onShutdownComplete() {
-            mShutdownComplete = true;
+        public void onImeShow() {
+            mRunCallback.inUIThread(() -> mClient.onImeShow());
         }
 
-        public void onAnimatingChanged(boolean animating) {
-            mRunCallback.inGLThread(() -> mGfxCb.animationStateChanged(animating));
-        }
-
-        public boolean onAllowNavigation(String url) {
-            return mClient.onAllowNavigation(url);
+        public void onImeHide() {
+            mRunCallback.inUIThread(() -> mClient.onImeHide());
         }
 
         public void onLoadStarted() {

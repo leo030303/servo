@@ -3,14 +3,14 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use canvas_traits::canvas::{
-    CompositionOptions, FillOrStrokeStyle, FillRule, LineOptions, Path, ShadowOptions,
+    CompositionOptions, FillOrStrokeStyle, FillRule, LineOptions, Path, ShadowOptions, TextRun,
 };
 use compositing_traits::SerializableImageData;
 use euclid::default::{Point2D, Rect, Size2D, Transform2D};
 use pixels::Snapshot;
 use webrender_api::ImageDescriptor;
 
-use crate::canvas_data::{Filter, TextRun};
+use crate::canvas_data::Filter;
 
 // This defines required methods for a DrawTarget. The prototypes are derived from the now-removed
 // Azure backend's methods.
@@ -55,7 +55,6 @@ pub(crate) trait GenericDrawTarget {
     fn fill_text(
         &mut self,
         text_runs: Vec<TextRun>,
-        start: Point2D<f32>,
         style: FillOrStrokeStyle,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
@@ -79,6 +78,14 @@ pub(crate) trait GenericDrawTarget {
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
     );
+    fn stroke_text(
+        &mut self,
+        text_runs: Vec<TextRun>,
+        style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    );
     fn stroke_rect(
         &mut self,
         rect: &Rect<f32>,
@@ -94,7 +101,6 @@ pub(crate) trait GenericDrawTarget {
     fn snapshot(&mut self) -> Snapshot;
 }
 
-#[allow(dead_code)] // used by gated backends
 /// A version of the `Into<T>` trait from the standard library that can be used
 /// to convert between two types that are not defined in the canvas crate.
 pub(crate) trait Convert<T> {

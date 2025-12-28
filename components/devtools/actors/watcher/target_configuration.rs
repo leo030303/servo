@@ -12,7 +12,7 @@ use log::warn;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
 use crate::actors::browsing_context::BrowsingContextActor;
 use crate::actors::tab::TabDescriptorActor;
 use crate::protocol::ClientRequest;
@@ -35,6 +35,13 @@ pub struct TargetConfigurationActor {
     name: String,
     configuration: HashMap<&'static str, bool>,
     supported_options: HashMap<&'static str, bool>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JavascriptEnabledReply {
+    from: String,
+    javascript_enabled: bool,
 }
 
 impl Actor for TargetConfigurationActor {
@@ -82,6 +89,13 @@ impl Actor for TargetConfigurationActor {
                 let msg = EmptyReplyMsg { from: self.name() };
                 request.reply_final(&msg)?
             },
+            "isJavascriptEnabled" => {
+                let msg = JavascriptEnabledReply {
+                    from: self.name(),
+                    javascript_enabled: true,
+                };
+                request.reply_final(&msg)?
+            },
             _ => return Err(ActorError::UnrecognizedPacketType),
         };
         Ok(())
@@ -114,8 +128,10 @@ impl TargetConfigurationActor {
             ]),
         }
     }
+}
 
-    pub fn encodable(&self) -> TargetConfigurationActorMsg {
+impl ActorEncode<TargetConfigurationActorMsg> for TargetConfigurationActor {
+    fn encode(&self, _: &ActorRegistry) -> TargetConfigurationActorMsg {
         TargetConfigurationActorMsg {
             actor: self.name(),
             configuration: self.configuration.clone(),

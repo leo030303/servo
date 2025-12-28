@@ -86,6 +86,8 @@ interface Element : Node {
 
   [Throws] ShadowRoot attachShadow(ShadowRootInit init);
   readonly attribute ShadowRoot? shadowRoot;
+
+  readonly attribute CustomElementRegistry? customElementRegistry;
 };
 
 dictionary ShadowRootInit {
@@ -119,6 +121,8 @@ partial interface Element {
   readonly attribute long clientLeft;
   readonly attribute long clientWidth;
   readonly attribute long clientHeight;
+
+  readonly attribute double currentCSSZoom;
 };
 
 // https://html.spec.whatwg.org/multipage/#dom-parsing-and-serialization

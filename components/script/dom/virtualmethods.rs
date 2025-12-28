@@ -16,53 +16,53 @@ use crate::dom::document::Document;
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::element::{AttributeMutation, Element};
 use crate::dom::event::Event;
-use crate::dom::htmlanchorelement::HTMLAnchorElement;
-use crate::dom::htmlareaelement::HTMLAreaElement;
-use crate::dom::htmlbaseelement::HTMLBaseElement;
-use crate::dom::htmlbodyelement::HTMLBodyElement;
-use crate::dom::htmlbuttonelement::HTMLButtonElement;
-use crate::dom::htmlcanvaselement::HTMLCanvasElement;
-use crate::dom::htmldetailselement::HTMLDetailsElement;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
-use crate::dom::htmlfontelement::HTMLFontElement;
-use crate::dom::htmlformelement::HTMLFormElement;
-use crate::dom::htmlheadelement::HTMLHeadElement;
-use crate::dom::htmlhrelement::HTMLHRElement;
-use crate::dom::htmliframeelement::HTMLIFrameElement;
-use crate::dom::htmlimageelement::HTMLImageElement;
-use crate::dom::htmlinputelement::HTMLInputElement;
-use crate::dom::htmllabelelement::HTMLLabelElement;
-use crate::dom::htmllielement::HTMLLIElement;
-use crate::dom::htmllinkelement::HTMLLinkElement;
-use crate::dom::htmlmediaelement::HTMLMediaElement;
-use crate::dom::htmlmetaelement::HTMLMetaElement;
-use crate::dom::htmlmeterelement::HTMLMeterElement;
-use crate::dom::htmlobjectelement::HTMLObjectElement;
-use crate::dom::htmloptgroupelement::HTMLOptGroupElement;
-use crate::dom::htmloptionelement::HTMLOptionElement;
-use crate::dom::htmloutputelement::HTMLOutputElement;
-use crate::dom::htmlpreelement::HTMLPreElement;
-use crate::dom::htmlprogresselement::HTMLProgressElement;
-use crate::dom::htmlscriptelement::HTMLScriptElement;
-use crate::dom::htmlselectelement::HTMLSelectElement;
-use crate::dom::htmlslotelement::HTMLSlotElement;
-use crate::dom::htmlsourceelement::HTMLSourceElement;
-use crate::dom::htmlstyleelement::HTMLStyleElement;
-use crate::dom::htmltablecellelement::HTMLTableCellElement;
-use crate::dom::htmltablecolelement::HTMLTableColElement;
-use crate::dom::htmltableelement::HTMLTableElement;
-use crate::dom::htmltablerowelement::HTMLTableRowElement;
-use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
-use crate::dom::htmltemplateelement::HTMLTemplateElement;
-use crate::dom::htmltextareaelement::HTMLTextAreaElement;
-use crate::dom::htmltitleelement::HTMLTitleElement;
-use crate::dom::htmlvideoelement::HTMLVideoElement;
+use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
+use crate::dom::html::htmlareaelement::HTMLAreaElement;
+use crate::dom::html::htmlbaseelement::HTMLBaseElement;
+use crate::dom::html::htmlbodyelement::HTMLBodyElement;
+use crate::dom::html::htmlbuttonelement::HTMLButtonElement;
+use crate::dom::html::htmlcanvaselement::HTMLCanvasElement;
+use crate::dom::html::htmldetailselement::HTMLDetailsElement;
+use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
+use crate::dom::html::htmlfontelement::HTMLFontElement;
+use crate::dom::html::htmlformelement::HTMLFormElement;
+use crate::dom::html::htmlheadelement::HTMLHeadElement;
+use crate::dom::html::htmlhrelement::HTMLHRElement;
+use crate::dom::html::htmliframeelement::HTMLIFrameElement;
+use crate::dom::html::htmlimageelement::HTMLImageElement;
+use crate::dom::html::htmlinputelement::HTMLInputElement;
+use crate::dom::html::htmllabelelement::HTMLLabelElement;
+use crate::dom::html::htmllielement::HTMLLIElement;
+use crate::dom::html::htmllinkelement::HTMLLinkElement;
+use crate::dom::html::htmlmediaelement::HTMLMediaElement;
+use crate::dom::html::htmlmetaelement::HTMLMetaElement;
+use crate::dom::html::htmlmeterelement::HTMLMeterElement;
+use crate::dom::html::htmlobjectelement::HTMLObjectElement;
+use crate::dom::html::htmloptgroupelement::HTMLOptGroupElement;
+use crate::dom::html::htmloptionelement::HTMLOptionElement;
+use crate::dom::html::htmloutputelement::HTMLOutputElement;
+use crate::dom::html::htmlpreelement::HTMLPreElement;
+use crate::dom::html::htmlprogresselement::HTMLProgressElement;
+use crate::dom::html::htmlscriptelement::HTMLScriptElement;
+use crate::dom::html::htmlselectelement::HTMLSelectElement;
+use crate::dom::html::htmlslotelement::HTMLSlotElement;
+use crate::dom::html::htmlsourceelement::HTMLSourceElement;
+use crate::dom::html::htmlstyleelement::HTMLStyleElement;
+use crate::dom::html::htmltablecellelement::HTMLTableCellElement;
+use crate::dom::html::htmltablecolelement::HTMLTableColElement;
+use crate::dom::html::htmltableelement::HTMLTableElement;
+use crate::dom::html::htmltablerowelement::HTMLTableRowElement;
+use crate::dom::html::htmltablesectionelement::HTMLTableSectionElement;
+use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
+use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+use crate::dom::html::htmltitleelement::HTMLTitleElement;
+use crate::dom::html::htmlvideoelement::HTMLVideoElement;
 use crate::dom::node::{BindContext, ChildrenMutation, CloneChildrenFlag, Node, UnbindContext};
 use crate::dom::shadowroot::ShadowRoot;
-use crate::dom::svgelement::SVGElement;
-use crate::dom::svgimageelement::SVGImageElement;
-use crate::dom::svgsvgelement::SVGSVGElement;
+use crate::dom::svg::svgelement::SVGElement;
+use crate::dom::svg::svgimageelement::SVGImageElement;
+use crate::dom::svg::svgsvgelement::SVGSVGElement;
 
 /// Trait to allow DOM nodes to opt-in to overriding (or adding to) common
 /// behaviours. Replicates the effect of C++ virtual methods.
@@ -101,22 +101,20 @@ pub(crate) trait VirtualMethods {
     /// Invoked during a DOM tree mutation after a node becomes connected, once all
     /// related DOM tree mutations have been applied.
     /// <https://dom.spec.whatwg.org/#concept-node-post-connection-ext>
-    fn post_connection_steps(&self) {
+    fn post_connection_steps(&self, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.post_connection_steps();
+            s.post_connection_steps(can_gc);
         }
     }
 
-    /// Called when a Node is appended to a tree, where 'tree_connected' indicates
-    /// whether the tree is part of a Document.
+    /// Called when a Node is appended to a tree.
     fn bind_to_tree(&self, context: &BindContext, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
             s.bind_to_tree(context, can_gc);
         }
     }
 
-    /// Called when a Node is removed from a tree, where 'tree_connected'
-    /// indicates whether the tree is part of a Document.
+    /// Called when a Node is removed from a tree.
     /// Implements removing steps:
     /// <https://dom.spec.whatwg.org/#concept-node-remove-ext>
     fn unbind_from_tree(&self, context: &UnbindContext, can_gc: CanGc) {
@@ -126,9 +124,9 @@ pub(crate) trait VirtualMethods {
     }
 
     /// Called on the parent when its children are changed.
-    fn children_changed(&self, mutation: &ChildrenMutation) {
+    fn children_changed(&self, mutation: &ChildrenMutation, can_gc: CanGc) {
         if let Some(s) = self.super_type() {
-            s.children_changed(mutation);
+            s.children_changed(mutation, can_gc);
         }
     }
 

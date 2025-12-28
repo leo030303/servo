@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use script_bindings::match_domstring_ascii;
 use script_bindings::str::DOMString;
 use servo_url::ServoUrl;
 
@@ -29,7 +30,7 @@ use crate::script_runtime::CanGc;
 pub(crate) struct ReportingObserver {
     reflector_: Reflector,
 
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     callback: Rc<ReportingObserverCallback>,
     buffered: RefCell<bool>,
     types: DomRefCell<Vec<DOMString>>,
@@ -67,11 +68,11 @@ impl ReportingObserver {
     }
 
     fn report_is_visible_to_reporting_observers(report: &Report) -> bool {
-        match report.type_.str() {
-            // https://w3c.github.io/webappsec-csp/#reporting
-            "csp-violation" => true,
-            _ => false,
-        }
+        match_domstring_ascii!(report.type_,
+                // https://w3c.github.io/webappsec-csp/#reporting
+                "csp-violation" => true,
+                _ =>  false,
+        )
     }
 
     /// <https://w3c.github.io/reporting/#add-report>

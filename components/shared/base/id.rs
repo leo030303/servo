@@ -10,16 +10,20 @@ use std::cell::Cell;
 use std::fmt;
 use std::marker::PhantomData;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use malloc_size_of::MallocSizeOfOps;
 use malloc_size_of_derive::MallocSizeOf;
 use parking_lot::Mutex;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use webrender_api::{ExternalScrollId, PipelineId as WebRenderPipelineId};
+use webrender_api::{
+    ExternalScrollId, FontInstanceKey, FontKey, IdNamespace, ImageKey,
+    PipelineId as WebRenderPipelineId, SpatialTreeItemKey,
+};
 
-use crate::generic_channel::GenericSender;
+use crate::generic_channel::{self, GenericReceiver, GenericSender};
 
 /// Asserts the size of a type at compile time.
 macro_rules! size_of_test {
@@ -117,19 +121,19 @@ macro_rules! namespace_id {
 
 #[derive(Debug, Deserialize, Serialize)]
 /// Request a pipeline-namespace id from the constellation.
-pub struct PipelineNamespaceRequest(pub IpcSender<PipelineNamespaceId>);
+pub struct PipelineNamespaceRequest(pub GenericSender<PipelineNamespaceId>);
 
 /// A per-process installer of pipeline-namespaces.
 pub struct PipelineNamespaceInstaller {
     request_sender: Option<GenericSender<PipelineNamespaceRequest>>,
-    namespace_sender: IpcSender<PipelineNamespaceId>,
-    namespace_receiver: IpcReceiver<PipelineNamespaceId>,
+    namespace_sender: GenericSender<PipelineNamespaceId>,
+    namespace_receiver: GenericReceiver<PipelineNamespaceId>,
 }
 
 impl Default for PipelineNamespaceInstaller {
     fn default() -> Self {
         let (namespace_sender, namespace_receiver) =
-            ipc::channel().expect("PipelineNamespaceInstaller ipc channel failure");
+            generic_channel::channel().expect("PipelineNamespaceInstaller channel failure");
         Self {
             request_sender: None,
             namespace_sender,
@@ -258,7 +262,7 @@ impl PipelineId {
 }
 
 impl From<WebRenderPipelineId> for PipelineId {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn from(pipeline: WebRenderPipelineId) -> Self {
         let WebRenderPipelineId(namespace_id, index) = pipeline;
         unsafe {
@@ -297,60 +301,73 @@ impl fmt::Display for BrowsingContextGroupId {
     }
 }
 
-thread_local!(pub static WEBVIEW_ID: Cell<Option<WebViewId>> =
-    const { Cell::new(None) });
+impl BrowsingContextId {
+    pub fn from_string(str: &str) -> Option<BrowsingContextId> {
+        let re = Regex::new(r"^BrowsingContext\((\d+),(\d+)\)$").ok()?;
+        let caps = re.captures(str)?;
+        let namespace_id = caps.get(1)?.as_str().parse::<u32>().ok()?;
+        let index = caps.get(2)?.as_str().parse::<u32>().ok()?;
 
-#[derive(
-    Clone, Copy, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
-)]
-pub struct WebViewId(pub BrowsingContextId);
-
-size_of_test!(WebViewId, 8);
-size_of_test!(Option<WebViewId>, 8);
-
-impl fmt::Debug for WebViewId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TopLevel{:?}", self.0)
+        let result = BrowsingContextId {
+            namespace_id: PipelineNamespaceId(namespace_id),
+            index: Index::new(index).ok()?,
+        };
+        assert_eq!(result.to_string(), str.to_string());
+        Some(result)
     }
 }
 
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct WebViewId(PainterId, BrowsingContextId);
+
+size_of_test!(WebViewId, 12);
+size_of_test!(Option<WebViewId>, 12);
+
 impl fmt::Display for WebViewId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "TopLevel{}", self.0)
+        write!(f, "{}, TopLevel{}", self.0, self.1)
+    }
+}
+
+impl From<WebViewId> for SpatialTreeItemKey {
+    fn from(webview_id: WebViewId) -> Self {
+        Self::new(webview_id.1.index.0.get() as u64, 0)
     }
 }
 
 impl WebViewId {
-    pub fn new() -> WebViewId {
-        WebViewId(BrowsingContextId::new())
+    pub fn new(painter_id: PainterId) -> WebViewId {
+        WebViewId(painter_id, BrowsingContextId::new())
     }
 
-    /// Each script and layout thread should have the top-level browsing context id installed,
-    /// since it is used by crash reporting.
-    pub fn install(id: WebViewId) {
-        WEBVIEW_ID.with(|tls| tls.set(Some(id)))
-    }
-
-    pub fn installed() -> Option<WebViewId> {
-        WEBVIEW_ID.with(|tls| tls.get())
+    pub fn mock_for_testing(browsing_context_id: BrowsingContextId) -> WebViewId {
+        WebViewId(TEST_PAINTER_ID, browsing_context_id)
     }
 }
 
 impl From<WebViewId> for BrowsingContextId {
     fn from(id: WebViewId) -> BrowsingContextId {
+        id.1
+    }
+}
+
+impl From<WebViewId> for PainterId {
+    fn from(id: WebViewId) -> PainterId {
         id.0
     }
 }
 
 impl PartialEq<WebViewId> for BrowsingContextId {
     fn eq(&self, rhs: &WebViewId) -> bool {
-        self.eq(&rhs.0)
+        self.eq(&rhs.1)
     }
 }
 
 impl PartialEq<BrowsingContextId> for WebViewId {
     fn eq(&self, rhs: &BrowsingContextId) -> bool {
-        self.0.eq(rhs)
+        self.1.eq(rhs)
     }
 }
 
@@ -386,6 +403,8 @@ namespace_id! {OffscreenCanvasId, OffscreenCanvasIndex, "OffscreenCanvas"}
 
 namespace_id! {CookieStoreId, CookieStoreIndex, "CookieStore"}
 
+namespace_id! {ImageDataId, ImageDataIndex, "ImageData"}
+
 // We provide ids just for unit testing.
 pub const TEST_NAMESPACE: PipelineNamespaceId = PipelineNamespaceId(1234);
 pub const TEST_PIPELINE_INDEX: Index<PipelineIndex> =
@@ -401,7 +420,9 @@ pub const TEST_BROWSING_CONTEXT_ID: BrowsingContextId = BrowsingContextId {
     index: TEST_BROWSING_CONTEXT_INDEX,
 };
 
-pub const TEST_WEBVIEW_ID: WebViewId = WebViewId(TEST_BROWSING_CONTEXT_ID);
+pub const TEST_PAINTER_ID: PainterId = PainterId(9999);
+pub const TEST_WEBVIEW_ID: WebViewId = WebViewId(TEST_PAINTER_ID, TEST_BROWSING_CONTEXT_ID);
+pub const TEST_SCRIPT_EVENT_LOOP_ID: ScriptEventLoopId = ScriptEventLoopId(1234);
 
 /// An id for a ScrollTreeNode in the ScrollTree. This contains both the index
 /// to the node in the tree's array of nodes as well as the corresponding SpatialId
@@ -410,4 +431,84 @@ pub const TEST_WEBVIEW_ID: WebViewId = WebViewId(TEST_BROWSING_CONTEXT_ID);
 pub struct ScrollTreeNodeId {
     /// The index of this scroll tree node in the tree's array of nodes.
     pub index: usize,
+}
+
+static PAINTER_ID: AtomicU32 = AtomicU32::new(1);
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, PartialOrd, Ord, Hash, Eq, Serialize, Deserialize, MallocSizeOf,
+)]
+pub struct PainterId(u32);
+
+impl fmt::Display for PainterId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "PainterId: {}", self.0)
+    }
+}
+
+impl PainterId {
+    pub fn next() -> Self {
+        Self(PAINTER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl From<PainterId> for IdNamespace {
+    fn from(painter_id: PainterId) -> Self {
+        IdNamespace(painter_id.0)
+    }
+}
+
+impl From<IdNamespace> for PainterId {
+    fn from(id_namespace: IdNamespace) -> Self {
+        PainterId(id_namespace.0)
+    }
+}
+
+impl From<FontKey> for PainterId {
+    fn from(font_key: FontKey) -> Self {
+        font_key.0.into()
+    }
+}
+
+impl From<FontInstanceKey> for PainterId {
+    fn from(font_instance_key: FontInstanceKey) -> Self {
+        font_instance_key.0.into()
+    }
+}
+
+impl From<ImageKey> for PainterId {
+    fn from(image_key: ImageKey) -> Self {
+        image_key.0.into()
+    }
+}
+
+static SCRIPT_EVENT_LOOP_ID: AtomicU32 = AtomicU32::new(1);
+thread_local!(pub static INSTALLED_SCRIPT_EVENT_LOOP_ID: Cell<Option<ScriptEventLoopId>> =
+    const { Cell::new(None) });
+
+#[derive(
+    Clone, Copy, Debug, PartialEq, PartialOrd, Ord, Hash, Eq, Serialize, Deserialize, MallocSizeOf,
+)]
+pub struct ScriptEventLoopId(u32);
+
+impl ScriptEventLoopId {
+    pub fn new() -> Self {
+        Self(SCRIPT_EVENT_LOOP_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Each script and layout thread should have the [`ScriptEventLoopId`] installed,
+    /// since it is used by crash reporting.
+    pub fn install(id: Self) {
+        INSTALLED_SCRIPT_EVENT_LOOP_ID.with(|tls| tls.set(Some(id)))
+    }
+
+    pub fn installed() -> Option<Self> {
+        INSTALLED_SCRIPT_EVENT_LOOP_ID.with(|tls| tls.get())
+    }
+}
+
+impl fmt::Display for ScriptEventLoopId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }

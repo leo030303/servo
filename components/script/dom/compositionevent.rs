@@ -35,7 +35,7 @@ impl CompositionEvent {
         reflect_dom_object(Box::new(CompositionEvent::new_inherited()), window, can_gc)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         window: &Window,
         type_: DOMString,
@@ -51,7 +51,7 @@ impl CompositionEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
         window: &Window,
         proto: Option<HandleObject>,
@@ -77,13 +77,13 @@ impl CompositionEvent {
         ev
     }
 
-    pub(crate) fn data(&self) -> &str {
+    pub(crate) fn data(&self) -> &DOMString {
         &self.data
     }
 }
 
 impl CompositionEventMethods<crate::DomTypeHolder> for CompositionEvent {
-    // https://w3c.github.io/uievents/#dom-compositionevent-compositionevent
+    /// <https://w3c.github.io/uievents/#dom-compositionevent-compositionevent>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -105,12 +105,12 @@ impl CompositionEventMethods<crate::DomTypeHolder> for CompositionEvent {
         Ok(event)
     }
 
-    // https://w3c.github.io/uievents/#dom-compositionevent-data
+    /// <https://w3c.github.io/uievents/#dom-compositionevent-data>
     fn Data(&self) -> DOMString {
         self.data.clone()
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.uievent.IsTrusted()
     }

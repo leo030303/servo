@@ -4,10 +4,10 @@
 
 use std::rc::Rc;
 
+use base::generic_channel::GenericSender;
 use bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
 use bluetooth_traits::{BluetoothRequest, BluetoothResponse, GATTType};
 use dom_struct::dom_struct;
-use ipc_channel::ipc::IpcSender;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::BluetoothCharacteristicPropertiesBinding::BluetoothCharacteristicPropertiesMethods;
@@ -84,7 +84,7 @@ impl BluetoothRemoteGATTCharacteristic {
         )
     }
 
-    fn get_bluetooth_thread(&self) -> IpcSender<BluetoothRequest> {
+    fn get_bluetooth_thread(&self) -> GenericSender<BluetoothRequest> {
         self.global().as_window().bluetooth_thread()
     }
 
@@ -96,22 +96,22 @@ impl BluetoothRemoteGATTCharacteristic {
 impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
     for BluetoothRemoteGATTCharacteristic
 {
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-properties
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-properties>
     fn Properties(&self) -> DomRoot<BluetoothCharacteristicProperties> {
         DomRoot::from_ref(&self.properties)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-service
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-service>
     fn Service(&self) -> DomRoot<BluetoothRemoteGATTService> {
         DomRoot::from_ref(&self.service)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-uuid
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-uuid>
     fn Uuid(&self) -> DOMString {
         self.uuid.clone()
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-getdescriptor
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-getdescriptor>
     fn GetDescriptor(&self, descriptor: BluetoothDescriptorUUID, can_gc: CanGc) -> Rc<Promise> {
         get_gatt_children(
             self,
@@ -119,13 +119,13 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
             BluetoothUUID::descriptor,
             Some(descriptor),
             self.get_instance_id(),
-            self.Service().Device().get_gatt().Connected(),
+            self.Service().Device().get_gatt(can_gc).Connected(),
             GATTType::Descriptor,
             can_gc,
         )
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-getdescriptors
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-getdescriptors>
     fn GetDescriptors(
         &self,
         descriptor: Option<BluetoothDescriptorUUID>,
@@ -137,30 +137,30 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
             BluetoothUUID::descriptor,
             descriptor,
             self.get_instance_id(),
-            self.Service().Device().get_gatt().Connected(),
+            self.Service().Device().get_gatt(can_gc).Connected(),
             GATTType::Descriptor,
             can_gc,
         )
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-value
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-value>
     fn GetValue(&self) -> Option<ByteString> {
         self.value.borrow().clone()
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-readvalue
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-readvalue>
     fn ReadValue(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 1.
-        if uuid_is_blocklisted(self.uuid.as_ref(), Blocklist::Reads) {
-            p.reject_error(Security, can_gc);
+        if uuid_is_blocklisted(&self.uuid.str(), Blocklist::Reads) {
+            p.reject_error(Security(None), can_gc);
             return p;
         }
 
         // Step 2.
-        if !self.Service().Device().get_gatt().Connected() {
-            p.reject_error(Network, can_gc);
+        if !self.Service().Device().get_gatt(can_gc).Connected() {
+            p.reject_error(Network(None), can_gc);
             return p;
         }
 
@@ -168,7 +168,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
 
         // Step 5.1.
         if !self.Properties().Read() {
-            p.reject_error(NotSupported, can_gc);
+            p.reject_error(NotSupported(None), can_gc);
             return p;
         }
 
@@ -181,7 +181,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         p
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-writevalue
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-writevalue>
     fn WriteValue(
         &self,
         value: ArrayBufferViewOrArrayBuffer,
@@ -191,8 +191,8 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         let p = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 1.
-        if uuid_is_blocklisted(self.uuid.as_ref(), Blocklist::Writes) {
-            p.reject_error(Security, can_gc);
+        if uuid_is_blocklisted(&self.uuid.str(), Blocklist::Writes) {
+            p.reject_error(Security(None), can_gc);
             return p;
         }
 
@@ -203,13 +203,13 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         };
 
         if vec.len() > MAXIMUM_ATTRIBUTE_LENGTH {
-            p.reject_error(InvalidModification, can_gc);
+            p.reject_error(InvalidModification(None), can_gc);
             return p;
         }
 
         // Step 4.
-        if !self.Service().Device().get_gatt().Connected() {
-            p.reject_error(Network, can_gc);
+        if !self.Service().Device().get_gatt(can_gc).Connected() {
+            p.reject_error(Network(None), can_gc);
             return p;
         }
 
@@ -220,7 +220,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
             self.Properties().WriteWithoutResponse() ||
             self.Properties().AuthenticatedSignedWrites())
         {
-            p.reject_error(NotSupported, can_gc);
+            p.reject_error(NotSupported(None), can_gc);
             return p;
         }
 
@@ -237,25 +237,25 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         p
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-startnotifications
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-startnotifications>
     fn StartNotifications(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 1.
-        if uuid_is_blocklisted(self.uuid.as_ref(), Blocklist::Reads) {
-            p.reject_error(Security, can_gc);
+        if uuid_is_blocklisted(&self.uuid.str(), Blocklist::Reads) {
+            p.reject_error(Security(None), can_gc);
             return p;
         }
 
         // Step 2.
-        if !self.Service().Device().get_gatt().Connected() {
-            p.reject_error(Network, can_gc);
+        if !self.Service().Device().get_gatt(can_gc).Connected() {
+            p.reject_error(Network(None), can_gc);
             return p;
         }
 
         // Step 5.
         if !(self.Properties().Notify() || self.Properties().Indicate()) {
-            p.reject_error(NotSupported, can_gc);
+            p.reject_error(NotSupported(None), can_gc);
             return p;
         }
 
@@ -274,7 +274,7 @@ impl BluetoothRemoteGATTCharacteristicMethods<crate::DomTypeHolder>
         p
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-stopnotifications
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-stopnotifications>
     fn StopNotifications(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
         let sender = response_async(&p, self);

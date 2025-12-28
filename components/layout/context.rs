@@ -2,20 +2,20 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
+use base::id::PainterId;
 use embedder_traits::UntrustedNodeAddress;
 use euclid::Size2D;
-use fnv::FnvHashMap;
 use fonts::FontContext;
-use fxhash::FxHashMap;
 use layout_api::wrapper_traits::ThreadSafeLayoutNode;
 use layout_api::{
-    IFrameSizes, ImageAnimationState, PendingImage, PendingImageState, PendingRasterizationImage,
+    AnimatingImages, IFrameSizes, LayoutImageDestination, PendingImage, PendingImageState,
+    PendingRasterizationImage,
 };
 use net_traits::image_cache::{
     Image as CachedImage, ImageCache, ImageCacheResult, ImageOrMetadataAvailable, PendingImageId,
-    UsePlaceholder,
 };
 use parking_lot::{Mutex, RwLock};
 use pixels::RasterImage;
@@ -43,6 +43,9 @@ pub(crate) struct LayoutContext<'a> {
     /// An [`ImageResolver`] used for resolving images during box and fragment
     /// tree construction. Later passed to display list construction.
     pub image_resolver: Arc<ImageResolver>,
+
+    /// The [`PainterId`] that identifies which `RenderingContext` that this layout targets.
+    pub painter_id: PainterId,
 }
 
 pub enum ResolvedImage<'a> {
@@ -90,19 +93,18 @@ pub(crate) struct ImageResolver {
     /// A list of `SVGSVGElement`s encountered during layout that are not
     /// serialized yet. This is needed to support inline SVGs as they are treated
     /// as replaced elements and the layout is responsible for triggering the
-    /// network load for the corresponding serialzed data: urls (similar to
+    /// network load for the corresponding serialized data: urls (similar to
     /// background images).
     pub pending_svg_elements_for_serialization: Mutex<Vec<UntrustedNodeAddress>>,
 
     /// A shared reference to script's map of DOM nodes with animated images. This is used
     /// to manage image animations in script and inform the script about newly animating
     /// nodes.
-    pub node_to_animating_image_map: Arc<RwLock<FxHashMap<OpaqueNode, ImageAnimationState>>>,
+    pub animating_images: Arc<RwLock<AnimatingImages>>,
 
     // A cache that maps image resources used in CSS (e.g as the `url()` value
     // for `background-image` or `content` property) to the final resolved image data.
-    pub resolved_images_cache:
-        Arc<RwLock<FnvHashMap<(ServoUrl, UsePlaceholder), CachedImageOrError>>>,
+    pub resolved_images_cache: Arc<RwLock<HashMap<ServoUrl, CachedImageOrError>>>,
 
     /// The current animation timeline value used to properly initialize animating images.
     pub animation_timeline_value: f64,
@@ -127,15 +129,12 @@ impl ImageResolver {
         &self,
         node: OpaqueNode,
         url: ServoUrl,
-        use_placeholder: UsePlaceholder,
+        destination: LayoutImageDestination,
     ) -> LayoutImageCacheResult {
         // Check for available image or start tracking.
-        let cache_result = self.image_cache.get_cached_image_status(
-            url.clone(),
-            self.origin.clone(),
-            None,
-            use_placeholder,
-        );
+        let cache_result =
+            self.image_cache
+                .get_cached_image_status(url.clone(), self.origin.clone(), None);
 
         match cache_result {
             ImageCacheResult::Available(img_or_meta) => {
@@ -149,6 +148,7 @@ impl ImageResolver {
                     node: node.into(),
                     id,
                     origin: self.origin.clone(),
+                    destination,
                 };
                 self.pending_images.lock().push(image);
                 LayoutImageCacheResult::Pending
@@ -160,30 +160,22 @@ impl ImageResolver {
                     node: node.into(),
                     id,
                     origin: self.origin.clone(),
+                    destination,
                 };
                 self.pending_images.lock().push(image);
                 LayoutImageCacheResult::Pending
             },
             // Image failed to load, so just return the same error.
-            ImageCacheResult::LoadError => LayoutImageCacheResult::LoadError,
+            ImageCacheResult::FailedToLoadOrDecode => LayoutImageCacheResult::LoadError,
         }
     }
 
     pub(crate) fn handle_animated_image(&self, node: OpaqueNode, image: Arc<RasterImage>) {
-        let mut map = self.node_to_animating_image_map.write();
+        let mut animating_images = self.animating_images.write();
         if !image.should_animate() {
-            map.remove(&node);
-            return;
-        }
-        let new_image_animation_state =
-            || ImageAnimationState::new(image.clone(), self.animation_timeline_value);
-
-        let entry = map.entry(node).or_insert_with(new_image_animation_state);
-
-        // If the entry exists, but it is for a different image id, replace it as the image
-        // has changed during this layout.
-        if entry.image.id != image.id {
-            *entry = new_image_animation_state();
+            animating_images.remove(node);
+        } else {
+            animating_images.maybe_insert_or_update(node, image, self.animation_timeline_value);
         }
     }
 
@@ -191,17 +183,13 @@ impl ImageResolver {
         &self,
         node: OpaqueNode,
         url: ServoUrl,
-        use_placeholder: UsePlaceholder,
+        destination: LayoutImageDestination,
     ) -> Result<CachedImage, ResolveImageError> {
-        if let Some(cached_image) = self
-            .resolved_images_cache
-            .read()
-            .get(&(url.clone(), use_placeholder))
-        {
+        if let Some(cached_image) = self.resolved_images_cache.read().get(&url) {
             return cached_image.clone();
         }
 
-        let result = self.get_or_request_image_or_meta(node, url.clone(), use_placeholder);
+        let result = self.get_or_request_image_or_meta(node, url.clone(), destination);
         match result {
             LayoutImageCacheResult::DataAvailable(img_or_meta) => match img_or_meta {
                 ImageOrMetadataAvailable::ImageAvailable { image, .. } => {
@@ -210,7 +198,7 @@ impl ImageResolver {
                     }
 
                     let mut resolved_images_cache = self.resolved_images_cache.write();
-                    resolved_images_cache.insert((url, use_placeholder), Ok(image.clone()));
+                    resolved_images_cache.insert(url, Ok(image.clone()));
                     Ok(image)
                 },
                 ImageOrMetadataAvailable::MetadataAvailable(..) => {
@@ -222,7 +210,7 @@ impl ImageResolver {
                 let error = Err(ResolveImageError::LoadError);
                 self.resolved_images_cache
                     .write()
-                    .insert((url, use_placeholder), error.clone());
+                    .insert(url, error.clone());
                 error
             },
         }
@@ -279,7 +267,7 @@ impl ImageResolver {
                 let image = self.get_cached_image_for_url(
                     node,
                     image_url.clone().into(),
-                    UsePlaceholder::No,
+                    LayoutImageDestination::DisplayListBuilding,
                 )?;
                 let metadata = image.metadata();
                 let size = Size2D::new(metadata.width, metadata.height).to_f32();

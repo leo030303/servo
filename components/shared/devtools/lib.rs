@@ -18,14 +18,16 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base::cross_process_instant::CrossProcessInstant;
+use base::generic_channel::GenericSender;
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use bitflags::bitflags;
+pub use embedder_traits::ConsoleLogLevel;
 use embedder_traits::Theme;
 use http::{HeaderMap, Method};
-use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::Destination;
+use net_traits::{DebugVec, TlsSecurityInfo};
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
 use uuid::Uuid;
@@ -87,13 +89,15 @@ pub enum ScriptToDevtoolsControlMsg {
     /// The means of communicating directly with it are provided.
     NewGlobal(
         (BrowsingContextId, PipelineId, Option<WorkerId>, WebViewId),
-        IpcSender<DevtoolScriptControlMsg>,
+        GenericSender<DevtoolScriptControlMsg>,
         DevtoolsPageInfo,
     ),
     /// The given browsing context is performing a navigation.
     Navigate(BrowsingContextId, NavigationState),
     /// A particular page has invoked the console API.
     ConsoleAPI(PipelineId, ConsoleMessage, Option<WorkerId>),
+    /// Request to clear the console for a given pipeline.
+    ClearConsole(PipelineId, Option<WorkerId>),
     /// An animation frame with the given timestamp was processed in a script thread.
     /// The actor with the provided name should be notified.
     FramerateTick(String, f64),
@@ -108,7 +112,11 @@ pub enum ScriptToDevtoolsControlMsg {
     TitleChanged(PipelineId, String),
 
     /// Get source information from script
-    CreateSourceActor(IpcSender<DevtoolScriptControlMsg>, PipelineId, SourceInfo),
+    CreateSourceActor(
+        GenericSender<DevtoolScriptControlMsg>,
+        PipelineId,
+        SourceInfo,
+    ),
 
     UpdateSourceContent(PipelineId, String),
 }
@@ -235,30 +243,40 @@ pub struct AutoMargins {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum DevtoolScriptControlMsg {
     /// Evaluate a JS snippet in the context of the global for the given pipeline.
-    EvaluateJS(PipelineId, String, IpcSender<EvaluateJSReply>),
+    EvaluateJS(PipelineId, String, GenericSender<EvaluateJSReply>),
     /// Retrieve the details of the root node (ie. the document) for the given pipeline.
-    GetRootNode(PipelineId, IpcSender<Option<NodeInfo>>),
+    GetRootNode(PipelineId, GenericSender<Option<NodeInfo>>),
     /// Retrieve the details of the document element for the given pipeline.
-    GetDocumentElement(PipelineId, IpcSender<Option<NodeInfo>>),
+    GetDocumentElement(PipelineId, GenericSender<Option<NodeInfo>>),
     /// Retrieve the details of the child nodes of the given node in the given pipeline.
-    GetChildren(PipelineId, String, IpcSender<Option<Vec<NodeInfo>>>),
+    GetChildren(PipelineId, String, GenericSender<Option<Vec<NodeInfo>>>),
     /// Retrieve the CSS style properties defined in the attribute tag for the given node.
-    GetAttributeStyle(PipelineId, String, IpcSender<Option<Vec<NodeStyle>>>),
+    GetAttributeStyle(PipelineId, String, GenericSender<Option<Vec<NodeStyle>>>),
     /// Retrieve the CSS style properties defined in an stylesheet for the given selector.
     GetStylesheetStyle(
         PipelineId,
         String,
         String,
         usize,
-        IpcSender<Option<Vec<NodeStyle>>>,
+        GenericSender<Option<Vec<NodeStyle>>>,
     ),
     /// Retrieves the CSS selectors for the given node. A selector is comprised of the text
     /// of the selector and the id of the stylesheet that contains it.
-    GetSelectors(PipelineId, String, IpcSender<Option<Vec<(String, usize)>>>),
+    GetSelectors(
+        PipelineId,
+        String,
+        GenericSender<Option<Vec<(String, usize)>>>,
+    ),
     /// Retrieve the computed CSS style properties for the given node.
-    GetComputedStyle(PipelineId, String, IpcSender<Option<Vec<NodeStyle>>>),
+    GetComputedStyle(PipelineId, String, GenericSender<Option<Vec<NodeStyle>>>),
     /// Retrieve the computed layout properties of the given node in the given pipeline.
-    GetLayout(PipelineId, String, IpcSender<Option<ComputedNodeLayout>>),
+    GetLayout(
+        PipelineId,
+        String,
+        GenericSender<Option<ComputedNodeLayout>>,
+    ),
+    /// Get a unique XPath selector for the node.
+    GetXPath(PipelineId, String, GenericSender<String>),
     /// Update a given node's attributes with a list of modifications.
     ModifyAttribute(PipelineId, String, Vec<AttrModification>),
     /// Update a given node's style rules with a list of modifications.
@@ -269,7 +287,7 @@ pub enum DevtoolScriptControlMsg {
     SetTimelineMarkers(
         PipelineId,
         Vec<TimelineMarkerType>,
-        IpcSender<Option<TimelineMarker>>,
+        GenericSender<Option<TimelineMarker>>,
     ),
     /// Withdraw request for live timeline notifications for a given pipeline.
     DropTimelineMarkers(PipelineId, Vec<TimelineMarkerType>),
@@ -279,13 +297,13 @@ pub enum DevtoolScriptControlMsg {
     /// Direct the given pipeline to reload the current page.
     Reload(PipelineId),
     /// Gets the list of all allowed CSS rules and possible values.
-    GetCssDatabase(IpcSender<HashMap<String, CssDatabaseProperty>>),
+    GetCssDatabase(GenericSender<HashMap<String, CssDatabaseProperty>>),
     /// Simulates a light or dark color scheme for the given pipeline
     SimulateColorScheme(PipelineId, Theme),
     /// Highlight the given DOM node
     HighlightDomNode(PipelineId, Option<String>),
 
-    GetPossibleBreakpoints(u32, IpcSender<Vec<RecommendedBreakpointLocation>>),
+    GetPossibleBreakpoints(u32, GenericSender<Vec<RecommendedBreakpointLocation>>),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -306,37 +324,11 @@ pub struct RuleModification {
     pub priority: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub enum LogLevel {
-    Log,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Clear,
-    Trace,
-}
-
-impl From<LogLevel> for log::Level {
-    fn from(value: LogLevel) -> Self {
-        match value {
-            LogLevel::Log => log::Level::Info,
-            LogLevel::Clear => log::Level::Info,
-
-            LogLevel::Debug => log::Level::Debug,
-            LogLevel::Info => log::Level::Info,
-            LogLevel::Warn => log::Level::Warn,
-            LogLevel::Error => log::Level::Error,
-            LogLevel::Trace => log::Level::Trace,
-        }
-    }
-}
-
 /// A console message as it is sent from script to the constellation
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConsoleMessage {
-    pub log_level: LogLevel,
+    pub log_level: ConsoleLogLevel,
     pub filename: String,
     pub line_number: usize,
     pub column_number: usize,
@@ -408,13 +400,12 @@ pub struct ConsoleLog {
 impl From<ConsoleMessage> for ConsoleLog {
     fn from(value: ConsoleMessage) -> Self {
         let level = match value.log_level {
-            LogLevel::Debug => "debug",
-            LogLevel::Info => "info",
-            LogLevel::Warn => "warn",
-            LogLevel::Error => "error",
-            LogLevel::Clear => "clear",
-            LogLevel::Trace => "trace",
-            LogLevel::Log => "log",
+            ConsoleLogLevel::Debug => "debug",
+            ConsoleLogLevel::Info => "info",
+            ConsoleLogLevel::Warn => "warn",
+            ConsoleLogLevel::Error => "error",
+            ConsoleLogLevel::Trace => "trace",
+            ConsoleLogLevel::Log => "log",
         }
         .to_owned();
 
@@ -435,6 +426,11 @@ impl From<ConsoleMessage> for ConsoleLog {
     }
 }
 
+#[derive(Serialize)]
+pub struct ConsoleClearMessage {
+    pub level: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CachedConsoleMessage {
     PageError(PageError),
@@ -446,7 +442,7 @@ pub struct HttpRequest {
     pub url: ServoUrl,
     pub method: Method,
     pub headers: HeaderMap,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<DebugVec>,
     pub pipeline_id: PipelineId,
     pub started_date_time: SystemTime,
     pub time_stamp: i64,
@@ -461,9 +457,16 @@ pub struct HttpRequest {
 pub struct HttpResponse {
     pub headers: Option<HeaderMap>,
     pub status: HttpStatus,
-    pub body: Option<Vec<u8>>,
+    pub body: Option<DebugVec>,
+    pub from_cache: bool,
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct SecurityInfoUpdate {
+    pub browsing_context_id: BrowsingContextId,
+    pub security_info: Option<TlsSecurityInfo>,
 }
 
 #[derive(Debug)]
@@ -471,6 +474,18 @@ pub enum NetworkEvent {
     HttpRequest(HttpRequest),
     HttpRequestUpdate(HttpRequest),
     HttpResponse(HttpResponse),
+    SecurityInfo(SecurityInfoUpdate),
+}
+
+impl NetworkEvent {
+    pub fn forward_to_devtools(&self) -> bool {
+        match self {
+            NetworkEvent::HttpRequest(http_request) => http_request.url.scheme() != "data",
+            NetworkEvent::HttpRequestUpdate(_) => true,
+            NetworkEvent::HttpResponse(_) => true,
+            NetworkEvent::SecurityInfo(_) => true,
+        }
+    }
 }
 
 impl TimelineMarker {
@@ -543,7 +558,7 @@ impl From<String> for ConsoleMessageArgument {
 }
 
 pub struct ConsoleMessageBuilder {
-    level: LogLevel,
+    level: ConsoleLogLevel,
     filename: String,
     line_number: u32,
     column_number: u32,
@@ -552,7 +567,12 @@ pub struct ConsoleMessageBuilder {
 }
 
 impl ConsoleMessageBuilder {
-    pub fn new(level: LogLevel, filename: String, line_number: u32, column_number: u32) -> Self {
+    pub fn new(
+        level: ConsoleLogLevel,
+        filename: String,
+        line_number: u32,
+        column_number: u32,
+    ) -> Self {
         Self {
             level,
             filename,

@@ -10,18 +10,16 @@ use range::Range;
 use style::Zero;
 use style::computed_values::position::T as Position;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
-use style::properties::ComputedValues;
 use style::values::generics::box_::{GenericVerticalAlign, VerticalAlignKeyword};
-use style::values::generics::font::LineHeight;
 use style::values::specified::align::AlignFlags;
 use style::values::specified::box_::DisplayOutside;
 use unicode_bidi::{BidiInfo, Level};
 use webrender_api::FontInstanceKey;
 
 use super::inline_box::{InlineBoxContainerState, InlineBoxIdentifier, InlineBoxTreePathToken};
-use super::{InlineFormattingContextLayout, LineBlockSizes, SharedInlineStyles};
+use super::{InlineFormattingContextLayout, LineBlockSizes, SharedInlineStyles, line_height};
 use crate::cell::ArcRefCell;
-use crate::fragment_tree::{BaseFragmentInfo, BoxFragment, Fragment, TextFragment};
+use crate::fragment_tree::{BaseFragment, BaseFragmentInfo, BoxFragment, Fragment, TextFragment};
 use crate::geom::{LogicalRect, LogicalVec2, PhysicalRect, ToLogical};
 use crate::positioned::{
     AbsolutelyPositionedBox, PositioningContext, PositioningContextLength, relative_adjustement,
@@ -148,6 +146,10 @@ pub(super) struct LineItemLayout<'layout_data, 'layout> {
     /// The amount of space to add to each justification opportunity in order to implement
     /// `text-align: justify`.
     pub justification_adjustment: Au,
+
+    /// Whether this is a phantom line box.
+    /// <https://drafts.csswg.org/css-inline-3/#invisible-line-boxes>
+    is_phantom_line: bool,
 }
 
 impl LineItemLayout<'_, '_> {
@@ -157,6 +159,7 @@ impl LineItemLayout<'_, '_> {
         start_position: LogicalVec2<Au>,
         effective_block_advance: &LineBlockSizes,
         justification_adjustment: Au,
+        is_phantom_line: bool,
     ) -> Vec<Fragment> {
         let baseline_offset = effective_block_advance.find_baseline_offset();
         LineItemLayout {
@@ -172,6 +175,7 @@ impl LineItemLayout<'_, '_> {
                 baseline_block_offset: baseline_offset,
             },
             justification_adjustment,
+            is_phantom_line,
         }
         .layout(line_items)
     }
@@ -282,7 +286,7 @@ impl LineItemLayout<'_, '_> {
         let fragments_and_rectangles = std::mem::take(&mut self.current_state.fragments);
         fragments_and_rectangles
             .into_iter()
-            .map(|(mut fragment, logical_rect)| {
+            .map(|(fragment, logical_rect)| {
                 if matches!(fragment, Fragment::Float(_)) {
                     return fragment;
                 }
@@ -290,9 +294,9 @@ impl LineItemLayout<'_, '_> {
                 // We do not know the actual physical position of a logically laid out inline element, until
                 // we know the width of the containing inline block. This step converts the logical rectangle
                 // into a physical one based on the inline formatting context width.
-                fragment.mutate_content_rect(|content_rect| {
-                    *content_rect = logical_rect.as_physical(Some(self.layout.containing_block))
-                });
+                if let Some(mut base) = fragment.base_mut() {
+                    base.rect = logical_rect.as_physical(Some(self.layout.containing_block));
+                }
 
                 fragment
             })
@@ -396,8 +400,19 @@ impl LineItemLayout<'_, '_> {
         //
         // Note: This is an optimization, but also has side effects. Any fragments on a line will
         // force the baseline to advance in the parent IFC.
+        //
+        // Note: We don't need to check the inline-start padding, border and margin because they
+        // must have been set to zero in the code above. But checking whether `pbm_sums.inline_end`
+        // is zero doesn't suffice, because it could be nullified by a negative margin.
+        //
+        // TODO: Once we implement `box-decoration-break: clone`, it may happen that `had_start` is
+        // true even if this isn't the first fragment.
         let pbm_sums = padding + border + margin;
-        if inner_state.fragments.is_empty() && !had_start && pbm_sums.inline_sum().is_zero() {
+        if inner_state.fragments.is_empty() &&
+            !had_start &&
+            pbm_sums.inline_end.is_zero() &&
+            margin.inline_end.is_zero()
+        {
             return;
         }
 
@@ -409,7 +424,11 @@ impl LineItemLayout<'_, '_> {
             },
             size: LogicalVec2 {
                 inline: inner_state.inline_advance,
-                block: inline_box_state.base.font_metrics.line_gap,
+                block: if self.is_phantom_line {
+                    Au::zero()
+                } else {
+                    inline_box_state.base.font_metrics.line_gap
+                },
             },
         };
 
@@ -431,19 +450,19 @@ impl LineItemLayout<'_, '_> {
         let fragments = inner_state
             .fragments
             .into_iter()
-            .map(|(mut fragment, logical_rect)| {
+            .map(|(fragment, logical_rect)| {
                 let is_float = matches!(fragment, Fragment::Float(_));
-                fragment.mutate_content_rect(|content_rect| {
+                if let Some(mut base) = fragment.base_mut() {
                     if is_float {
-                        content_rect.origin -=
+                        base.rect.origin -=
                             pbm_sums.start_offset().to_physical_size(ifc_writing_mode);
                     } else {
                         // We do not know the actual physical position of a logically laid out inline element, until
                         // we know the width of the containing inline block. This step converts the logical rectangle
                         // into a physical one now that we've computed inline size of the containing inline block above.
-                        *content_rect = logical_rect.as_physical(Some(&inline_box_containing_block))
+                        base.rect = logical_rect.as_physical(Some(&inline_box_containing_block))
                     }
-                });
+                }
                 fragment
             })
             .collect();
@@ -501,6 +520,9 @@ impl LineItemLayout<'_, '_> {
         inline_box_state: &InlineBoxContainerState,
         space_above_baseline: Au,
     ) -> Au {
+        if self.is_phantom_line {
+            return Au::zero();
+        };
         let font_metrics = &inline_box_state.base.font_metrics;
         let style = &inline_box_state.base.style;
         let line_gap = font_metrics.line_gap;
@@ -509,11 +531,11 @@ impl LineItemLayout<'_, '_> {
         // baseline, so we need to make it relative to the line block start.
         match inline_box_state.base.style.clone_vertical_align() {
             GenericVerticalAlign::Keyword(VerticalAlignKeyword::Top) => {
-                let line_height: Au = line_height(style, font_metrics);
+                let line_height = line_height(style, font_metrics, &inline_box_state.base.flags);
                 (line_height - line_gap).scale_by(0.5)
             },
             GenericVerticalAlign::Keyword(VerticalAlignKeyword::Bottom) => {
-                let line_height: Au = line_height(style, font_metrics);
+                let line_height = line_height(style, font_metrics, &inline_box_state.base.flags);
                 let half_leading = (line_height - line_gap).scale_by(0.5);
                 self.line_metrics.block_size - line_height + half_leading
             },
@@ -565,9 +587,12 @@ impl LineItemLayout<'_, '_> {
         self.current_state.inline_advance += inline_advance;
         self.current_state.fragments.push((
             Fragment::Text(ArcRefCell::new(TextFragment {
-                base: text_item.base_fragment_info.into(),
-                inline_styles: text_item.inline_styles.clone(),
-                rect: PhysicalRect::zero(),
+                base: BaseFragment::new(
+                    text_item.base_fragment_info,
+                    text_item.inline_styles.style.clone().into(),
+                    PhysicalRect::zero(),
+                ),
+                selected_style: text_item.inline_styles.selected.clone(),
                 font_metrics: text_item.font_metrics,
                 font_key: text_item.font_key,
                 glyphs: text_item.text,
@@ -598,9 +623,9 @@ impl LineItemLayout<'_, '_> {
                     padding_border_margin_sides.block_start,
             };
 
-            if atomic_fragment.style.get_box().position == Position::Relative {
-                atomic_offset +=
-                    relative_adjustement(&atomic_fragment.style, self.layout.containing_block);
+            let style = atomic_fragment.style();
+            if style.get_box().position == Position::Relative {
+                atomic_offset += relative_adjustement(&style, self.layout.containing_block);
             }
 
             // Reconstruct a logical rectangle relative to the inline box container that will be used
@@ -608,7 +633,7 @@ impl LineItemLayout<'_, '_> {
             LogicalRect {
                 start_corner: atomic_offset,
                 size: atomic_fragment
-                    .content_rect
+                    .content_rect()
                     .size
                     .to_logical(ifc_writing_mode),
             }
@@ -704,7 +729,7 @@ impl LineItemLayout<'_, '_> {
             inline: self.current_state.parent_offset.inline,
             block: self.line_metrics.block_offset + self.current_state.parent_offset.block,
         };
-        float.fragment.borrow_mut().content_rect.origin -= distance_from_parent_to_ifc
+        float.fragment.borrow_mut().base.rect.origin -= distance_from_parent_to_ifc
             .to_physical_size(self.layout.containing_block.style.writing_mode);
 
         self.current_state
@@ -853,7 +878,7 @@ impl AtomicLineItem {
     /// Given the metrics for a line, our vertical alignment, and our block size, find a block start
     /// position relative to the top of the line.
     fn calculate_block_start(&self, line_metrics: &LineMetrics) -> Au {
-        match self.fragment.borrow().style.clone_vertical_align() {
+        match self.fragment.borrow().style().clone_vertical_align() {
             GenericVerticalAlign::Keyword(VerticalAlignKeyword::Top) => Au::zero(),
             GenericVerticalAlign::Keyword(VerticalAlignKeyword::Bottom) => {
                 line_metrics.block_size - self.size.block
@@ -880,17 +905,7 @@ pub(super) struct FloatLineItem {
     pub needs_placement: bool,
 }
 
-fn line_height(parent_style: &ComputedValues, font_metrics: &FontMetrics) -> Au {
-    let font = parent_style.get_font();
-    let font_size = font.font_size.computed_size();
-    match font.line_height {
-        LineHeight::Normal => font_metrics.line_gap,
-        LineHeight::Number(number) => (font_size * number.0).into(),
-        LineHeight::Length(length) => length.0.into(),
-    }
-}
-
-/// Sort a mutable slice by the the given indices array in place, reording the slice so that final
+/// Sort a mutable slice by the given indices array in place, reording the slice so that final
 /// value of `slice[x]` is `slice[indices[x]]`.
 fn sort_by_indices_in_place<T>(data: &mut [T], mut indices: Vec<usize>) {
     for idx in 0..data.len() {

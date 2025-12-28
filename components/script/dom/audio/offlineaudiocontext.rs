@@ -39,7 +39,7 @@ pub(crate) struct OfflineAudioContext {
     channel_count: u32,
     length: u32,
     rendering_started: Cell<bool>,
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     pending_rendering_promise: DomRefCell<Option<Rc<Promise>>>,
 }
 
@@ -83,7 +83,7 @@ impl OfflineAudioContext {
             length == 0 ||
             !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&sample_rate)
         {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
         let pipeline_id = window.pipeline_id();
         let context =
@@ -98,7 +98,7 @@ impl OfflineAudioContext {
 }
 
 impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
-    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext
+    /// <https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -115,7 +115,7 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
         )
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext-numberofchannels-length-samplerate
+    /// <https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-offlineaudiocontext-numberofchannels-length-samplerate>
     fn Constructor_(
         window: &Window,
         proto: Option<HandleObject>,
@@ -137,16 +137,16 @@ impl OfflineAudioContextMethods<crate::DomTypeHolder> for OfflineAudioContext {
     // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-oncomplete
     event_handler!(complete, GetOncomplete, SetOncomplete);
 
-    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-length
+    /// <https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-length>
     fn Length(&self) -> u32 {
         self.length
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-startrendering
+    /// <https://webaudio.github.io/web-audio-api/#dom-offlineaudiocontext-startrendering>
     fn StartRendering(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let promise = Promise::new_in_current_realm(comp, can_gc);
         if self.rendering_started.get() {
-            promise.reject_error(Error::InvalidState, can_gc);
+            promise.reject_error(Error::InvalidState(None), can_gc);
             return promise;
         }
         self.rendering_started.set(true);

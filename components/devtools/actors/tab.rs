@@ -9,15 +9,16 @@
 //!
 //! [Firefox JS implementation]: https://searchfox.org/mozilla-central/source/devtools/server/actors/descriptors/tab.js
 
+use devtools_traits::DevtoolScriptControlMsg;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::StreamId;
-use crate::actor::{Actor, ActorError, ActorRegistry};
+use crate::actor::{Actor, ActorEncode, ActorError, ActorRegistry};
 use crate::actors::browsing_context::{BrowsingContextActor, BrowsingContextActorMsg};
 use crate::actors::root::{DescriptorTraits, RootActor};
 use crate::actors::watcher::{WatcherActor, WatcherActorMsg};
 use crate::protocol::ClientRequest;
+use crate::{EmptyReplyMsg, StreamId};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,7 +32,7 @@ pub struct TabDescriptorActorMsg {
     is_zombie_tab: bool,
     #[serde(rename = "outerWindowID")]
     outer_window_id: u32,
-    selected: bool,
+    pub selected: bool,
     title: String,
     traits: DescriptorTraits,
     url: String,
@@ -85,6 +86,8 @@ impl Actor for TabDescriptorActor {
     ///
     /// - `getWatcher`: Returns a `WatcherActor` linked to the tab's `BrowsingContext`. It is used
     ///   to describe the debugging capabilities of this tab.
+    ///
+    /// - `reloadDescriptor`: Causes the page to reload.
     fn handle_message(
         &self,
         request: ClientRequest,
@@ -94,15 +97,10 @@ impl Actor for TabDescriptorActor {
         _id: StreamId,
     ) -> Result<(), ActorError> {
         match msg_type {
-            "getTarget" => {
-                let frame = registry
-                    .find::<BrowsingContextActor>(&self.browsing_context_actor)
-                    .encodable();
-                request.reply_final(&GetTargetReply {
-                    from: self.name(),
-                    frame,
-                })?
-            },
+            "getTarget" => request.reply_final(&GetTargetReply {
+                from: self.name(),
+                frame: registry.encode::<BrowsingContextActor, _>(&self.browsing_context_actor),
+            })?,
             "getFavicon" => {
                 // TODO: Return a favicon when available
                 request.reply_final(&GetFaviconReply {
@@ -112,11 +110,21 @@ impl Actor for TabDescriptorActor {
             },
             "getWatcher" => {
                 let ctx_actor = registry.find::<BrowsingContextActor>(&self.browsing_context_actor);
-                let watcher = registry.find::<WatcherActor>(&ctx_actor.watcher);
                 request.reply_final(&GetWatcherReply {
                     from: self.name(),
-                    watcher: watcher.encodable(),
+                    watcher: registry.encode::<WatcherActor, _>(&ctx_actor.watcher),
                 })?
+            },
+            "reloadDescriptor" => {
+                // There is an extra bypassCache parameter that we don't currently use.
+                let ctx_actor = registry.find::<BrowsingContextActor>(&self.browsing_context_actor);
+                let pipeline = ctx_actor.active_pipeline_id.get();
+                ctx_actor
+                    .script_chan
+                    .send(DevtoolScriptControlMsg::Reload(pipeline))
+                    .map_err(|_| ActorError::Internal)?;
+
+                request.reply_final(&EmptyReplyMsg { from: self.name() })?
             },
             _ => return Err(ActorError::UnrecognizedPacketType),
         };
@@ -140,7 +148,17 @@ impl TabDescriptorActor {
         }
     }
 
-    pub fn encodable(&self, registry: &ActorRegistry, selected: bool) -> TabDescriptorActorMsg {
+    pub(crate) fn is_top_level_global(&self) -> bool {
+        self.is_top_level_global
+    }
+
+    pub fn browsing_context(&self) -> String {
+        self.browsing_context_actor.clone()
+    }
+}
+
+impl ActorEncode<TabDescriptorActorMsg> for TabDescriptorActor {
+    fn encode(&self, registry: &ActorRegistry) -> TabDescriptorActorMsg {
         let ctx_actor = registry.find::<BrowsingContextActor>(&self.browsing_context_actor);
         let title = ctx_actor.title.borrow().clone();
         let url = ctx_actor.url.borrow().clone();
@@ -151,7 +169,7 @@ impl TabDescriptorActor {
             browsing_context_id: ctx_actor.browsing_context_id.value(),
             is_zombie_tab: false,
             outer_window_id: ctx_actor.active_outer_window_id.get().value(),
-            selected,
+            selected: false,
             title,
             traits: DescriptorTraits {
                 watcher: true,
@@ -159,14 +177,5 @@ impl TabDescriptorActor {
             },
             url,
         }
-    }
-
-    pub(crate) fn is_top_level_global(&self) -> bool {
-        self.is_top_level_global
-    }
-
-    #[allow(dead_code)]
-    pub fn browsing_context(&self) -> String {
-        self.browsing_context_actor.clone()
     }
 }

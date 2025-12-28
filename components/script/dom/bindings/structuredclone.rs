@@ -4,20 +4,20 @@
 
 //! This module implements structured cloning, as defined by [HTML](https://html.spec.whatwg.org/multipage/#safe-passing-of-structured-data).
 
-use std::collections::HashMap;
 use std::ffi::CStr;
 use std::os::raw;
 use std::ptr;
 
 use base::id::{
-    BlobId, DomExceptionId, DomMatrixId, DomPointId, DomQuadId, DomRectId, ImageBitmapId, Index,
-    MessagePortId, NamespaceIndex, OffscreenCanvasId, PipelineNamespaceId, QuotaExceededErrorId,
+    BlobId, DomExceptionId, DomMatrixId, DomPointId, DomQuadId, DomRectId, ImageBitmapId,
+    ImageDataId, Index, MessagePortId, NamespaceIndex, OffscreenCanvasId, PipelineNamespaceId,
+    QuotaExceededErrorId,
 };
 use constellation_traits::{
     BlobImpl, DomException, DomMatrix, DomPoint, DomQuad, DomRect, MessagePortImpl,
-    Serializable as SerializableInterface, SerializableImageBitmap, SerializableQuotaExceededError,
-    StructuredSerializedData, TransferableOffscreenCanvas, Transferrable as TransferrableInterface,
-    TransformStreamData,
+    Serializable as SerializableInterface, SerializableImageBitmap, SerializableImageData,
+    SerializableQuotaExceededError, StructuredSerializedData, TransferableOffscreenCanvas,
+    Transferrable as TransferrableInterface, TransformStreamData,
 };
 use js::gc::RootedVec;
 use js::glue::{
@@ -34,6 +34,7 @@ use js::rust::wrappers::{JS_ReadStructuredClone, JS_WriteStructuredClone};
 use js::rust::{
     CustomAutoRooterGuard, HandleValue, JSAutoStructuredCloneBufferWrapper, MutableHandleValue,
 };
+use rustc_hash::FxHashMap;
 use script_bindings::conversions::{IDLInterface, SafeToJSValConvertible};
 use strum::IntoEnumIterator;
 
@@ -47,6 +48,7 @@ use crate::dom::dompoint::DOMPoint;
 use crate::dom::dompointreadonly::DOMPointReadOnly;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::imagebitmap::ImageBitmap;
+use crate::dom::imagedata::ImageData;
 use crate::dom::messageport::MessagePort;
 use crate::dom::offscreencanvas::OffscreenCanvas;
 use crate::dom::readablestream::ReadableStream;
@@ -83,6 +85,7 @@ pub(super) enum StructuredCloneTags {
     DomQuad = 0xFFFF800F,
     DomMatrix = 0xFFFF8010,
     DomMatrixReadOnly = 0xFFFF8011,
+    ImageData = 0xFFFF8012,
     Max = 0xFFFFFFFF,
 }
 
@@ -100,6 +103,7 @@ impl From<SerializableInterface> for StructuredCloneTags {
             SerializableInterface::DomException => StructuredCloneTags::DomException,
             SerializableInterface::ImageBitmap => StructuredCloneTags::ImageBitmap,
             SerializableInterface::QuotaExceededError => StructuredCloneTags::QuotaExceededError,
+            SerializableInterface::ImageData => StructuredCloneTags::ImageData,
         }
     }
 }
@@ -137,6 +141,7 @@ fn reader_for_type(
         SerializableInterface::DomException => read_object::<DOMException>,
         SerializableInterface::ImageBitmap => read_object::<ImageBitmap>,
         SerializableInterface::QuotaExceededError => read_object::<QuotaExceededError>,
+        SerializableInterface::ImageData => read_object::<ImageData>,
     }
 }
 
@@ -191,7 +196,7 @@ unsafe fn write_object<T: Serializable>(
 ) -> bool {
     if let Ok((new_id, serialized)) = object.serialize() {
         let objects = T::serialized_storage(StructuredData::Writer(sc_writer))
-            .get_or_insert_with(HashMap::new);
+            .get_or_insert(FxHashMap::default());
         objects.insert(new_id, serialized);
         let storage_key = StorageKey::new(new_id);
 
@@ -287,6 +292,7 @@ fn serialize_for_type(val: SerializableInterface) -> SerializeOperation {
         SerializableInterface::DomException => try_serialize::<DOMException>,
         SerializableInterface::ImageBitmap => try_serialize::<ImageBitmap>,
         SerializableInterface::QuotaExceededError => try_serialize::<QuotaExceededError>,
+        SerializableInterface::ImageData => try_serialize::<ImageData>,
     }
 }
 
@@ -416,8 +422,8 @@ unsafe fn try_transfer<T: Transferable + IDLInterface>(
     let (id, object) = object.transfer().map_err(OperationError::Exception)?;
 
     // 2. Store the transferred object at a given key.
-    let objects =
-        T::serialized_storage(StructuredData::Writer(sc_writer)).get_or_insert_with(HashMap::new);
+    let objects = T::serialized_storage(StructuredData::Writer(sc_writer))
+        .get_or_insert(FxHashMap::default());
     objects.insert(id, object);
 
     let index = id.index.0.get();
@@ -587,32 +593,35 @@ pub(crate) struct StructuredDataReader<'a> {
     /// A map of port implementations,
     /// used as part of the "transfer-receiving" steps of ports,
     /// to produce the DOM ports stored in `message_ports` above.
-    pub(crate) port_impls: Option<HashMap<MessagePortId, MessagePortImpl>>,
+    pub(crate) port_impls: Option<FxHashMap<MessagePortId, MessagePortImpl>>,
     /// A map of transform stream implementations,
-    pub(crate) transform_streams_port_impls: Option<HashMap<MessagePortId, TransformStreamData>>,
+    pub(crate) transform_streams_port_impls: Option<FxHashMap<MessagePortId, TransformStreamData>>,
     /// A map of blob implementations,
     /// used as part of the "deserialize" steps of blobs,
     /// to produce the DOM blobs stored in `blobs` above.
-    pub(crate) blob_impls: Option<HashMap<BlobId, BlobImpl>>,
+    pub(crate) blob_impls: Option<FxHashMap<BlobId, BlobImpl>>,
     /// A map of serialized points.
-    pub(crate) points: Option<HashMap<DomPointId, DomPoint>>,
+    pub(crate) points: Option<FxHashMap<DomPointId, DomPoint>>,
     /// A map of serialized rects.
-    pub(crate) rects: Option<HashMap<DomRectId, DomRect>>,
+    pub(crate) rects: Option<FxHashMap<DomRectId, DomRect>>,
     /// A map of serialized quads.
-    pub(crate) quads: Option<HashMap<DomQuadId, DomQuad>>,
+    pub(crate) quads: Option<FxHashMap<DomQuadId, DomQuad>>,
     /// A map of serialized matrices.
-    pub(crate) matrices: Option<HashMap<DomMatrixId, DomMatrix>>,
+    pub(crate) matrices: Option<FxHashMap<DomMatrixId, DomMatrix>>,
     /// A map of serialized exceptions.
-    pub(crate) exceptions: Option<HashMap<DomExceptionId, DomException>>,
+    pub(crate) exceptions: Option<FxHashMap<DomExceptionId, DomException>>,
     /// A map of serialized quota exceeded errors.
     pub(crate) quota_exceeded_errors:
-        Option<HashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
+        Option<FxHashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
     // A map of serialized image bitmaps.
-    pub(crate) image_bitmaps: Option<HashMap<ImageBitmapId, SerializableImageBitmap>>,
+    pub(crate) image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
     /// A map of transferred image bitmaps.
-    pub(crate) transferred_image_bitmaps: Option<HashMap<ImageBitmapId, SerializableImageBitmap>>,
+    pub(crate) transferred_image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
     /// A map of transferred offscreen canvases.
-    pub(crate) offscreen_canvases: Option<HashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
+    pub(crate) offscreen_canvases:
+        Option<FxHashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
+    // A map of serialized image data.
+    pub(crate) image_data: Option<FxHashMap<ImageDataId, SerializableImageData>>,
 }
 
 /// A data holder for transferred and serialized objects.
@@ -622,30 +631,33 @@ pub(crate) struct StructuredDataWriter {
     /// Error record.
     pub(crate) error: Option<Error>,
     /// Transferred ports.
-    pub(crate) ports: Option<HashMap<MessagePortId, MessagePortImpl>>,
+    pub(crate) ports: Option<FxHashMap<MessagePortId, MessagePortImpl>>,
     /// Transferred transform streams.
-    pub(crate) transform_streams_port: Option<HashMap<MessagePortId, TransformStreamData>>,
+    pub(crate) transform_streams_port: Option<FxHashMap<MessagePortId, TransformStreamData>>,
     /// Serialized points.
-    pub(crate) points: Option<HashMap<DomPointId, DomPoint>>,
+    pub(crate) points: Option<FxHashMap<DomPointId, DomPoint>>,
     /// Serialized rects.
-    pub(crate) rects: Option<HashMap<DomRectId, DomRect>>,
+    pub(crate) rects: Option<FxHashMap<DomRectId, DomRect>>,
     /// Serialized quads.
-    pub(crate) quads: Option<HashMap<DomQuadId, DomQuad>>,
+    pub(crate) quads: Option<FxHashMap<DomQuadId, DomQuad>>,
     /// Serialized matrices.
-    pub(crate) matrices: Option<HashMap<DomMatrixId, DomMatrix>>,
+    pub(crate) matrices: Option<FxHashMap<DomMatrixId, DomMatrix>>,
     /// Serialized exceptions.
-    pub(crate) exceptions: Option<HashMap<DomExceptionId, DomException>>,
+    pub(crate) exceptions: Option<FxHashMap<DomExceptionId, DomException>>,
     /// Serialized quota exceeded errors.
     pub(crate) quota_exceeded_errors:
-        Option<HashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
+        Option<FxHashMap<QuotaExceededErrorId, SerializableQuotaExceededError>>,
     /// Serialized blobs.
-    pub(crate) blobs: Option<HashMap<BlobId, BlobImpl>>,
+    pub(crate) blobs: Option<FxHashMap<BlobId, BlobImpl>>,
     /// Serialized image bitmaps.
-    pub(crate) image_bitmaps: Option<HashMap<ImageBitmapId, SerializableImageBitmap>>,
+    pub(crate) image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
     /// Transferred image bitmaps.
-    pub(crate) transferred_image_bitmaps: Option<HashMap<ImageBitmapId, SerializableImageBitmap>>,
+    pub(crate) transferred_image_bitmaps: Option<FxHashMap<ImageBitmapId, SerializableImageBitmap>>,
     /// Transferred offscreen canvases.
-    pub(crate) offscreen_canvases: Option<HashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
+    pub(crate) offscreen_canvases:
+        Option<FxHashMap<OffscreenCanvasId, TransferableOffscreenCanvas>>,
+    // A map of serialized image data.
+    pub(crate) image_data: Option<FxHashMap<ImageDataId, SerializableImageData>>,
 }
 
 /// Writes a structured clone. Returns a `DataClone` error if that fails.
@@ -657,7 +669,7 @@ pub(crate) fn write(
     unsafe {
         rooted!(in(*cx) let mut val = UndefinedValue());
         if let Some(transfer) = transfer {
-            transfer.safe_to_jsval(cx, val.handle_mut());
+            transfer.safe_to_jsval(cx, val.handle_mut(), CanGc::note());
         }
         let mut sc_writer = StructuredDataWriter::default();
         let sc_writer_ptr = &mut sc_writer as *mut _;
@@ -710,6 +722,7 @@ pub(crate) fn write(
             image_bitmaps: sc_writer.image_bitmaps.take(),
             transferred_image_bitmaps: sc_writer.transferred_image_bitmaps.take(),
             offscreen_canvases: sc_writer.offscreen_canvases.take(),
+            image_data: sc_writer.image_data.take(),
         };
 
         Ok(data)
@@ -722,6 +735,7 @@ pub(crate) fn read(
     global: &GlobalScope,
     mut data: StructuredSerializedData,
     rval: MutableHandleValue,
+    _can_gc: CanGc,
 ) -> Fallible<Vec<DomRoot<MessagePort>>> {
     let cx = GlobalScope::get_cx();
     let _ac = enter_realm(global);
@@ -741,6 +755,7 @@ pub(crate) fn read(
         image_bitmaps: data.image_bitmaps.take(),
         transferred_image_bitmaps: data.transferred_image_bitmaps.take(),
         offscreen_canvases: data.offscreen_canvases.take(),
+        image_data: data.image_data.take(),
     };
     let sc_reader_ptr = &mut sc_reader as *mut _;
     unsafe {

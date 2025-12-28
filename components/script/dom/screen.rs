@@ -2,9 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use base::generic_channel;
 use dom_struct::dom_struct;
 use embedder_traits::{EmbedderMsg, ScreenMetrics};
-use ipc_channel::ipc;
 
 use crate::dom::bindings::codegen::Bindings::ScreenBinding::ScreenMethods;
 use crate::dom::bindings::num::Finite;
@@ -33,7 +33,7 @@ impl Screen {
 
     /// Retrives [`ScreenMetrics`] from the embedder.
     fn screen_metrics(&self) -> ScreenMetrics {
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel!");
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel!");
 
         self.window.send_to_embedder(EmbedderMsg::GetScreenMetrics(
             self.window.webview_id(),
@@ -45,32 +45,32 @@ impl Screen {
 }
 
 impl ScreenMethods<crate::DomTypeHolder> for Screen {
-    // https://drafts.csswg.org/cssom-view/#dom-screen-availwidth
+    /// <https://drafts.csswg.org/cssom-view/#dom-screen-availwidth>
     fn AvailWidth(&self) -> Finite<f64> {
         Finite::wrap(self.screen_metrics().available_size.width as f64)
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-screen-availheight
+    /// <https://drafts.csswg.org/cssom-view/#dom-screen-availheight>
     fn AvailHeight(&self) -> Finite<f64> {
         Finite::wrap(self.screen_metrics().available_size.height as f64)
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-screen-width
+    /// <https://drafts.csswg.org/cssom-view/#dom-screen-width>
     fn Width(&self) -> Finite<f64> {
         Finite::wrap(self.screen_metrics().screen_size.width as f64)
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-screen-height
+    /// <https://drafts.csswg.org/cssom-view/#dom-screen-height>
     fn Height(&self) -> Finite<f64> {
         Finite::wrap(self.screen_metrics().screen_size.height as f64)
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-screen-colordepth
+    /// <https://drafts.csswg.org/cssom-view/#dom-screen-colordepth>
     fn ColorDepth(&self) -> u32 {
         24
     }
 
-    // https://drafts.csswg.org/cssom-view/#dom-screen-pixeldepth
+    /// <https://drafts.csswg.org/cssom-view/#dom-screen-pixeldepth>
     fn PixelDepth(&self) -> u32 {
         24
     }

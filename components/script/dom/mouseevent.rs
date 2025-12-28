@@ -10,8 +10,8 @@ use euclid::Point2D;
 use js::rust::HandleObject;
 use keyboard_types::Modifiers;
 use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
+use script_bindings::match_domstring_ascii;
 use script_traits::ConstellationInputEvent;
-use servo_config::pref;
 use style_traits::CSSPixel;
 
 use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
@@ -21,7 +21,7 @@ use crate::dom::bindings::codegen::Bindings::UIEventBinding::UIEventMethods;
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
-use crate::dom::bindings::root::{DomRoot, MutNullableDom};
+use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::FireMouseEventType;
 use crate::dom::event::{Event, EventBubbles, EventCancelable};
@@ -74,8 +74,6 @@ pub(crate) struct MouseEvent {
     /// <https://w3c.github.io/uievents/#dom-mouseevent-buttons>
     buttons: Cell<u16>,
 
-    /// <https://w3c.github.io/uievents/#dom-mouseevent-relatedtarget>
-    related_target: MutNullableDom<EventTarget>,
     #[no_trace]
     point_in_target: Cell<Option<Point2D<f32, CSSPixel>>>,
 }
@@ -90,7 +88,6 @@ impl MouseEvent {
             modifiers: Cell::new(Modifiers::empty()),
             button: Cell::new(0),
             buttons: Cell::new(0),
-            related_target: Default::default(),
             point_in_target: Cell::new(None),
         }
     }
@@ -214,7 +211,7 @@ impl MouseEvent {
     }
 
     /// <https://w3c.github.io/uievents/#initialize-a-mouseevent>
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn initialize_mouse_event(
         &self,
         type_: DOMString,
@@ -245,8 +242,11 @@ impl MouseEvent {
         self.modifiers.set(modifiers);
         self.button.set(button);
         self.buttons.set(buttons);
-        self.related_target.set(related_target);
+        self.upcast::<Event>().set_related_target(related_target);
         self.point_in_target.set(point_in_target);
+        // Legacy mapping per spec: left/middle/right => 1/2/3 (button + 1), else 0.
+        let w = if button >= 0 { (button as u32) + 1 } else { 0 };
+        self.uievent.set_which(w);
     }
 
     pub(crate) fn point_in_target(&self) -> Option<Point2D<f32, CSSPixel>> {
@@ -256,6 +256,7 @@ impl MouseEvent {
     /// Create a [MouseEvent] triggered by the embedder
     /// <https://w3c.github.io/uievents/#create-a-cancelable-mouseevent-id>
     pub(crate) fn for_platform_mouse_event(
+        event_type_string: &'static str,
         event: embedder_traits::MouseButtonEvent,
         pressed_mouse_buttons: u16,
         window: &Window,
@@ -263,12 +264,6 @@ impl MouseEvent {
         modifiers: Modifiers,
         can_gc: CanGc,
     ) -> DomRoot<Self> {
-        let mouse_event_type_string = match event.action {
-            embedder_traits::MouseButtonAction::Click => "click",
-            embedder_traits::MouseButtonAction::Up => "mouseup",
-            embedder_traits::MouseButtonAction::Down => "mousedown",
-        };
-
         let client_point = hit_test_result.point_in_frame.to_i32();
         let page_point = hit_test_result
             .point_relative_to_initial_containing_block
@@ -277,7 +272,7 @@ impl MouseEvent {
         let click_count = 1;
         let mouse_event = MouseEvent::new(
             window,
-            mouse_event_type_string.into(),
+            event_type_string.into(),
             EventBubbles::Bubbles,
             EventCancelable::Cancelable,
             Some(window),
@@ -478,20 +473,7 @@ impl MouseEventMethods<crate::DomTypeHolder> for MouseEvent {
 
     /// <https://w3c.github.io/uievents/#widl-MouseEvent-relatedTarget>
     fn GetRelatedTarget(&self) -> Option<DomRoot<EventTarget>> {
-        self.related_target.get()
-    }
-
-    // See discussion at:
-    //  - https://github.com/servo/servo/issues/6643
-    //  - https://bugzilla.mozilla.org/show_bug.cgi?id=1186125
-    // This returns the same result as current gecko.
-    // https://developer.mozilla.org/en-US/docs/Web/API/MouseEvent/which
-    fn Which(&self) -> i32 {
-        if pref!(dom_mouse_event_which_enabled) {
-            (self.button.get() + 1) as i32
-        } else {
-            0
-        }
+        self.upcast::<Event>().related_target()
     }
 
     /// <https://w3c.github.io/uievents/#widl-MouseEvent-initMouseEvent>
@@ -552,7 +534,16 @@ impl MouseEventMethods<crate::DomTypeHolder> for MouseEvent {
         self.modifiers.set(modifiers);
 
         self.button.set(button_arg);
-        self.related_target.set(related_target_arg);
+        self.upcast::<Event>()
+            .set_related_target(related_target_arg);
+
+        // Keep UIEvent.which in sync for legacy init path too.
+        let w = if button_arg >= 0 {
+            (button_arg as u32) + 1
+        } else {
+            0
+        };
+        self.uievent.set_which(w);
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
@@ -562,20 +553,22 @@ impl MouseEventMethods<crate::DomTypeHolder> for MouseEvent {
 
     /// <https://w3c.github.io/uievents/#dom-mouseevent-getmodifierstate>
     fn GetModifierState(&self, key_arg: DOMString) -> bool {
-        self.modifiers.get().contains(match &*key_arg {
-            "Alt" => Modifiers::ALT,
-            "AltGraph" => Modifiers::ALT_GRAPH,
-            "CapsLock" => Modifiers::CAPS_LOCK,
-            "Control" => Modifiers::CONTROL,
-            "Fn" => Modifiers::FN,
-            "FnLock" => Modifiers::FN_LOCK,
-            "Meta" => Modifiers::META,
-            "NumLock" => Modifiers::NUM_LOCK,
-            "ScrollLock" => Modifiers::SCROLL_LOCK,
-            "Shift" => Modifiers::SHIFT,
-            "Symbol" => Modifiers::SYMBOL,
-            "SymbolLock" => Modifiers::SYMBOL_LOCK,
-            _ => return false,
-        })
+        self.modifiers
+            .get()
+            .contains(match_domstring_ascii!(key_arg,
+                "Alt" => Modifiers::ALT,
+                "AltGraph" => Modifiers::ALT_GRAPH,
+                "CapsLock" => Modifiers::CAPS_LOCK,
+                "Control" => Modifiers::CONTROL,
+                "Fn" => Modifiers::FN,
+                "FnLock" => Modifiers::FN_LOCK,
+                "Meta" => Modifiers::META,
+                "NumLock" => Modifiers::NUM_LOCK,
+                "ScrollLock" => Modifiers::SCROLL_LOCK,
+                "Shift" => Modifiers::SHIFT,
+                "Symbol" => Modifiers::SYMBOL,
+                "SymbolLock" => Modifiers::SYMBOL_LOCK,
+                    _ => { return false; },
+            ))
     }
 }

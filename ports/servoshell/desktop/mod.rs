@@ -6,19 +6,17 @@
 
 mod accelerated_gl_media;
 pub(crate) mod app;
-mod app_state;
 pub(crate) mod cli;
-mod dialog;
-mod egui_glue;
-pub(crate) mod events_loop;
-mod gamepad;
+pub(crate) mod dialog;
+pub(crate) mod event_loop;
+#[cfg(feature = "gamepad")]
+pub(crate) mod gamepad;
 pub mod geometry;
+mod gui;
 mod headed_window;
 mod headless_window;
 mod keyutils;
-mod minibrowser;
 mod protocols;
 mod tracing;
 #[cfg(feature = "webxr")]
 mod webxr;
-mod window_trait;

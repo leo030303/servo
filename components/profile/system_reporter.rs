@@ -15,8 +15,6 @@ use libc::c_int;
 use libc::{c_void, size_t};
 use profile_traits::mem::{ProcessReports, Report, ReportKind, ReporterRequest};
 use profile_traits::path;
-#[cfg(target_os = "macos")]
-use task_info::task_basic_info::{resident_size, virtual_size};
 
 const JEMALLOC_HEAP_ALLOCATED_STR: &str = "jemalloc-heap-allocated";
 const SYSTEM_HEAP_ALLOCATED_STR: &str = "system-heap-allocated";
@@ -38,6 +36,7 @@ pub fn collect_reports(request: ReporterRequest) {
         // Virtual and physical memory usage, as reported by the OS.
         report(path!["vsize"], vsize());
         report(path!["resident"], resident());
+        report(path!["pss"], proportional_set_size());
 
         // Memory segments, as reported by the OS.
         // Notice that the sum of this should be more accurate according to
@@ -199,15 +198,58 @@ fn vsize() -> Option<usize> {
 fn resident() -> Option<usize> {
     proc_self_statm_field(1)
 }
+#[cfg(target_os = "linux")]
+fn proportional_set_size() -> Option<usize> {
+    use std::fs::File;
+    use std::io::Read;
+    let mut file = File::open("/proc/self/smaps_rollup").ok()?;
+    let mut contents = String::new();
+    file.read_to_string(&mut contents).ok()?;
+    let pss_line = contents
+        .split("\n")
+        .find(|string| string.contains("Pss:"))?;
+
+    // String looks like: "Pss:                 227 kB"
+    let pss_str = pss_line.split_whitespace().nth(1)?;
+    pss_str.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn proportional_set_size() -> Option<usize> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn task_basic_info() -> Option<mach2::task_info::task_basic_info> {
+    use mach2::kern_return::KERN_SUCCESS;
+    use mach2::task::task_info;
+    use mach2::task_info::{TASK_BASIC_INFO, TASK_BASIC_INFO_COUNT, task_basic_info};
+    use mach2::traps::mach_task_self;
+
+    let mut info = task_basic_info::default();
+    let mut count = TASK_BASIC_INFO_COUNT;
+    if unsafe {
+        task_info(
+            mach_task_self(),
+            TASK_BASIC_INFO,
+            std::ptr::from_mut(&mut info).cast(),
+            std::ptr::from_mut(&mut count),
+        )
+    } != KERN_SUCCESS
+    {
+        return None;
+    }
+    Some(info)
+}
 
 #[cfg(target_os = "macos")]
 fn vsize() -> Option<usize> {
-    virtual_size()
+    task_basic_info().map(|task_basic_info| task_basic_info.virtual_size)
 }
 
 #[cfg(target_os = "macos")]
 fn resident() -> Option<usize> {
-    resident_size()
+    task_basic_info().map(|task_basic_info| task_basic_info.resident_size)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

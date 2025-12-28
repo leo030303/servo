@@ -6,7 +6,7 @@ use std::fmt;
 
 use base::id::PipelineId;
 use malloc_size_of_derive::MallocSizeOf;
-use strum_macros::VariantArray;
+use strum::VariantArray;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::refcounted::Trusted;
@@ -26,7 +26,11 @@ pub(crate) enum TaskSourceName {
     Bitmap,
     Canvas,
     Clipboard,
+    /// <https://w3c.github.io/webcrypto/#dfn-crypto-task-source-0>
+    Crypto,
     DatabaseAccess,
+    /// <https://fetch.spec.whatwg.org/#deferred-fetch-task-source>
+    DeferredFetch,
     DOMManipulation,
     FileReading,
     /// <https://drafts.csswg.org/css-font-loading/#task-source>
@@ -44,8 +48,12 @@ pub(crate) enum TaskSourceName {
     Timer,
     /// <https://www.w3.org/TR/gamepad/#dfn-gamepad-task-source>
     Gamepad,
+    /// <https://www.w3.org/TR/geolocation/#dfn-geolocation-task-source>
+    Geolocation,
     /// <https://w3c.github.io/IntersectionObserver/#intersectionobserver-task-source>
     IntersectionObserver,
+    /// <https://www.w3.org/TR/webgpu/#-webgpu-task-source>
+    WebGPU,
 }
 
 impl From<TaskSourceName> for ScriptThreadEventCategory {
@@ -54,10 +62,13 @@ impl From<TaskSourceName> for ScriptThreadEventCategory {
             TaskSourceName::Bitmap => ScriptThreadEventCategory::ScriptEvent,
             TaskSourceName::Canvas => ScriptThreadEventCategory::ScriptEvent,
             TaskSourceName::Clipboard => ScriptThreadEventCategory::ScriptEvent,
+            TaskSourceName::Crypto => ScriptThreadEventCategory::ScriptEvent,
             TaskSourceName::DatabaseAccess => ScriptThreadEventCategory::ScriptEvent,
+            TaskSourceName::DeferredFetch => ScriptThreadEventCategory::NetworkEvent,
             TaskSourceName::DOMManipulation => ScriptThreadEventCategory::ScriptEvent,
             TaskSourceName::FileReading => ScriptThreadEventCategory::FileRead,
             TaskSourceName::FontLoading => ScriptThreadEventCategory::FontLoading,
+            TaskSourceName::Geolocation => ScriptThreadEventCategory::GeolocationEvent,
             TaskSourceName::HistoryTraversal => ScriptThreadEventCategory::HistoryEvent,
             TaskSourceName::Networking => ScriptThreadEventCategory::NetworkEvent,
             TaskSourceName::PerformanceTimeline => {
@@ -72,6 +83,7 @@ impl From<TaskSourceName> for ScriptThreadEventCategory {
             TaskSourceName::Timer => ScriptThreadEventCategory::TimerEvent,
             TaskSourceName::Gamepad => ScriptThreadEventCategory::InputEvent,
             TaskSourceName::IntersectionObserver => ScriptThreadEventCategory::ScriptEvent,
+            TaskSourceName::WebGPU => ScriptThreadEventCategory::ScriptEvent,
         }
     }
 }

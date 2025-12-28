@@ -5,16 +5,16 @@
 //! Data and main loop of WebGPU thread.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::slice;
 use std::sync::{Arc, Mutex};
 
 use base::id::PipelineId;
 use compositing_traits::{
-    CrossProcessCompositorApi, WebrenderExternalImageRegistry, WebrenderImageHandlerType,
+    CrossProcessPaintApi, WebRenderExternalImageIdManager, WebRenderImageHandlerType,
 };
 use ipc_channel::ipc::{IpcReceiver, IpcSender, IpcSharedMemory};
 use log::{info, warn};
+use rustc_hash::FxHashMap;
 use servo_config::pref;
 use webgpu_traits::{
     Adapter, ComputePassId, DeviceLostReason, Error, ErrorScope, Mapping, Pipeline, PopError,
@@ -36,8 +36,8 @@ use wgpu_types::MemoryHints;
 use wgt::InstanceDescriptor;
 pub use {wgpu_core as wgc, wgpu_types as wgt};
 
+use crate::canvas_context::WebGpuExternalImageMap;
 use crate::poll_thread::Poller;
-use crate::swapchain::WGPUImageMap;
 
 #[derive(Eq, Hash, PartialEq)]
 pub(crate) struct DeviceScope {
@@ -98,21 +98,21 @@ pub(crate) struct WGPU {
     sender: IpcSender<WebGPURequest>,
     pub(crate) script_sender: IpcSender<WebGPUMsg>,
     pub(crate) global: Arc<wgc::global::Global>,
-    devices: Arc<Mutex<HashMap<DeviceId, DeviceScope>>>,
+    devices: Arc<Mutex<FxHashMap<DeviceId, DeviceScope>>>,
     // TODO: Remove this (https://github.com/gfx-rs/wgpu/issues/867)
     /// This stores first error on command encoder,
     /// because wgpu does not invalidate command encoder object
     /// (this is also reused for invalidation of command buffers)
-    error_command_encoders: HashMap<id::CommandEncoderId, String>,
-    pub(crate) compositor_api: CrossProcessCompositorApi,
-    pub(crate) external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
-    pub(crate) wgpu_image_map: WGPUImageMap,
+    error_command_encoders: FxHashMap<id::CommandEncoderId, String>,
+    pub(crate) paint_api: CrossProcessPaintApi,
+    pub(crate) webrender_external_image_id_manager: WebRenderExternalImageIdManager,
+    pub(crate) wgpu_image_map: WebGpuExternalImageMap,
     /// Provides access to poller thread
     pub(crate) poller: Poller,
     /// Store compute passes
-    compute_passes: HashMap<ComputePassId, Pass<ComputePass>>,
+    compute_passes: FxHashMap<ComputePassId, Pass<ComputePass>>,
     /// Store render passes
-    render_passes: HashMap<RenderPassId, Pass<RenderPass>>,
+    render_passes: FxHashMap<RenderPassId, Pass<RenderPass>>,
 }
 
 impl WGPU {
@@ -120,9 +120,9 @@ impl WGPU {
         receiver: IpcReceiver<WebGPURequest>,
         sender: IpcSender<WebGPURequest>,
         script_sender: IpcSender<WebGPUMsg>,
-        compositor_api: CrossProcessCompositorApi,
-        external_images: Arc<Mutex<WebrenderExternalImageRegistry>>,
-        wgpu_image_map: WGPUImageMap,
+        paint_api: CrossProcessPaintApi,
+        webrender_external_image_id_manager: WebRenderExternalImageIdManager,
+        wgpu_image_map: WebGpuExternalImageMap,
     ) -> Self {
         let backend_pref = pref!(dom_webgpu_wgpu_backend);
         let backends = if backend_pref.is_empty() {
@@ -147,13 +147,13 @@ impl WGPU {
             sender,
             script_sender,
             global,
-            devices: Arc::new(Mutex::new(HashMap::new())),
-            error_command_encoders: HashMap::new(),
-            compositor_api,
-            external_images,
+            devices: Arc::new(Mutex::new(FxHashMap::default())),
+            error_command_encoders: FxHashMap::default(),
+            paint_api,
+            webrender_external_image_id_manager,
             wgpu_image_map,
-            compute_passes: HashMap::new(),
-            render_passes: HashMap::new(),
+            compute_passes: FxHashMap::default(),
+            render_passes: FxHashMap::default(),
         }
     }
 
@@ -162,6 +162,10 @@ impl WGPU {
             if let Ok(msg) = self.receiver.recv() {
                 log::trace!("recv: {msg:?}");
                 match msg {
+                    WebGPURequest::SetImageKey {
+                        context_id,
+                        image_key,
+                    } => self.set_image_key(context_id, image_key),
                     WebGPURequest::BufferMapAsync {
                         sender,
                         buffer_id,
@@ -246,7 +250,7 @@ impl WGPU {
                             source_offset,
                             destination_id,
                             destination_offset,
-                            size,
+                            Some(size),
                         );
                         self.encoder_record_error(command_encoder_id, &result);
                     },
@@ -378,9 +382,7 @@ impl WGPU {
                         if let Some(sender) = sender {
                             let res = match error {
                                 // if device is lost we must return pipeline and not raise any error
-                                Some(CreateComputePipelineError::Device(
-                                    DeviceError::Lost | DeviceError::Invalid(_),
-                                )) |
+                                Some(CreateComputePipelineError::Device(DeviceError::Lost)) |
                                 None => Ok(Pipeline {
                                     id: compute_pipeline_id,
                                     label: descriptor.label.unwrap_or_default().to_string(),
@@ -437,9 +439,7 @@ impl WGPU {
                         if let Some(sender) = sender {
                             let res = match error {
                                 // if device is lost we must return pipeline and not raise any error
-                                Some(CreateRenderPipelineError::Device(
-                                    DeviceError::Lost | DeviceError::Invalid(_),
-                                )) |
+                                Some(CreateRenderPipelineError::Device(DeviceError::Lost)) |
                                 None => Ok(Pipeline {
                                     id: render_pipeline_id,
                                     label: descriptor.label.unwrap_or_default().to_string(),
@@ -498,37 +498,29 @@ impl WGPU {
                         sender,
                     } => {
                         let id = self
-                            .external_images
-                            .lock()
-                            .expect("Lock poisoned?")
-                            .next_id(WebrenderImageHandlerType::WebGPU);
-                        let image_key = self.compositor_api.generate_image_key_blocking().unwrap();
+                            .webrender_external_image_id_manager
+                            .next_id(WebRenderImageHandlerType::WebGpu);
                         let context_id = WebGPUContextId(id.0);
-                        if let Err(e) = sender.send((context_id, image_key)) {
-                            warn!("Failed to send ExternalImageId to new context ({})", e);
+
+                        if let Err(error) = sender.send(context_id) {
+                            warn!("Failed to send ContextId to new context ({error})");
                         };
-                        self.create_context(context_id, image_key, size, buffer_ids);
+
+                        self.create_context(context_id, size, buffer_ids);
                     },
-                    WebGPURequest::UpdateContext {
+                    WebGPURequest::Present {
                         context_id,
+                        pending_texture,
                         size,
-                        configuration,
+                        canvas_epoch,
                     } => {
-                        self.update_context(context_id, size, configuration);
+                        self.present(context_id, pending_texture, size, canvas_epoch);
                     },
-                    WebGPURequest::SwapChainPresent {
+                    WebGPURequest::GetImage {
                         context_id,
-                        texture_id,
-                        encoder_id,
-                    } => {
-                        let result = self.swapchain_present(context_id, encoder_id, texture_id);
-                        if let Err(e) = result {
-                            log::error!("Error occured in SwapChainPresent: {e:?}");
-                        }
-                    },
-                    WebGPURequest::GetImage { context_id, sender } => {
-                        sender.send(self.get_image(context_id)).unwrap()
-                    },
+                        pending_texture,
+                        sender,
+                    } => self.get_image(context_id, pending_texture, sender),
                     WebGPURequest::ValidateTextureDescriptor {
                         device_id,
                         texture_id,
@@ -549,9 +541,7 @@ impl WGPU {
                     },
                     WebGPURequest::DestroyContext { context_id } => {
                         self.destroy_context(context_id);
-                        self.external_images
-                            .lock()
-                            .expect("Lock poisoned?")
+                        self.webrender_external_image_id_manager
                             .remove(&ExternalImageId(context_id.0));
                     },
                     WebGPURequest::CreateTexture {
@@ -583,7 +573,7 @@ impl WGPU {
                     },
                     WebGPURequest::DestroyBuffer(buffer) => {
                         let global = &self.global;
-                        let _result = global.buffer_destroy(buffer);
+                        global.buffer_destroy(buffer);
                     },
                     WebGPURequest::DestroyDevice(device) => {
                         let global = &self.global;
@@ -593,7 +583,7 @@ impl WGPU {
                     },
                     WebGPURequest::DestroyTexture(texture_id) => {
                         let global = &self.global;
-                        let _ = global.texture_destroy(texture_id);
+                        global.texture_destroy(texture_id);
                     },
                     WebGPURequest::Exit(sender) => {
                         if let Err(e) = sender.send(()) {
@@ -1179,25 +1169,22 @@ impl WGPU {
                         let device_scope = devices
                             .get_mut(&device_id)
                             .expect("Device should not be dropped by this point");
-                        if let Some(error_scope_stack) = &mut device_scope.error_scope_stack {
-                            if let Some(error_scope) = error_scope_stack.pop() {
-                                if let Err(e) = sender.send(Ok(
-                                    // TODO: Do actual selection instead of selecting first error
-                                    error_scope.errors.first().cloned(),
-                                )) {
-                                    warn!(
-                                        "Unable to send {:?} to poperrorscope: {e:?}",
-                                        error_scope.errors
-                                    );
+                        let result =
+                            if let Some(error_scope_stack) = &mut device_scope.error_scope_stack {
+                                if let Some(error_scope) = error_scope_stack.pop() {
+                                    Ok(
+                                        // TODO: Do actual selection instead of selecting first error
+                                        error_scope.errors.first().cloned(),
+                                    )
+                                } else {
+                                    Err(PopError::Empty)
                                 }
-                            } else if let Err(e) = sender.send(Err(PopError::Empty)) {
-                                warn!("Unable to send PopError::Empty: {e:?}");
-                            }
-                        } else {
-                            // device lost
-                            if let Err(e) = sender.send(Err(PopError::Lost)) {
-                                warn!("Unable to send PopError::Lost due {e:?}");
-                            }
+                            } else {
+                                // This means the device has been lost.
+                                Err(PopError::Lost)
+                            };
+                        if let Err(error) = sender.send(result) {
+                            warn!("Error while sending PopErrorScope result: {error}");
                         }
                     },
                     WebGPURequest::ComputeGetBindGroupLayout {

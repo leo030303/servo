@@ -13,8 +13,8 @@ use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlformelement::HTMLFormElement;
+use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlformelement::HTMLFormElement;
 use crate::dom::node::{ChildrenMutation, Node};
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
@@ -116,7 +116,7 @@ impl NodeList {
 }
 
 impl NodeListMethods<crate::DomTypeHolder> for NodeList {
-    // https://dom.spec.whatwg.org/#dom-nodelist-length
+    /// <https://dom.spec.whatwg.org/#dom-nodelist-length>
     fn Length(&self) -> u32 {
         match self.list_type {
             NodeListType::Simple(ref elems) => elems.len() as u32,
@@ -127,7 +127,7 @@ impl NodeListMethods<crate::DomTypeHolder> for NodeList {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodelist-item
+    /// <https://dom.spec.whatwg.org/#dom-nodelist-item>
     fn Item(&self, index: u32) -> Option<DomRoot<Node>> {
         match self.list_type {
             NodeListType::Simple(ref elems) => elems
@@ -140,7 +140,7 @@ impl NodeListMethods<crate::DomTypeHolder> for NodeList {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodelist-item
+    /// <https://dom.spec.whatwg.org/#dom-nodelist-item>
     fn IndexedGetter(&self, index: u32) -> Option<DomRoot<Node>> {
         self.Item(index)
     }

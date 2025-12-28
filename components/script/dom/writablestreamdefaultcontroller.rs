@@ -9,6 +9,7 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, IsPromiseObject, JSObject};
 use js::jsval::{JSVal, UndefinedValue};
+use js::realm::CurrentRealm;
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
 use super::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategySize;
@@ -43,11 +44,12 @@ struct CloseAlgorithmFulfillmentHandler {
 }
 
 impl Callback for CloseAlgorithmFulfillmentHandler {
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         let stream = self.stream.as_rooted();
 
         // Perform ! WritableStreamFinishInFlightClose(stream).
-        stream.finish_in_flight_close(cx, can_gc);
+        stream.finish_in_flight_close(cx.into(), can_gc);
     }
 }
 
@@ -62,13 +64,13 @@ struct CloseAlgorithmRejectionHandler {
 }
 
 impl Callback for CloseAlgorithmRejectionHandler {
-    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
         let stream = self.stream.as_rooted();
 
-        let global = GlobalScope::from_safe_context(cx, realm);
+        let global = GlobalScope::from_current_realm(cx);
 
         // Perform ! WritableStreamFinishInFlightCloseWithError(stream, reason).
-        stream.finish_in_flight_close_with_error(cx, &global, v, can_gc);
+        stream.finish_in_flight_close_with_error(cx.into(), &global, v, CanGc::from_cx(cx));
     }
 }
 
@@ -85,7 +87,7 @@ struct StartAlgorithmFulfillmentHandler {
 impl Callback for StartAlgorithmFulfillmentHandler {
     /// Continuation of <https://streams.spec.whatwg.org/#set-up-writable-stream-default-controller>
     /// Upon fulfillment of startPromise,
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
         let controller = self.controller.as_rooted();
         let stream = controller
             .stream
@@ -98,10 +100,10 @@ impl Callback for StartAlgorithmFulfillmentHandler {
         // Set controller.[[started]] to true.
         controller.started.set(true);
 
-        let global = GlobalScope::from_safe_context(cx, realm);
+        let global = GlobalScope::from_current_realm(cx);
 
         // Perform ! WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller).
-        controller.advance_queue_if_needed(cx, &global, can_gc)
+        controller.advance_queue_if_needed(cx.into(), &global, CanGc::from_cx(cx))
     }
 }
 
@@ -118,7 +120,7 @@ struct StartAlgorithmRejectionHandler {
 impl Callback for StartAlgorithmRejectionHandler {
     /// Continuation of <https://streams.spec.whatwg.org/#set-up-writable-stream-default-controller>
     /// Upon rejection of startPromise with reason r,
-    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
         let controller = self.controller.as_rooted();
         let stream = controller
             .stream
@@ -131,10 +133,10 @@ impl Callback for StartAlgorithmRejectionHandler {
         // Set controller.[[started]] to true.
         controller.started.set(true);
 
-        let global = GlobalScope::from_safe_context(cx, realm);
+        let global = GlobalScope::from_current_realm(cx);
 
         // Perform ! WritableStreamDealWithRejection(stream, r).
-        stream.deal_with_rejection(cx, &global, v, can_gc);
+        stream.deal_with_rejection(cx.into(), &global, v, CanGc::from_cx(cx));
     }
 }
 
@@ -146,11 +148,11 @@ impl js::gc::Rootable for TransferBackPressurePromiseReaction {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct TransferBackPressurePromiseReaction {
     /// The result of reacting to backpressurePromise.
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     result_promise: Rc<Promise>,
 
     /// The backpressurePromise.
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[ignore_malloc_size_of = "nested Rc"]
     backpressure_promise: Rc<RefCell<Option<Rc<Promise>>>>,
 
     /// The chunk received by the `writeAlgorithm`.
@@ -163,13 +165,15 @@ struct TransferBackPressurePromiseReaction {
 
 impl Callback for TransferBackPressurePromiseReaction {
     /// Reacting to backpressurePromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         let global = self.result_promise.global();
         // Set backpressurePromise to a new promise.
-        *self.backpressure_promise.borrow_mut() = Some(Promise::new(&global, can_gc));
+        let promise = Promise::new2(cx, &global);
+        *self.backpressure_promise.borrow_mut() = Some(promise);
 
         // Let result be PackAndPostMessageHandlingError(port, "chunk", chunk).
-        rooted!(in(*cx) let mut chunk = UndefinedValue());
+        rooted!(&in(cx) let mut chunk = UndefinedValue());
         chunk.set(self.chunk.get());
         let result =
             self.port
@@ -200,7 +204,8 @@ struct WriteAlgorithmFulfillmentHandler {
 }
 
 impl Callback for WriteAlgorithmFulfillmentHandler {
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         let controller = self.controller.as_rooted();
         let stream = controller
             .stream
@@ -215,13 +220,12 @@ impl Callback for WriteAlgorithmFulfillmentHandler {
         assert!(stream.is_erroring() || stream.is_writable());
 
         // Perform ! DequeueValue(controller).
-        {
-            rooted!(in(*cx) let mut rval = UndefinedValue());
-            let mut queue = controller.queue.borrow_mut();
-            queue.dequeue_value(cx, Some(rval.handle_mut()), can_gc);
-        }
+        rooted!(&in(cx) let mut rval = UndefinedValue());
+        controller
+            .queue
+            .dequeue_value(cx.into(), Some(rval.handle_mut()), can_gc);
 
-        let global = GlobalScope::from_safe_context(cx, realm);
+        let global = GlobalScope::from_current_realm(cx);
 
         // If ! WritableStreamCloseQueuedOrInFlight(stream) is false and state is "writable",
         if !stream.close_queued_or_in_flight() && stream.is_writable() {
@@ -233,7 +237,7 @@ impl Callback for WriteAlgorithmFulfillmentHandler {
         }
 
         // Perform ! WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller).
-        controller.advance_queue_if_needed(cx, &global, can_gc)
+        controller.advance_queue_if_needed(cx.into(), &global, can_gc)
     }
 }
 
@@ -248,7 +252,7 @@ struct WriteAlgorithmRejectionHandler {
 }
 
 impl Callback for WriteAlgorithmRejectionHandler {
-    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
         let controller = self.controller.as_rooted();
         let stream = controller
             .stream
@@ -261,10 +265,10 @@ impl Callback for WriteAlgorithmRejectionHandler {
             controller.clear_algorithms();
         }
 
-        let global = GlobalScope::from_safe_context(cx, realm);
+        let global = GlobalScope::from_current_realm(cx);
 
         // Perform ! WritableStreamFinishInFlightWriteWithError(stream, reason).
-        stream.finish_in_flight_write_with_error(cx, &global, v, can_gc);
+        stream.finish_in_flight_write_with_error(cx.into(), &global, v, CanGc::from_cx(cx));
     }
 }
 
@@ -326,7 +330,7 @@ pub struct WritableStreamDefaultController {
     underlying_sink_obj: Heap<*mut JSObject>,
 
     /// <https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-queue>
-    queue: RefCell<QueueWithSizes>,
+    queue: QueueWithSizes,
 
     /// <https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-started>
     started: Cell<bool>,
@@ -335,7 +339,7 @@ pub struct WritableStreamDefaultController {
     strategy_hwm: f64,
 
     /// <https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-strategysizealgorithm>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[ignore_malloc_size_of = "QueuingStrategySize"]
     strategy_size: RefCell<Option<Rc<QueuingStrategySize>>>,
 
     /// <https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-stream>
@@ -519,17 +523,14 @@ impl WritableStreamDefaultController {
     /// <https://streams.spec.whatwg.org/#writable-stream-default-controller-close>
     pub(crate) fn close(&self, cx: SafeJSContext, global: &GlobalScope, can_gc: CanGc) {
         // Perform ! EnqueueValueWithSize(controller, close sentinel, 0).
-        {
-            let mut queue = self.queue.borrow_mut();
-            queue
-                .enqueue_value_with_size(EnqueuedValue::CloseSentinel)
-                .expect("Enqueuing the close sentinel should not fail.");
-        }
+        self.queue
+            .enqueue_value_with_size(EnqueuedValue::CloseSentinel)
+            .expect("Enqueuing the close sentinel should not fail.");
         // Perform ! WritableStreamDefaultControllerAdvanceQueueIfNeeded(controller).
         self.advance_queue_if_needed(cx, global, can_gc);
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn start_algorithm(
         &self,
         cx: SafeJSContext,
@@ -696,13 +697,11 @@ impl WritableStreamDefaultController {
                 // The steps from the `writeAlgorithm` at
                 // <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
 
-                {
-                    // If backpressurePromise is undefined,
-                    // set backpressurePromise to a promise resolved with undefined.
-                    let mut backpressure_promise = backpressure_promise.borrow_mut();
-                    if backpressure_promise.is_none() {
-                        *backpressure_promise = Some(Promise::new_resolved(global, cx, (), can_gc));
-                    }
+                // If backpressurePromise is undefined,
+                // set backpressurePromise to a promise resolved with undefined.
+                if backpressure_promise.borrow().is_none() {
+                    let promise = Promise::new_resolved(global, cx, (), can_gc);
+                    *backpressure_promise.borrow_mut() = Some(promise);
                 }
 
                 // Return the result of reacting to backpressurePromise with the following fulfillment steps:
@@ -800,13 +799,10 @@ impl WritableStreamDefaultController {
         stream.mark_close_request_in_flight();
 
         // Perform ! DequeueValue(controller).
-        {
-            let mut queue = self.queue.borrow_mut();
-            queue.dequeue_value(cx, None, can_gc);
-        }
+        self.queue.dequeue_value(cx, None, can_gc);
 
         // Assert: controller.[[queue]] is empty.
-        assert!(self.queue.borrow().is_empty());
+        assert!(self.queue.is_empty());
 
         // Let sinkClosePromise be the result of performing controller.[[closeAlgorithm]].
         let sink_close_promise = self.call_close_algorithm(cx, global, can_gc);
@@ -870,13 +866,11 @@ impl WritableStreamDefaultController {
         // Let value be ! PeekQueueValue(controller).
         rooted!(in(*cx) let mut value = UndefinedValue());
         let is_closed = {
-            let queue = self.queue.borrow_mut();
-
             // If controller.[[queue]] is empty, return.
-            if queue.is_empty() {
+            if self.queue.is_empty() {
                 return;
             }
-            queue.peek_queue_value(cx, value.handle_mut(), can_gc)
+            self.queue.peek_queue_value(cx, value.handle_mut(), can_gc)
         };
 
         if is_closed {
@@ -891,7 +885,7 @@ impl WritableStreamDefaultController {
     /// <https://streams.spec.whatwg.org/#ws-default-controller-private-error>
     pub(crate) fn perform_error_steps(&self) {
         // Perform ! ResetQueue(this).
-        self.queue.borrow_mut().reset();
+        self.queue.reset();
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-default-controller-process-write>
@@ -938,8 +932,7 @@ impl WritableStreamDefaultController {
     /// <https://streams.spec.whatwg.org/#writable-stream-default-controller-get-desired-size>
     pub(crate) fn get_desired_size(&self) -> f64 {
         // Return controller.[[strategyHWM]] − controller.[[queueTotalSize]].
-        let queue = self.queue.borrow();
-        let desired_size = self.strategy_hwm - queue.total_size.clamp(0.0, f64::MAX);
+        let desired_size = self.strategy_hwm - self.queue.total_size.get().clamp(0.0, f64::MAX);
         desired_size.clamp(desired_size, self.strategy_hwm)
     }
 
@@ -1004,13 +997,12 @@ impl WritableStreamDefaultController {
         can_gc: CanGc,
     ) {
         // Let enqueueResult be EnqueueValueWithSize(controller, chunk, chunkSize).
-        let enqueue_result = {
-            let mut queue = self.queue.borrow_mut();
-            queue.enqueue_value_with_size(EnqueuedValue::Js(ValueWithSize {
+        let enqueue_result = self
+            .queue
+            .enqueue_value_with_size(EnqueuedValue::Js(ValueWithSize {
                 value: Heap::boxed(chunk.get()),
                 size: chunk_size,
-            }))
-        };
+            }));
 
         // If enqueueResult is an abrupt completion,
         if let Err(error) = enqueue_result {

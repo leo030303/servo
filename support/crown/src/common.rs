@@ -48,6 +48,9 @@ pub fn in_derive_expn(span: Span) -> bool {
 macro_rules! symbols {
     ($($s: ident)+) => {
         #[derive(Clone)]
+        // We are using `allow` and not `expect` here because this depends on the arguments passed
+        // to the macro and there is no way to tell what they are here. Please do not change the
+        // following line to `expect`.
         #[allow(non_snake_case)]
         pub(crate) struct Symbols {
             $( $s: Symbol, )+
@@ -126,7 +129,7 @@ pub fn implements_trait_with_env_from_iter<'tcx>(
         let _ = tcx.hir_body_owner_kind(callee_id);
     }
 
-    let ty = tcx.erase_regions(ty);
+    let ty = tcx.erase_and_anonymize_regions(ty);
     if ty.has_escaping_bound_vars() {
         return false;
     }

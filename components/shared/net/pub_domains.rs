@@ -14,20 +14,22 @@
 //! we don't need to make the code more complex for it. The `mach` update command makes sure that
 //! those cases are not present.
 
-use std::collections::HashSet;
 use std::iter::FromIterator;
 use std::sync::LazyLock;
 
 use embedder_traits::resources::{self, Resource};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
 use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::FxHashSet;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 
+// We can use FxHash here.
+// The list is given by publicsuffix.org so an attack is highly unlikely
 #[derive(Clone, Debug, Default, MallocSizeOf)]
 pub struct PubDomainRules {
-    rules: HashSet<String>,
-    wildcards: HashSet<String>,
-    exceptions: HashSet<String>,
+    rules: FxHashSet<String>,
+    wildcards: FxHashSet<String>,
+    exceptions: FxHashSet<String>,
 }
 
 static PUB_DOMAINS: LazyLock<PubDomainRules> = LazyLock::new(load_pub_domains);
@@ -143,7 +145,7 @@ pub fn is_reg_domain(domain: &str) -> bool {
 /// Returns None if the URL has no host name.
 /// Returns the registered suffix for the host name if it is a domain.
 /// Leaves the host name alone if it is an IP address.
-pub fn reg_host(url: &ServoUrl) -> Option<Host> {
+pub fn registered_domain_name(url: &ServoUrl) -> Option<Host> {
     match url.origin() {
         ImmutableOrigin::Tuple(_, Host::Domain(domain), _) => {
             Some(Host::Domain(String::from(reg_suffix(&domain))))

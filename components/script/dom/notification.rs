@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dom_struct::dom_struct;
@@ -12,21 +12,16 @@ use embedder_traits::{
     EmbedderMsg, Notification as EmbedderNotification,
     NotificationAction as EmbedderNotificationAction,
 };
-use ipc_channel::ipc;
-use ipc_channel::router::ROUTER;
 use js::jsapi::Heap;
 use js::jsval::JSVal;
 use js::rust::{HandleObject, MutableHandleValue};
 use net_traits::http_status::HttpStatus;
 use net_traits::image_cache::{
     ImageCache, ImageCacheResponseMessage, ImageCacheResult, ImageLoadListener,
-    ImageOrMetadataAvailable, ImageResponse, PendingImageId, UsePlaceholder,
+    ImageOrMetadataAvailable, ImageResponse, PendingImageId,
 };
 use net_traits::request::{Destination, RequestBuilder, RequestId};
-use net_traits::{
-    FetchMetadata, FetchResponseListener, FetchResponseMsg, NetworkError, ResourceFetchTiming,
-    ResourceTimingType,
-};
+use net_traits::{FetchMetadata, FetchResponseMsg, NetworkError, ResourceFetchTiming};
 use pixels::RasterImage;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
@@ -61,7 +56,7 @@ use crate::dom::promise::Promise;
 use crate::dom::serviceworkerglobalscope::ServiceWorkerGlobalScope;
 use crate::dom::serviceworkerregistration::ServiceWorkerRegistration;
 use crate::fetch::create_a_potential_cors_request;
-use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 // TODO: Service Worker API (persistent notification)
@@ -111,21 +106,21 @@ pub(crate) struct Notification {
     #[no_trace] // RequestId is not traceable
     pending_request_ids: DomRefCell<HashSet<RequestId>>,
     /// <https://notifications.spec.whatwg.org/#image-resource>
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "RasterImage"]
     #[no_trace]
     image_resource: DomRefCell<Option<Arc<RasterImage>>>,
     /// <https://notifications.spec.whatwg.org/#icon-resource>
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "RasterImage"]
     #[no_trace]
     icon_resource: DomRefCell<Option<Arc<RasterImage>>>,
     /// <https://notifications.spec.whatwg.org/#badge-resource>
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "RasterImage"]
     #[no_trace]
     badge_resource: DomRefCell<Option<Arc<RasterImage>>>,
 }
 
 impl Notification {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         global: &GlobalScope,
         title: DOMString,
@@ -299,6 +294,11 @@ impl Notification {
 
     /// Create an [`embedder_traits::Notification`].
     fn to_embedder_notification(&self) -> EmbedderNotification {
+        let icon_resource = self
+            .icon_resource
+            .borrow()
+            .as_ref()
+            .map(|image| image.to_shared());
         EmbedderNotification {
             title: self.title.to_string(),
             body: self.body.to_string(),
@@ -328,12 +328,20 @@ impl Notification {
                         .icon_url
                         .as_ref()
                         .and_then(|icon| ServoUrl::parse(icon).ok()),
-                    icon_resource: action.icon_resource.borrow().clone(),
+                    icon_resource: icon_resource.clone(),
                 })
                 .collect(),
-            icon_resource: self.icon_resource.borrow().clone(),
-            badge_resource: self.badge_resource.borrow().clone(),
-            image_resource: self.image_resource.borrow().clone(),
+            icon_resource: icon_resource.clone(),
+            badge_resource: self
+                .badge_resource
+                .borrow()
+                .as_ref()
+                .map(|image| image.to_shared()),
+            image_resource: self
+                .image_resource
+                .borrow()
+                .as_ref()
+                .map(|image| image.to_shared()),
         }
     }
 }
@@ -557,7 +565,7 @@ struct Action {
     /// <https://notifications.spec.whatwg.org/#action-icon-url>
     icon_url: Option<USVString>,
     /// <https://notifications.spec.whatwg.org/#action-icon-resource>
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "RasterImage"]
     #[no_trace]
     icon_resource: DomRefCell<Option<Arc<RasterImage>>>,
 }
@@ -595,7 +603,7 @@ fn create_notification_with_settings_object(
 }
 
 /// <https://notifications.spec.whatwg.org/#create-a-notification
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn create_notification(
     global: &GlobalScope,
     title: DOMString,
@@ -715,8 +723,6 @@ struct ResourceFetchListener {
     status: Result<(), NetworkError>,
     /// Resource URL of this request.
     url: ServoUrl,
-    /// Timing data for this resource.
-    resource_timing: ResourceFetchTiming,
 }
 
 impl FetchResponseListener for ResourceFetchListener {
@@ -763,32 +769,23 @@ impl FetchResponseListener for ResourceFetchListener {
         if self.status.is_ok() {
             self.image_cache.notify_pending_response(
                 self.pending_image_id,
-                FetchResponseMsg::ProcessResponseChunk(request_id, payload),
+                FetchResponseMsg::ProcessResponseChunk(request_id, payload.into()),
             );
         }
     }
 
     fn process_response_eof(
-        &mut self,
+        self,
         request_id: RequestId,
         response: Result<ResourceFetchTiming, NetworkError>,
     ) {
         self.image_cache.notify_pending_response(
             self.pending_image_id,
-            FetchResponseMsg::ProcessResponseEOF(request_id, response),
+            FetchResponseMsg::ProcessResponseEOF(request_id, response.clone()),
         );
-    }
-
-    fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
-        &mut self.resource_timing
-    }
-
-    fn resource_timing(&self) -> &ResourceFetchTiming {
-        &self.resource_timing
-    }
-
-    fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self, CanGc::note())
+        if let Ok(response) = response {
+            network_listener::submit_timing(&self, &response, CanGc::note());
+        }
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
@@ -804,12 +801,6 @@ impl ResourceTimingListener for ResourceFetchListener {
 
     fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
         self.notification.root().global()
-    }
-}
-
-impl PreInvoke for ResourceFetchListener {
-    fn should_invoke(&self) -> bool {
-        true
     }
 }
 
@@ -878,7 +869,6 @@ impl Notification {
             request.url.clone(),
             global.origin().immutable().clone(),
             None, // TODO: check which CORS should be used
-            UsePlaceholder::No,
         );
         match cache_result {
             ImageCacheResult::Available(ImageOrMetadataAvailable::ImageAvailable {
@@ -915,7 +905,7 @@ impl Notification {
                 );
                 self.fetch(pending_image_id, request, global);
             },
-            ImageCacheResult::LoadError => {
+            ImageCacheResult::FailedToLoadOrDecode => {
                 self.set_resource_and_show_when_ready(request_id, &resource_type, None);
             },
         };
@@ -927,36 +917,25 @@ impl Notification {
         pending_image_id: PendingImageId,
         resource_type: ResourceType,
     ) {
-        let (sender, receiver) = ipc::channel().expect("ipc channel failure");
-
         let global: &GlobalScope = &self.global();
-
         let trusted_this = Trusted::new(self);
-        let resource_type = resource_type.clone();
         let task_source = global.task_manager().networking_task_source().to_sendable();
 
-        ROUTER.add_typed_route(
-            receiver,
-            Box::new(move |response| {
-                let trusted_this = trusted_this.clone();
-                let resource_type = resource_type.clone();
-                task_source.queue(task!(handle_response: move || {
-                    let this = trusted_this.root();
-                    if let Ok(response) = response {
-                        let ImageCacheResponseMessage::NotifyPendingImageLoadStatus(status) = response else {
-                            warn!("Received unexpected message from image cache: {response:?}");
-                            return;
-                        };
-                        this.handle_image_cache_response(request_id, status.response, resource_type);
-                    } else {
-                        this.handle_image_cache_response(request_id, ImageResponse::None, resource_type);
-                    }
-                }));
-            }),
-        );
+        let callback = Box::new(move |response| {
+            let trusted_this = trusted_this.clone();
+            let resource_type = resource_type.clone();
+            task_source.queue(task!(handle_response: move || {
+                let this = trusted_this.root();
+                let ImageCacheResponseMessage::NotifyPendingImageLoadStatus(status) = response else {
+                    warn!("Received unexpected message from image cache: {response:?}");
+                    return;
+                };
+                this.handle_image_cache_response(request_id, status.response, resource_type);
+            }));
+        });
 
         global.image_cache().add_listener(ImageLoadListener::new(
-            sender,
+            callback,
             global.pipeline_id(),
             pending_image_id,
         ));
@@ -976,10 +955,7 @@ impl Notification {
                 };
                 self.set_resource_and_show_when_ready(request_id, &resource_type, image);
             },
-            ImageResponse::PlaceholderLoaded(image, _) => {
-                self.set_resource_and_show_when_ready(request_id, &resource_type, Some(image));
-            },
-            ImageResponse::None => {
+            ImageResponse::FailedToLoadOrDecode => {
                 self.set_resource_and_show_when_ready(request_id, &resource_type, None);
             },
             _ => (),
@@ -1025,14 +1001,13 @@ impl Notification {
         request: RequestBuilder,
         global: &GlobalScope,
     ) {
-        let context = Arc::new(Mutex::new(ResourceFetchListener {
+        let context = ResourceFetchListener {
             pending_image_id,
             image_cache: global.image_cache(),
             notification: Trusted::new(self),
             url: request.url.clone(),
             status: Ok(()),
-            resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
-        }));
+        };
 
         global.fetch(
             request,

@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use headers::{ContentType, HeaderMapExt};
 use http::HeaderMap;
@@ -13,9 +12,7 @@ use net_traits::request::{
     CredentialsMode, Destination, RequestBody, RequestId, RequestMode,
     create_request_body_with_content,
 };
-use net_traits::{
-    FetchMetadata, FetchResponseListener, NetworkError, ResourceFetchTiming, ResourceTimingType,
-};
+use net_traits::{FetchMetadata, NetworkError, ResourceFetchTiming};
 use script_bindings::str::DOMString;
 use serde::Serialize;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -28,9 +25,9 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::csp::Violation;
 use crate::dom::csppolicyviolationreport::serialize_disposition;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::fetch::create_a_potential_cors_request;
-use crate::network_listener::{PreInvoke, ResourceTimingListener, submit_timing};
+use crate::network_listener::{FetchResponseListener, ResourceTimingListener, submit_timing};
 use crate::script_runtime::CanGc;
 
 /// <https://w3c.github.io/reporting/#endpoint>
@@ -129,6 +126,8 @@ impl SendReportsToEndpoints for GlobalScope {
         endpoints: Vec<ReportingEndpoint>,
     ) {
         // Step 1. Let endpoint map be an empty map of endpoint objects to lists of report objects.
+        #[allow(clippy::mutable_key_type)]
+        // See `impl Hash for DOMString`.
         let mut endpoint_map: HashMap<&ReportingEndpoint, Vec<Report>> = HashMap::new();
         // Step 2. For each report in reports:
         reports.retain(|report| {
@@ -152,7 +151,7 @@ impl SendReportsToEndpoints for GlobalScope {
             let mut origin_map: HashMap<ImmutableOrigin, Vec<&Report>> = HashMap::new();
             // Step 3.2. For each report in report list:
             for report in report_list {
-                let Ok(url) = ServoUrl::parse(&report.url) else {
+                let Ok(url) = ServoUrl::parse(&report.url.str()) else {
                     continue;
                 };
                 // Step 3.2.1. Let origin be the origin of report’s url.
@@ -218,11 +217,10 @@ impl SendReportsToEndpoints for GlobalScope {
         // Step 3. Queue a task to fetch request.
         self.fetch(
             request,
-            Arc::new(Mutex::new(CSPReportEndpointFetchListener {
+            CSPReportEndpointFetchListener {
                 endpoint: endpoint.clone(),
                 global: Trusted::new(self),
-                resource_timing: ResourceFetchTiming::new(ResourceTimingType::None),
-            })),
+            },
             self.task_manager().networking_task_source().into(),
         );
         // Step 4. Wait for a response (response).
@@ -311,8 +309,6 @@ impl From<CSPViolationReportBody> for CSPReportingEndpointBody {
 struct CSPReportEndpointFetchListener {
     /// Endpoint URL of this request.
     endpoint: ServoUrl,
-    /// Timing data for this resource.
-    resource_timing: ResourceFetchTiming,
     /// The global object fetching the report uri violation
     global: Trusted<GlobalScope>,
 }
@@ -335,23 +331,13 @@ impl FetchResponseListener for CSPReportEndpointFetchListener {
     }
 
     fn process_response_eof(
-        &mut self,
+        self,
         _: RequestId,
         response: Result<ResourceFetchTiming, NetworkError>,
     ) {
-        _ = response;
-    }
-
-    fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
-        &mut self.resource_timing
-    }
-
-    fn resource_timing(&self) -> &ResourceFetchTiming {
-        &self.resource_timing
-    }
-
-    fn submit_resource_timing(&mut self) {
-        submit_timing(self, CanGc::note())
+        if let Ok(response) = response {
+            submit_timing(&self, &response, CanGc::note());
+        }
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, _violations: Vec<Violation>) {}
@@ -364,11 +350,5 @@ impl ResourceTimingListener for CSPReportEndpointFetchListener {
 
     fn resource_timing_global(&self) -> DomRoot<GlobalScope> {
         self.global.root()
-    }
-}
-
-impl PreInvoke for CSPReportEndpointFetchListener {
-    fn should_invoke(&self) -> bool {
-        true
     }
 }

@@ -4,8 +4,9 @@
 
 //! <https://drafts.csswg.org/css-sizing/>
 
-use std::cell::{LazyCell, OnceCell};
+use std::cell::{Cell, LazyCell, OnceCell};
 use std::ops::{Add, AddAssign};
+use std::sync::atomic::Ordering;
 
 use app_units::{Au, MAX_AU};
 use malloc_size_of_derive::MallocSizeOf;
@@ -16,6 +17,7 @@ use style::values::computed::{
 };
 
 use crate::context::LayoutContext;
+use crate::layout_box_base::LayoutBoxBase;
 use crate::style_ext::{AspectRatio, Clamp, ComputedValuesExt, ContentBoxSizesAndPBM, LayoutStyle};
 use crate::{ConstraintSpace, IndefiniteContainingBlock, LogicalVec2};
 
@@ -59,6 +61,11 @@ impl ContentSizes {
             min_content: self.min_content.max(other.min_content),
             max_content: self.max_content + other.max_content,
         }
+    }
+
+    pub fn union_assign(&mut self, other: &Self) {
+        self.min_content.max_assign(other.min_content);
+        self.max_content += other.max_content;
     }
 
     pub fn map(&self, f: impl Fn(Au) -> Au) -> Self {
@@ -120,6 +127,7 @@ impl From<Au> for ContentSizes {
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn outer_inline(
+    base: &LayoutBoxBase,
     layout_style: &LayoutStyle,
     containing_block: &IndefiniteContainingBlock,
     auto_minimum: &LogicalVec2<Au>,
@@ -143,7 +151,11 @@ pub(crate) fn outer_inline(
     };
     let style = layout_style.style();
     let is_table = layout_style.is_table();
+    // TODO: Replace `depends_on_contents` with `content_size.get().is_some()` once `LazyCell::get()`
+    // becomes stable.
+    let depends_on_contents = Cell::new(false);
     let content_size = LazyCell::new(|| {
+        depends_on_contents.set(true);
         let constraint_space = if establishes_containing_block {
             let available_block_size = containing_block
                 .size
@@ -175,14 +187,14 @@ pub(crate) fn outer_inline(
                         available_block_size,
                     )
                 };
-            ConstraintSpace::new(block_size, style.writing_mode, aspect_ratio)
+            ConstraintSpace::new(block_size, style, aspect_ratio)
         } else {
             // This assumes that there is no preferred aspect ratio, or that there is no
             // block size constraint to be transferred so the ratio is irrelevant.
             // We only get into here for anonymous blocks, for which the assumption holds.
             ConstraintSpace::new(
                 containing_block.size.block.into(),
-                containing_block.writing_mode,
+                containing_block.style,
                 None,
             )
         };
@@ -246,13 +258,14 @@ pub(crate) fn outer_inline(
             // We need a comment here to avoid breaking `./mach test-tidy`.
             matches!(size, Size::Numeric(numeric) if numeric.has_percentage())
         };
+        let writing_mode = containing_block.style.writing_mode;
         if content_box_sizes.inline.preferred.is_initial() &&
-            has_percentage(style.box_size(containing_block.writing_mode).inline)
+            has_percentage(style.box_size(writing_mode).inline)
         {
             preferred_min_content = Au::zero();
         }
         if content_box_sizes.inline.max.is_initial() &&
-            has_percentage(style.max_box_size(containing_block.writing_mode).inline)
+            has_percentage(style.max_box_size(writing_mode).inline)
         {
             max_min_content = Some(Au::zero());
         }
@@ -266,6 +279,8 @@ pub(crate) fn outer_inline(
         min_depends_on_block_constraints |= content_size.depends_on_block_constraints;
     }
 
+    base.outer_inline_content_sizes_depend_on_content
+        .store(depends_on_contents.get(), Ordering::Relaxed);
     InlineContentSizesResult {
         sizes: ContentSizes {
             min_content: preferred_min_content
@@ -382,7 +397,7 @@ impl From<StyleSize> for Size<LengthPercentage> {
             StyleSize::MaxContent => Size::MaxContent,
             StyleSize::FitContent => Size::FitContent,
             StyleSize::FitContentFunction(lp) => Size::FitContentFunction(lp.0),
-            StyleSize::Stretch => Size::Stretch,
+            StyleSize::Stretch | StyleSize::WebkitFillAvailable => Size::Stretch,
             StyleSize::AnchorSizeFunction(_) | StyleSize::AnchorContainingCalcFunction(_) => {
                 unreachable!("anchor-size() should be disabled")
             },
@@ -399,7 +414,7 @@ impl From<StyleMaxSize> for Size<LengthPercentage> {
             StyleMaxSize::MaxContent => Size::MaxContent,
             StyleMaxSize::FitContent => Size::FitContent,
             StyleMaxSize::FitContentFunction(lp) => Size::FitContentFunction(lp.0),
-            StyleMaxSize::Stretch => Size::Stretch,
+            StyleMaxSize::Stretch | StyleMaxSize::WebkitFillAvailable => Size::Stretch,
             StyleMaxSize::AnchorSizeFunction(_) | StyleMaxSize::AnchorContainingCalcFunction(_) => {
                 unreachable!("anchor-size() should be disabled")
             },
@@ -606,6 +621,14 @@ impl SizeConstraint {
         match self {
             Self::Definite(size) => Some(size),
             _ => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn definite_or_min(self) -> Au {
+        match self {
+            Self::Definite(size) => size,
+            Self::MinMax(min, _) => min,
         }
     }
 }

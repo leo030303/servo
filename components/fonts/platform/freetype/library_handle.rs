@@ -53,7 +53,7 @@ extern "C" fn ft_realloc(
 /// dropped during execution.
 #[derive(Clone, Debug)]
 pub(crate) struct FreeTypeLibraryHandle {
-    pub freetype_library: FT_Library,
+    pub(crate) freetype_library: FT_Library,
     freetype_memory: FT_Memory,
 }
 
@@ -61,7 +61,7 @@ unsafe impl Sync for FreeTypeLibraryHandle {}
 unsafe impl Send for FreeTypeLibraryHandle {}
 
 impl Drop for FreeTypeLibraryHandle {
-    #[allow(unused)]
+    #[expect(unused)]
     fn drop(&mut self) {
         assert!(!self.freetype_library.is_null());
         unsafe {

@@ -5,7 +5,8 @@
 use dom_struct::dom_struct;
 use euclid::{RigidTransform3D, Rotation3D, Vector3D};
 use js::rust::HandleObject;
-use js::typedarray::{Float32, Float32Array};
+use js::typedarray::{Float32, HeapFloat32Array};
+use script_bindings::trace::RootedTraceableBox;
 
 use crate::dom::bindings::buffer_source::HeapBufferSource;
 use crate::dom::bindings::codegen::Bindings::DOMPointBinding::DOMPointInit;
@@ -72,7 +73,7 @@ impl XRRigidTransform {
 }
 
 impl XRRigidTransformMethods<crate::DomTypeHolder> for XRRigidTransform {
-    // https://immersive-web.github.io/webxr/#dom-xrrigidtransform-xrrigidtransform
+    /// <https://immersive-web.github.io/webxr/#dom-xrrigidtransform-xrrigidtransform>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -118,7 +119,7 @@ impl XRRigidTransformMethods<crate::DomTypeHolder> for XRRigidTransform {
         if !rotate.i.is_finite() {
             // if quaternion has zero norm, we'll get an infinite or NaN
             // value for each element. This is preferable to checking for zero.
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         let transform = RigidTransform3D::new(rotate, translate);
         Ok(XRRigidTransform::new_with_proto(
@@ -126,7 +127,7 @@ impl XRRigidTransformMethods<crate::DomTypeHolder> for XRRigidTransform {
         ))
     }
 
-    // https://immersive-web.github.io/webxr/#dom-xrrigidtransform-position
+    /// <https://immersive-web.github.io/webxr/#dom-xrrigidtransform-position>
     fn Position(&self, can_gc: CanGc) -> DomRoot<DOMPointReadOnly> {
         self.position.or_init(|| {
             let t = &self.transform.translation;
@@ -140,7 +141,7 @@ impl XRRigidTransformMethods<crate::DomTypeHolder> for XRRigidTransform {
             )
         })
     }
-    // https://immersive-web.github.io/webxr/#dom-xrrigidtransform-orientation
+    /// <https://immersive-web.github.io/webxr/#dom-xrrigidtransform-orientation>
     fn Orientation(&self, can_gc: CanGc) -> DomRoot<DOMPointReadOnly> {
         self.orientation.or_init(|| {
             let r = &self.transform.rotation;
@@ -154,7 +155,7 @@ impl XRRigidTransformMethods<crate::DomTypeHolder> for XRRigidTransform {
             )
         })
     }
-    // https://immersive-web.github.io/webxr/#dom-xrrigidtransform-inverse
+    /// <https://immersive-web.github.io/webxr/#dom-xrrigidtransform-inverse>
     fn Inverse(&self, can_gc: CanGc) -> DomRoot<XRRigidTransform> {
         self.inverse.or_init(|| {
             let transform =
@@ -163,8 +164,8 @@ impl XRRigidTransformMethods<crate::DomTypeHolder> for XRRigidTransform {
             transform
         })
     }
-    // https://immersive-web.github.io/webxr/#dom-xrrigidtransform-matrix
-    fn Matrix(&self, _cx: JSContext, can_gc: CanGc) -> Float32Array {
+    /// <https://immersive-web.github.io/webxr/#dom-xrrigidtransform-matrix>
+    fn Matrix(&self, _cx: JSContext, can_gc: CanGc) -> RootedTraceableBox<HeapFloat32Array> {
         if !self.matrix.is_initialized() {
             self.matrix
                 .set_data(_cx, &self.transform.to_transform().to_array(), can_gc)

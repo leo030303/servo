@@ -13,8 +13,8 @@ use std::time::SystemTime;
 use cookie::Cookie;
 use itertools::Itertools;
 use log::info;
-use net_traits::CookieSource;
 use net_traits::pub_domains::reg_suffix;
+use net_traits::{CookieSource, SiteDescriptor};
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
 
@@ -97,11 +97,15 @@ impl CookieStorage {
         }
     }
 
-    pub fn clear_storage(&mut self, url: &ServoUrl) {
-        let domain = reg_host(url.host_str().unwrap_or(""));
-        let cookies = self.cookies_map.entry(domain).or_default();
-        for cookie in cookies.iter_mut() {
-            cookie.set_expiry_time_in_past();
+    pub fn clear_storage(&mut self, url: Option<&ServoUrl>) {
+        if let Some(url) = url {
+            let domain = reg_host(url.host_str().unwrap_or(""));
+            let cookies = self.cookies_map.entry(domain).or_default();
+            for cookie in cookies.iter_mut() {
+                cookie.set_expiry_time_in_past();
+            }
+        } else {
+            self.cookies_map.clear();
         }
     }
 
@@ -175,6 +179,13 @@ impl CookieStorage {
         }
     }
 
+    pub fn remove_all_expired_cookies(&mut self) {
+        self.cookies_map.retain(|_, cookies| {
+            cookies.retain(|c| !is_cookie_expired(c));
+            !cookies.is_empty()
+        });
+    }
+
     // http://tools.ietf.org/html/rfc6265#section-5.4
     pub fn cookies_for_url(&mut self, url: &ServoUrl, source: CookieSource) -> Option<String> {
         // Let cookie-list be the set of cookies from the cookie store
@@ -246,6 +257,14 @@ impl CookieStorage {
                 c.touch();
                 c.cookie.clone()
             })
+    }
+
+    pub fn cookie_site_descriptors(&self) -> Vec<SiteDescriptor> {
+        self.cookies_map
+            .keys()
+            .cloned()
+            .map(SiteDescriptor::new)
+            .collect()
     }
 }
 

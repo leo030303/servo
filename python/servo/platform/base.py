@@ -29,7 +29,7 @@ class Base:
     def executable_suffix(self) -> str:
         return ""
 
-    def _platform_bootstrap(self, force: bool) -> bool:
+    def _platform_bootstrap(self, force: bool, yes: bool) -> bool:
         raise NotImplementedError("Bootstrap installation detection not yet available.")
 
     def _platform_bootstrap_gstreamer(self, target: BuildTarget, force: bool) -> bool:
@@ -54,12 +54,15 @@ class Base:
         except FileNotFoundError:
             return False
 
-    def bootstrap(self, force: bool, skip_platform: bool, skip_lints: bool) -> None:
+    def bootstrap(self, force: bool, yes: bool, skip_platform: bool, skip_lints: bool, skip_nextest: bool) -> None:
         installed_something = False
         if not skip_platform:
-            installed_something |= self._platform_bootstrap(force)
+            installed_something |= self._platform_bootstrap(force, yes)
         self.install_rust_toolchain()
+        if not skip_nextest:
+            installed_something |= self.install_cargo_nextest(force)
         if not skip_lints:
+            installed_something |= self.install_cargo_about(force)
             installed_something |= self.install_taplo(force)
             installed_something |= self.install_cargo_deny(force)
             installed_something |= self.install_crown(force)
@@ -100,6 +103,22 @@ class Base:
         print(" * Installing cargo-deny...")
         if subprocess.call(["cargo", "install", "cargo-deny@0.18.3", "--locked"]) != 0:
             raise EnvironmentError("Installation of cargo-deny failed.")
+        return True
+
+    def install_cargo_about(self, force: bool) -> bool:
+        if not force and shutil.which("cargo-about") is not None:
+            return False
+        print(" * Installing cargo-about...")
+        if subprocess.call(["cargo", "install", "cargo-about", "--locked"]) != 0:
+            raise EnvironmentError("Installation of cargo-about failed.")
+        return True
+
+    def install_cargo_nextest(self, force: bool) -> bool:
+        if not force and shutil.which("cargo-nextest") is not None:
+            return False
+        print(" * Installing cargo-nextest...")
+        if subprocess.call(["cargo", "install", "cargo-nextest", "--locked"]) != 0:
+            raise EnvironmentError("Installation of cargo-nextest failed.")
         return True
 
     def install_crown(self, force: bool) -> bool:

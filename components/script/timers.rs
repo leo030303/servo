@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 use std::cmp::{Ord, Ordering};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::default::Default;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 use base::id::PipelineId;
 use deny_public_fields::DenyPublicFields;
 use js::jsapi::Heap;
-use js::jsval::{JSVal, UndefinedValue};
+use js::jsval::JSVal;
 use js::rust::HandleValue;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_config::pref;
 use timers::{BoxedTimerCallback, TimerEventRequest};
@@ -31,7 +32,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::csp::CspReporting;
 use crate::dom::document::RefreshRedirectDue;
 use crate::dom::eventsource::EventSourceTimeoutCallback;
-use crate::dom::globalscope::GlobalScope;
+use crate::dom::globalscope::{ErrorReporting, GlobalScope, RethrowErrors};
 #[cfg(feature = "testbinding")]
 use crate::dom::testbinding::TestBindingCallback;
 use crate::dom::trustedscript::TrustedScript;
@@ -41,6 +42,27 @@ use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::{CanGc, IntroductionType};
 use crate::script_thread::ScriptThread;
 use crate::task_source::SendableTaskSource;
+
+type TimerKey = i32;
+type RunStepsDeadline = Instant;
+type CompletionStep = Box<dyn FnOnce(&GlobalScope, CanGc) + 'static>;
+
+/// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+/// OrderingIdentifier per spec ("orderingIdentifier")
+type OrderingIdentifier = DOMString;
+
+#[derive(JSTraceable, MallocSizeOf)]
+struct OrderingEntry {
+    milliseconds: u64,
+    start_seq: u64,
+    handle: OneshotTimerHandle,
+}
+
+// Per-ordering queues map
+type OrderingQueues = FxHashMap<OrderingIdentifier, Vec<OrderingEntry>>;
+
+// Active timers map for Run Steps After A Timeout
+type RunStepsActiveMap = FxHashMap<TimerKey, RunStepsDeadline>;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
 pub(crate) struct OneshotTimerHandle(i32);
@@ -66,6 +88,22 @@ pub(crate) struct OneshotTimers {
     ///    original timer is rescheduled when it is the next one to get called.
     #[no_trace]
     expected_event_id: Cell<TimerEventId>,
+    /// <https://html.spec.whatwg.org/multipage/#map-of-active-timers>
+    /// TODO this should also be used for the other timers
+    /// as per <html.spec.whatwg.org/multipage/#map-of-settimeout-and-setinterval-ids>Z.
+    map_of_active_timers: DomRefCell<RunStepsActiveMap>,
+
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    /// Step 4.2 Wait until any invocations of this algorithm that had the same global and orderingIdentifier,
+    /// that started before this one, and whose milliseconds is less than or equal to this one's, have completed.
+    runsteps_queues: DomRefCell<OrderingQueues>,
+
+    /// <html.spec.whatwg.org/multipage/#timers:unique-internal-value-5>
+    next_runsteps_key: Cell<TimerKey>,
+
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    /// Start order sequence to break ties for Step 4.2.
+    runsteps_start_seq: Cell<u64>,
 }
 
 #[derive(DenyPublicFields, JSTraceable, MallocSizeOf)]
@@ -88,6 +126,19 @@ pub(crate) enum OneshotTimerCallback {
     #[cfg(feature = "testbinding")]
     TestBindingCallback(TestBindingCallback),
     RefreshRedirectDue(RefreshRedirectDue),
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    RunStepsAfterTimeout {
+        /// Step 1. timerKey
+        timer_key: i32,
+        /// Step 4. orderingIdentifier
+        ordering_id: DOMString,
+        /// Spec: milliseconds (the algorithm input)
+        milliseconds: u64,
+        /// Perform completionSteps.
+        #[no_trace]
+        #[ignore_malloc_size_of = "Closure"]
+        completion: CompletionStep,
+    },
 }
 
 impl OneshotTimerCallback {
@@ -99,6 +150,11 @@ impl OneshotTimerCallback {
             #[cfg(feature = "testbinding")]
             OneshotTimerCallback::TestBindingCallback(callback) => callback.invoke(),
             OneshotTimerCallback::RefreshRedirectDue(callback) => callback.invoke(can_gc),
+            OneshotTimerCallback::RunStepsAfterTimeout { completion, .. } => {
+                // <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+                // Step 4.4 Perform completionSteps.
+                completion(&this.global(), can_gc);
+            },
         }
     }
 }
@@ -135,7 +191,70 @@ impl OneshotTimers {
             suspended_since: Cell::new(None),
             suspension_offset: Cell::new(Duration::ZERO),
             expected_event_id: Cell::new(TimerEventId(0)),
+            map_of_active_timers: Default::default(),
+            runsteps_queues: Default::default(),
+            next_runsteps_key: Cell::new(1),
+            runsteps_start_seq: Cell::new(0),
         }
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    #[inline]
+    pub(crate) fn now_for_runsteps(&self) -> Instant {
+        // Step 2. Let startTime be the current high resolution time given global.
+        self.base_time()
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    /// Step 1. Let timerKey be a new unique internal value.
+    pub(crate) fn fresh_runsteps_key(&self) -> TimerKey {
+        let k = self.next_runsteps_key.get();
+        self.next_runsteps_key.set(k + 1);
+        k
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    /// Step 3. Set global's map of active timers[timerKey] to startTime plus milliseconds.
+    pub(crate) fn runsteps_set_active(&self, timer_key: TimerKey, deadline: RunStepsDeadline) {
+        self.map_of_active_timers
+            .borrow_mut()
+            .insert(timer_key, deadline);
+    }
+
+    /// <https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout>
+    /// Helper for Step 4.2: maintain per-ordering sorted queue by (milliseconds, startSeq, handle).
+    fn runsteps_enqueue_sorted(
+        &self,
+        ordering_id: &DOMString,
+        handle: OneshotTimerHandle,
+        milliseconds: u64,
+    ) {
+        let mut map = self.runsteps_queues.borrow_mut();
+        let q = map.entry(ordering_id.clone()).or_default();
+
+        let seq = {
+            let cur = self.runsteps_start_seq.get();
+            self.runsteps_start_seq.set(cur + 1);
+            cur
+        };
+
+        let key = OrderingEntry {
+            milliseconds,
+            start_seq: seq,
+            handle,
+        };
+
+        let idx = q
+            .binary_search_by(|ordering_entry| {
+                match ordering_entry.milliseconds.cmp(&milliseconds) {
+                    Ordering::Less => Ordering::Less,
+                    Ordering::Greater => Ordering::Greater,
+                    Ordering::Equal => ordering_entry.start_seq.cmp(&seq),
+                }
+            })
+            .unwrap_or_else(|i| i);
+
+        q.insert(idx, key);
     }
 
     pub(crate) fn schedule_callback(
@@ -154,6 +273,17 @@ impl OneshotTimers {
             callback,
             scheduled_for: self.base_time() + duration,
         };
+
+        // https://html.spec.whatwg.org/multipage/#run-steps-after-a-timeout
+        // Step 4.2: maintain per-orderingIdentifier order by milliseconds (and start order for ties).
+        if let OneshotTimerCallback::RunStepsAfterTimeout {
+            ordering_id,
+            milliseconds,
+            ..
+        } = &timer.callback
+        {
+            self.runsteps_enqueue_sorted(ordering_id, new_handle, *milliseconds);
+        }
 
         {
             let mut timers = self.timers.borrow_mut();
@@ -230,8 +360,69 @@ impl OneshotTimers {
             if !global.can_continue_running() {
                 return;
             }
-            let callback = timer.callback;
-            callback.invoke(global, &self.js_timers, can_gc);
+            match &timer.callback {
+                // TODO: https://github.com/servo/servo/issues/40060
+                OneshotTimerCallback::RunStepsAfterTimeout { ordering_id, .. } => {
+                    // Step 4.2 Wait until any invocations of this algorithm that had the same global and orderingIdentifier,
+                    // that started before this one, and whose milliseconds is less than or equal to this one's, have completed.
+                    let head_handle_opt = {
+                        let queues_ref = self.runsteps_queues.borrow();
+                        queues_ref
+                            .get(ordering_id)
+                            .and_then(|v| v.first().map(|t| t.handle))
+                    };
+                    let is_head = head_handle_opt.is_none_or(|head| head == timer.handle);
+
+                    if !is_head {
+                        // TODO: this re queuing would go away when we revisit timers implementation.
+                        let rein = OneshotTimer {
+                            handle: timer.handle,
+                            source: timer.source,
+                            callback: timer.callback,
+                            scheduled_for: self.base_time(),
+                        };
+                        let mut timers = self.timers.borrow_mut();
+                        let idx = timers.binary_search(&rein).err().unwrap();
+                        timers.insert(idx, rein);
+                        continue;
+                    }
+
+                    let (timer_key, ordering_id_owned, completion) = match timer.callback {
+                        OneshotTimerCallback::RunStepsAfterTimeout {
+                            timer_key,
+                            ordering_id,
+                            milliseconds: _,
+                            completion,
+                        } => (timer_key, ordering_id, completion),
+                        _ => unreachable!(),
+                    };
+
+                    // Step 4.3 Optionally, wait a further implementation-defined length of time.
+                    // (No additional delay applied.)
+
+                    // Step 4.4 Perform completionSteps.
+                    (completion)(global, can_gc);
+
+                    // Step 4.5 Remove global's map of active timers[timerKey].
+                    self.map_of_active_timers.borrow_mut().remove(&timer_key);
+
+                    {
+                        let mut queues_mut = self.runsteps_queues.borrow_mut();
+                        if let Some(q) = queues_mut.get_mut(&ordering_id_owned) {
+                            if !q.is_empty() {
+                                q.remove(0);
+                            }
+                            if q.is_empty() {
+                                queues_mut.remove(&ordering_id_owned);
+                            }
+                        }
+                    }
+                },
+                _ => {
+                    let cb = timer.callback;
+                    cb.invoke(global, &self.js_timers, can_gc);
+                },
+            }
         }
 
         self.schedule_timer_call();
@@ -310,7 +501,7 @@ impl OneshotTimers {
 
         let event_request = TimerEventRequest {
             callback,
-            duration: timer.scheduled_for - Instant::now(),
+            duration: timer.scheduled_for - self.base_time(),
         };
 
         self.global_scope.schedule_timer(event_request);
@@ -361,7 +552,7 @@ pub(crate) struct JsTimerHandle(i32);
 pub(crate) struct JsTimers {
     next_timer_handle: Cell<JsTimerHandle>,
     /// <https://html.spec.whatwg.org/multipage/#list-of-active-timers>
-    active_timers: DomRefCell<HashMap<JsTimerHandle, JsTimerEntry>>,
+    active_timers: DomRefCell<FxHashMap<JsTimerHandle, JsTimerEntry>>,
     /// The nesting level of the currently executing timer task or 0.
     nesting_level: Cell<u32>,
     /// Used to introduce a minimum delay in event intervals
@@ -407,7 +598,7 @@ enum InternalTimerCallback {
     StringTimerCallback(DOMString),
     FunctionTimerCallback(
         #[conditional_malloc_size_of] Rc<Function>,
-        #[ignore_malloc_size_of = "Rc"] Rc<Box<[Heap<JSVal>]>>,
+        #[ignore_malloc_size_of = "mozjs"] Rc<Box<[Heap<JSVal>]>>,
     ),
 }
 
@@ -415,7 +606,7 @@ impl Default for JsTimers {
     fn default() -> Self {
         JsTimers {
             next_timer_handle: Cell::new(JsTimerHandle(1)),
-            active_timers: DomRefCell::new(HashMap::new()),
+            active_timers: DomRefCell::new(FxHashMap::default()),
             nesting_level: Cell::new(0),
             min_duration: Cell::new(None),
         }
@@ -464,7 +655,7 @@ impl JsTimers {
                 // If this throws an exception, catch it, report it for global, and abort these steps.
                 if global
                     .get_csp_list()
-                    .is_js_evaluation_allowed(global, code_str.as_ref())
+                    .is_js_evaluation_allowed(global, &code_str.str())
                 {
                     // Step 9.6.2. Assert: handler is a string.
                     InternalTimerCallback::StringTimerCallback(code_str)
@@ -588,38 +779,43 @@ impl JsTimerTask {
         // prep for step ? in nested set_timeout_or_interval calls
         timers.nesting_level.set(self.nesting_level);
 
-        let was_user_interacting = ScriptThread::is_user_interacting();
-        ScriptThread::set_user_interacting(self.is_user_interacting);
+        let _guard = ScriptThread::user_interacting_guard();
         match self.callback {
             InternalTimerCallback::StringTimerCallback(ref code_str) => {
                 // Step 6.4. Let settings object be global's relevant settings object.
                 // Step 6. Let realm be global's relevant realm.
                 let global = this.global();
-                // Step 7. Let initiating script be the active script.
-                let cx = GlobalScope::get_cx();
-                // Step 9.6.7. If initiating script is not null, then:
-                rooted!(in(*cx) let mut rval = UndefinedValue());
+                // TODO Step 7. Let initiating script be the active script.
+
+                // Step 9.6.5. Let fetch options be the default script fetch options.
+                let fetch_options = ScriptFetchOptions::default_classic_script(&global);
+
+                // Step 9.6.6. Let base URL be settings object's API base URL.
+                let base_url = global.api_base_url();
+
+                // TODO Step 9.6.7. If initiating script is not null, then:
                 // Step 9.6.7.1. Set fetch options to a script fetch options whose cryptographic nonce
                 // is initiating script's fetch options's cryptographic nonce,
                 // integrity metadata is the empty string, parser metadata is "not-parser-inserted",
                 // credentials mode is initiating script's fetch options's credentials mode,
                 // referrer policy is initiating script's fetch options's referrer policy,
                 // and fetch priority is "auto".
+                // Step 9.6.7.2. Set base URL to initiating script's base URL.
+
                 // Step 9.6.8. Let script be the result of creating a classic script given handler,
                 // settings object, base URL, and fetch options.
-                // Step 9.6.9. Run the classic script script.
-                //
-                // FIXME(cybai): Use base url properly by saving private reference for timers (#27260)
-                _ = global.evaluate_js_on_global_with_result(
-                    code_str,
-                    rval.handle_mut(),
-                    ScriptFetchOptions::default_classic_script(&global),
-                    // Step 9.6. Let base URL be settings object's API base URL.
-                    // Step 9.7.2. Set base URL to initiating script's base URL.
-                    global.api_base_url(),
-                    can_gc,
+                let script = global.create_a_classic_script(
+                    (*code_str.str()).into(),
+                    base_url,
+                    fetch_options,
+                    ErrorReporting::Unmuted,
                     Some(IntroductionType::DOM_TIMER),
+                    1,
+                    false,
                 );
+
+                // Step 9.6.9. Run the classic script script.
+                _ = global.run_a_classic_script(script, RethrowErrors::No, can_gc);
             },
             // Step 9.5. If handler is a Function, then invoke handler given arguments and
             // "report", and with callback this value set to thisArg.
@@ -629,7 +825,6 @@ impl JsTimerTask {
                 let _ = function.Call_(this, arguments, value.handle_mut(), Report, can_gc);
             },
         };
-        ScriptThread::set_user_interacting(was_user_interacting);
 
         // reset nesting level (see above)
         timers.nesting_level.set(0);

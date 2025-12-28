@@ -2,31 +2,33 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::iter::FromIterator;
-use std::sync::{Arc as StdArc, Condvar, Mutex, RwLock};
+use std::sync::Arc as StdArc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_recursion::async_recursion;
 use base::cross_process_instant::CrossProcessInstant;
+use base::generic_channel;
 use base::id::{BrowsingContextId, HistoryStateId, PipelineId};
 use crossbeam_channel::Sender;
 use devtools_traits::{
     ChromeToDevtoolsControlMsg, DevtoolsControlMsg, HttpRequest as DevtoolsHttpRequest,
-    HttpResponse as DevtoolsHttpResponse, NetworkEvent,
+    HttpResponse as DevtoolsHttpResponse, NetworkEvent, SecurityInfoUpdate,
 };
 use embedder_traits::{AuthenticationResponse, EmbedderMsg, EmbedderProxy};
 use futures::{TryFutureExt, TryStreamExt, future};
 use headers::authorization::Basic;
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
-    AccessControlAllowOrigin, AccessControlMaxAge, AccessControlRequestMethod, Authorization,
-    CacheControl, ContentLength, HeaderMapExt, IfModifiedSince, LastModified, Pragma, Referer,
+    AccessControlMaxAge, AccessControlRequestMethod, Authorization, CacheControl, ContentLength,
+    HeaderMapExt, IfModifiedSince, LastModified, Pragma, Referer, StrictTransportSecurity,
     UserAgent,
 };
 use http::header::{
-    self, ACCEPT, ACCESS_CONTROL_REQUEST_HEADERS, AUTHORIZATION, CONTENT_ENCODING,
-    CONTENT_LANGUAGE, CONTENT_LOCATION, CONTENT_TYPE, HeaderValue, RANGE,
+    self, ACCEPT, ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_REQUEST_HEADERS, AUTHORIZATION,
+    CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_LOCATION, CONTENT_TYPE, HeaderValue, RANGE,
+    WWW_AUTHENTICATE,
 };
 use http::{HeaderMap, Method, Request as HyperRequest, StatusCode};
 use http_body_util::combinators::BoxBody;
@@ -36,28 +38,32 @@ use hyper::body::{Bytes, Frame};
 use hyper::ext::ReasonPhrase;
 use hyper::header::{HeaderName, TRANSFER_ENCODING};
 use hyper_serde::Serde;
-use hyper_util::client::legacy::Client;
 use ipc_channel::ipc::{self, IpcSender, IpcSharedMemory};
 use ipc_channel::router::ROUTER;
 use log::{debug, error, info, log_enabled, warn};
 use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use net_traits::fetch::headers::get_value_from_header_list;
 use net_traits::http_status::HttpStatus;
+use net_traits::policy_container::RequestPolicyContainer;
 use net_traits::pub_domains::reg_suffix;
 use net_traits::request::Origin::Origin as SpecificOrigin;
 use net_traits::request::{
     BodyChunkRequest, BodyChunkResponse, CacheMode, CredentialsMode, Destination, Initiator,
     Origin, RedirectMode, Referrer, Request, RequestBuilder, RequestMode, ResponseTainting,
-    ServiceWorkersMode, Window as RequestWindow, get_cors_unsafe_header_names,
+    ServiceWorkersMode, TraversableForUserPrompts, get_cors_unsafe_header_names,
     is_cors_non_wildcard_request_header_name, is_cors_safelisted_method,
     is_cors_safelisted_request_header,
 };
-use net_traits::response::{HttpsState, Response, ResponseBody, ResponseType};
+use net_traits::response::{CacheState, HttpsState, Response, ResponseBody, ResponseType};
 use net_traits::{
-    CookieSource, DOCUMENT_ACCEPT_HEADER_VALUE, FetchMetadata, NetworkError, RedirectEndValue,
-    RedirectStartValue, ReferrerPolicy, ResourceAttribute, ResourceFetchTiming, ResourceTimeValue,
+    CookieSource, DOCUMENT_ACCEPT_HEADER_VALUE, DebugVec, FetchMetadata, NetworkError,
+    RedirectEndValue, RedirectStartValue, ReferrerPolicy, ResourceAttribute, ResourceFetchTiming,
+    ResourceTimeValue, TlsSecurityInfo, TlsSecurityState,
 };
+use parking_lot::{Mutex, RwLock};
 use profile_traits::mem::{Report, ReportKind};
 use profile_traits::path;
+use rustc_hash::FxHashMap;
 use servo_arc::Arc;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use tokio::sync::mpsc::{
@@ -67,7 +73,9 @@ use tokio::sync::mpsc::{
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::async_runtime::spawn_task;
-use crate::connector::{CertificateErrorOverrideManager, Connector};
+use crate::connector::{
+    CertificateErrorOverrideManager, ServoClient, TlsHandshakeInfo, create_tls_config,
+};
 use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
 use crate::decoder::Decoder;
@@ -76,8 +84,11 @@ use crate::fetch::fetch_params::FetchParams;
 use crate::fetch::headers::{SecFetchDest, SecFetchMode, SecFetchSite, SecFetchUser};
 use crate::fetch::methods::{Data, DoneChannel, FetchContext, Target, main_fetch};
 use crate::hsts::HstsList;
-use crate::http_cache::{CacheKey, HttpCache};
+use crate::http_cache::{
+    CacheKey, CachedResourcesOrGuard, HttpCache, construct_response, invalidate, refresh,
+};
 use crate::resource_thread::{AuthCache, AuthCacheEntry};
+use crate::websocket_loader::start_websocket;
 
 /// The various states an entry of the HttpCache can be in.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -90,19 +101,13 @@ pub enum HttpCacheEntryState {
     PendingStore(usize),
 }
 
-type HttpCacheState = Mutex<HashMap<CacheKey, Arc<(Mutex<HttpCacheEntryState>, Condvar)>>>;
-
 pub struct HttpState {
     pub hsts_list: RwLock<HstsList>,
     pub cookie_jar: RwLock<CookieStorage>,
-    pub http_cache: RwLock<HttpCache>,
-    /// A map of cache key to entry state,
-    /// reflecting whether the cache entry is ready to read from,
-    /// or whether a concurrent pending store should be awaited.
-    pub http_cache_state: HttpCacheState,
+    pub http_cache: HttpCache,
     pub auth_cache: RwLock<AuthCache>,
-    pub history_states: RwLock<HashMap<HistoryStateId, Vec<u8>>>,
-    pub client: Client<Connector, crate::connector::BoxedBody>,
+    pub history_states: RwLock<FxHashMap<HistoryStateId, Vec<u8>>>,
+    pub client: ServoClient,
     pub override_manager: CertificateErrorOverrideManager,
     pub embedder_proxy: Mutex<EmbedderProxy>,
 }
@@ -113,12 +118,12 @@ impl HttpState {
             Report {
                 path: path!["memory-cache", suffix],
                 kind: ReportKind::ExplicitJemallocHeapSize,
-                size: self.http_cache.read().unwrap().size_of(ops),
+                size: self.http_cache.size_of(ops),
             },
             Report {
                 path: path!["hsts-list", suffix],
                 kind: ReportKind::ExplicitJemallocHeapSize,
-                size: self.hsts_list.read().unwrap().size_of(ops),
+                size: self.hsts_list.read().size_of(ops),
             },
         ]
     }
@@ -137,8 +142,8 @@ impl HttpState {
             return None;
         }
 
-        let embedder_proxy = self.embedder_proxy.lock().unwrap();
-        let (ipc_sender, ipc_receiver) = ipc::channel().unwrap();
+        let embedder_proxy = self.embedder_proxy.lock();
+        let (ipc_sender, ipc_receiver) = generic_channel::channel().unwrap();
         embedder_proxy.send(EmbedderMsg::RequestAuthentication(
             webview_id,
             request.url(),
@@ -149,15 +154,19 @@ impl HttpState {
     }
 }
 
-/// Step 13 of <https://fetch.spec.whatwg.org/#concept-fetch>.
+/// Step 11 of <https://fetch.spec.whatwg.org/#concept-fetch>.
 pub(crate) fn set_default_accept(request: &mut Request) {
+    // Step 11. If request’s header list does not contain `Accept`, then:
     if request.headers.contains_key(header::ACCEPT) {
         return;
     }
 
+    // Step 11.2. If request’s initiator is "prefetch", then set value to the document `Accept` header value.
     let value = if request.initiator == Initiator::Prefetch {
         DOCUMENT_ACCEPT_HEADER_VALUE
     } else {
+        // Step 11.3. Otherwise, the user agent should set value to the first matching statement,
+        // if any, switching on request’s destination:
         match request.destination {
             Destination::Document | Destination::Frame | Destination::IFrame => {
                 DOCUMENT_ACCEPT_HEADER_VALUE
@@ -167,10 +176,12 @@ pub(crate) fn set_default_accept(request: &mut Request) {
             },
             Destination::Json => HeaderValue::from_static("application/json,*/*;q=0.5"),
             Destination::Style => HeaderValue::from_static("text/css,*/*;q=0.1"),
+            // Step 11.1. Let value be `*/*`.
             _ => HeaderValue::from_static("*/*"),
         }
     };
 
+    // Step 11.4. Append (`Accept`, value) to request’s header list.
     request.headers.insert(header::ACCEPT, value);
 }
 
@@ -182,7 +193,7 @@ fn set_default_accept_encoding(headers: &mut HeaderMap) {
     // TODO(eijebong): Change this once typed headers are done
     headers.insert(
         header::ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br"),
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
     );
 }
 
@@ -356,7 +367,7 @@ fn set_request_cookies(
     headers: &mut HeaderMap,
     cookie_jar: &RwLock<CookieStorage>,
 ) {
-    let mut cookie_jar = cookie_jar.write().unwrap();
+    let mut cookie_jar = cookie_jar.write();
     cookie_jar.remove_expired_cookies_for_url(url);
     if let Some(cookie_list) = cookie_jar.cookies_for_url(url, CookieSource::HTTP) {
         headers.insert(
@@ -367,10 +378,10 @@ fn set_request_cookies(
 }
 
 fn set_cookie_for_url(cookie_jar: &RwLock<CookieStorage>, request: &ServoUrl, cookie_val: &str) {
-    let mut cookie_jar = cookie_jar.write().unwrap();
+    let mut cookie_jar = cookie_jar.write();
     let source = CookieSource::HTTP;
 
-    if let Some(cookie) = ServoCookie::from_cookie_string(cookie_val.into(), request, source) {
+    if let Some(cookie) = ServoCookie::from_cookie_string(cookie_val, request, source) {
         cookie_jar.push(cookie, request, source);
     }
 }
@@ -381,9 +392,48 @@ fn set_cookies_from_headers(
     cookie_jar: &RwLock<CookieStorage>,
 ) {
     for cookie in headers.get_all(header::SET_COOKIE) {
-        if let Ok(cookie_str) = std::str::from_utf8(cookie.as_bytes()) {
+        let cookie_bytes = cookie.as_bytes();
+        if !ServoCookie::is_valid_name_or_value(cookie_bytes) {
+            continue;
+        }
+        if let Ok(cookie_str) = std::str::from_utf8(cookie_bytes) {
             set_cookie_for_url(cookie_jar, url, cookie_str);
         }
+    }
+}
+
+fn build_tls_security_info(handshake: &TlsHandshakeInfo, hsts_enabled: bool) -> TlsSecurityInfo {
+    // Simplified security state determination:
+    // Servo uses rustls, which only supports TLS 1.2+ and secure cipher suites (GCM, ChaCha20-Poly1305).
+    // rustls does NOT support TLS 1.0, TLS 1.1, SSL, or weak ciphers (RC4, 3DES, CBC, etc).
+    // Therefore, any successful TLS connection is secure by design.
+    //
+    // We only check for missing handshake information as a defensive measure.
+
+    let state = if handshake.protocol_version.is_none() || handshake.cipher_suite.is_none() {
+        // Missing handshake information indicates an incomplete or failed connection
+        TlsSecurityState::Insecure
+    } else {
+        // rustls guarantees TLS 1.2+ with secure ciphers
+        TlsSecurityState::Secure
+    };
+
+    TlsSecurityInfo {
+        state,
+        weakness_reasons: Vec::new(), // rustls never negotiates weak crypto
+        protocol_version: handshake.protocol_version.clone(),
+        cipher_suite: handshake.cipher_suite.clone(),
+        kea_group_name: handshake.kea_group_name.clone(),
+        signature_scheme_name: handshake.signature_scheme_name.clone(),
+        alpn_protocol: handshake.alpn_protocol.clone(),
+        certificate_chain_der: handshake.certificate_chain_der.clone(),
+        certificate_transparency: None,
+        hsts: hsts_enabled,
+        hpkp: false,
+        used_ech: handshake.used_ech,
+        used_delegated_credentials: false,
+        used_ocsp: false,
+        used_private_dns: false,
     }
 }
 
@@ -406,7 +456,7 @@ fn prepare_devtools_request(
         url,
         method,
         headers,
-        body,
+        body: body.map(DebugVec::from),
         pipeline_id,
         started_date_time,
         time_stamp: started_date_time
@@ -428,9 +478,13 @@ pub fn send_request_to_devtools(
     msg: ChromeToDevtoolsControlMsg,
     devtools_chan: &Sender<DevtoolsControlMsg>,
 ) {
-    devtools_chan
-        .send(DevtoolsControlMsg::FromChrome(msg))
-        .unwrap();
+    if matches!(msg, ChromeToDevtoolsControlMsg::NetworkEvent(_, ref network_event) if !network_event.forward_to_devtools())
+    {
+        return;
+    }
+    if let Err(e) = devtools_chan.send(DevtoolsControlMsg::FromChrome(msg)) {
+        error!("DevTools send failed: {e}");
+    }
 }
 
 pub fn send_response_to_devtools(
@@ -451,6 +505,7 @@ pub fn send_response_to_devtools(
         meta.headers.map(Serde::into_inner),
         meta.status,
         body_data,
+        response.cache_state,
         request,
         context.devtools_chan.clone(),
     );
@@ -461,6 +516,7 @@ pub fn send_response_values_to_devtools(
     headers: Option<HeaderMap>,
     status: HttpStatus,
     body: Option<Vec<u8>>,
+    cache_state: CacheState,
     request: &Request,
     devtools_chan: Option<StdArc<Mutex<Sender<DevtoolsControlMsg>>>>,
 ) {
@@ -469,12 +525,14 @@ pub fn send_response_values_to_devtools(
         request.pipeline_id,
         request.target_webview_id,
     ) {
-        let browsing_context_id = webview_id.0;
+        let browsing_context_id = webview_id.into();
+        let from_cache = matches!(cache_state, CacheState::Local | CacheState::Validated);
 
         let devtoolsresponse = DevtoolsHttpResponse {
             headers,
             status,
-            body,
+            body: body.map(DebugVec::from),
+            from_cache,
             pipeline_id,
             browsing_context_id,
         };
@@ -485,15 +543,50 @@ pub fn send_response_values_to_devtools(
 
         let _ = devtools_chan
             .lock()
-            .unwrap()
+            .send(DevtoolsControlMsg::FromChrome(msg));
+    }
+}
+
+pub fn send_security_info_to_devtools(
+    request: &Request,
+    context: &FetchContext,
+    response: &Response,
+) {
+    let meta = match response.metadata() {
+        Ok(FetchMetadata::Unfiltered(m)) => m,
+        Ok(FetchMetadata::Filtered { unsafe_, .. }) => unsafe_,
+        Err(_) => {
+            log::warn!("No metadata available, skipping devtools security info.");
+            return;
+        },
+    };
+
+    if let (Some(devtools_chan), Some(security_info), Some(webview_id)) = (
+        context.devtools_chan.clone(),
+        meta.tls_security_info.clone(),
+        request.target_webview_id,
+    ) {
+        let update = NetworkEvent::SecurityInfo(SecurityInfoUpdate {
+            browsing_context_id: webview_id.into(),
+            security_info: Some(security_info),
+        });
+
+        let msg = ChromeToDevtoolsControlMsg::NetworkEvent(request.id.0.to_string(), update);
+
+        let _ = devtools_chan
+            .lock()
             .send(DevtoolsControlMsg::FromChrome(msg));
     }
 }
 
 pub fn send_early_httprequest_to_devtools(request: &Request, context: &FetchContext) {
+    // Do not forward data requests to devtools
+    if request.url().scheme() == "data" {
+        return;
+    }
     if let (Some(devtools_chan), Some(browsing_context_id), Some(pipeline_id)) = (
         context.devtools_chan.as_ref(),
-        request.target_webview_id.map(|id| id.0),
+        request.target_webview_id.map(|id| id.into()),
         request.pipeline_id,
     ) {
         // Build the partial DevtoolsHttpRequest
@@ -517,7 +610,7 @@ pub fn send_early_httprequest_to_devtools(request: &Request, context: &FetchCont
             NetworkEvent::HttpRequest(devtools_request),
         );
 
-        send_request_to_devtools(msg, &devtools_chan.lock().unwrap());
+        send_request_to_devtools(msg, &devtools_chan.lock());
     }
 }
 
@@ -525,12 +618,7 @@ fn auth_from_cache(
     auth_cache: &RwLock<AuthCache>,
     origin: &ImmutableOrigin,
 ) -> Option<Authorization<Basic>> {
-    if let Some(auth_entry) = auth_cache
-        .read()
-        .unwrap()
-        .entries
-        .get(&origin.ascii_serialization())
-    {
+    if let Some(auth_entry) = auth_cache.read().entries.get(&origin.ascii_serialization()) {
         let user_name = &auth_entry.user_name;
         let password = &auth_entry.password;
         Some(Authorization::basic(user_name, password))
@@ -598,7 +686,7 @@ impl BodySink {
 
 #[allow(clippy::too_many_arguments)]
 async fn obtain_response(
-    client: &Client<Connector, crate::connector::BoxedBody>,
+    client: &ServoClient,
     url: &ServoUrl,
     method: &Method,
     request_headers: &mut HeaderMap,
@@ -647,7 +735,8 @@ async fn obtain_response(
 
             let (body_chan, body_port) = ipc::channel().unwrap();
 
-            if let Ok(requester) = chunk_requester.lock() {
+            {
+                let requester = chunk_requester.lock();
                 let _ = requester.send(BodyChunkRequest::Connect(body_chan));
 
                 // https://fetch.spec.whatwg.org/#concept-request-transmit-body
@@ -682,7 +771,7 @@ async fn obtain_response(
                         },
                     };
 
-                    devtools_bytes.lock().unwrap().extend_from_slice(&bytes);
+                    devtools_bytes.lock().extend_from_slice(&bytes);
 
                     // Step 5.1.2.2, transmit chunk over the network,
                     // currently implemented by sending the bytes to the fetch worker.
@@ -690,10 +779,7 @@ async fn obtain_response(
 
                     // Step 5.1.2.3
                     // Request the next chunk.
-                    let _ = chunk_requester2
-                        .lock()
-                        .unwrap()
-                        .send(BodyChunkRequest::Chunk);
+                    let _ = chunk_requester2.lock().send(BodyChunkRequest::Chunk);
                 }),
             );
 
@@ -735,7 +821,6 @@ async fn obtain_response(
         context
             .timing
             .lock()
-            .unwrap()
             .set_attribute(ResourceAttribute::DomainLookupStart);
 
         // TODO(#21261) connect_start: set if a persistent connection is *not* used and the last non-redirected
@@ -744,7 +829,6 @@ async fn obtain_response(
         context
             .timing
             .lock()
-            .unwrap()
             .set_attribute(ResourceAttribute::ConnectStart(connect_start));
 
         // TODO: We currently don't know when the handhhake before the connection is done
@@ -754,7 +838,6 @@ async fn obtain_response(
             context
                 .timing
                 .lock()
-                .unwrap()
                 .set_attribute(ResourceAttribute::SecureConnectionStart);
         }
 
@@ -768,7 +851,6 @@ async fn obtain_response(
         context
             .timing
             .lock()
-            .unwrap()
             .set_attribute(ResourceAttribute::ConnectEnd(connect_end));
 
         let request_id = request_id.map(|v| v.to_owned());
@@ -797,7 +879,7 @@ async fn obtain_response(
                                 closure_url,
                                 method.clone(),
                                 headers,
-                                Some(devtools_bytes.lock().unwrap().clone()),
+                                Some(devtools_bytes.lock().clone()),
                                 pipeline_id,
                                 (connect_end - connect_start).unsigned_abs(),
                                 (send_end - send_start).unsigned_abs(),
@@ -828,6 +910,7 @@ async fn obtain_response(
                 )))
             })
             .map_err(move |error| {
+                warn!("network error: {error:?}");
                 NetworkError::from_hyper_error(
                     &error,
                     override_manager.remove_certificate_failing_verification(host.as_str()),
@@ -921,7 +1004,6 @@ pub async fn http_fetch(
         context
             .timing
             .lock()
-            .unwrap()
             .set_attribute(ResourceAttribute::RequestStart);
 
         let mut fetch_result = http_network_or_cache_fetch(
@@ -1012,7 +1094,6 @@ pub async fn http_fetch(
     context
         .timing
         .lock()
-        .unwrap()
         .set_attribute(ResourceAttribute::RedirectCount(
             fetch_params.request.redirect_count as u16,
         ));
@@ -1038,7 +1119,6 @@ impl Drop for RedirectEndTimer {
 
         resource_fetch_timing_opt.as_ref().map_or((), |t| {
             t.lock()
-                .unwrap()
                 .set_attribute(ResourceAttribute::RedirectEnd(RedirectEndValue::Zero));
         })
     }
@@ -1086,7 +1166,6 @@ pub async fn http_redirect_fetch(
     context
         .timing
         .lock()
-        .unwrap()
         .set_attribute(ResourceAttribute::RedirectStart(
             RedirectStartValue::FetchStart,
         ));
@@ -1094,20 +1173,17 @@ pub async fn http_redirect_fetch(
     context
         .timing
         .lock()
-        .unwrap()
         .set_attribute(ResourceAttribute::FetchStart);
 
     // start_time should equal redirect_start if nonzero; else fetch_start
     context
         .timing
         .lock()
-        .unwrap()
         .set_attribute(ResourceAttribute::StartTime(ResourceTimeValue::FetchStart));
 
     context
         .timing
         .lock()
-        .unwrap()
         .set_attribute(ResourceAttribute::StartTime(
             ResourceTimeValue::RedirectStart,
         )); // updates start_time only if redirect_start is nonzero (implying TAO)
@@ -1224,7 +1300,6 @@ pub async fn http_redirect_fetch(
     context
         .timing
         .lock()
-        .unwrap()
         .set_attribute(ResourceAttribute::RedirectEnd(
             RedirectEndValue::ResponseEnd,
         ));
@@ -1242,9 +1317,6 @@ async fn http_network_or_cache_fetch(
     done_chan: &mut DoneChannel,
     context: &FetchContext,
 ) -> Response {
-    // Step 1. Let request be fetchParams’s request.
-    let request = &mut fetch_params.request;
-
     // Step 2. Let httpFetchParams be null.
     let http_fetch_params: &mut FetchParams;
     let mut fetch_params_copy: FetchParams;
@@ -1258,11 +1330,12 @@ async fn http_network_or_cache_fetch(
     let mut revalidating_flag = false;
 
     // TODO(#33616): Step 8. Run these steps, but abort when fetchParams is canceled:
-    // Step 8.1: If request’s window is "no-window" and request’s redirect mode is "error", then set
-    // httpFetchParams to fetchParams and httpRequest to request.
-    let request_has_no_window = request.window == RequestWindow::NoWindow;
-
-    let http_request = if request_has_no_window && request.redirect_mode == RedirectMode::Error {
+    // Step 8.1. If request’s traversable for user prompts is "no-traversable"
+    // and request’s redirect mode is "error", then set httpFetchParams to fetchParams and httpRequest to request.
+    let http_request = if fetch_params.request.traversable_for_user_prompts ==
+        TraversableForUserPrompts::NoTraversable &&
+        fetch_params.request.redirect_mode == RedirectMode::Error
+    {
         http_fetch_params = fetch_params;
         &mut http_fetch_params.request
     }
@@ -1335,7 +1408,7 @@ async fn http_network_or_cache_fetch(
         Referrer::Client(ref http_request_referrer) => {
             // Step 8.11.1: Let referrerValue be httpRequest’s referrer, serialized and isomorphic
             // encoded.
-            if let Ok(referer) = http_request_referrer.to_string().parse::<Referer>() {
+            if let Ok(referer) = http_request_referrer.as_str().parse::<Referer>() {
                 // Step 8.11.2: Append (`Referer`, referrerValue) to httpRequest’s header list.
                 http_request.headers.typed_insert(referer);
             } else {
@@ -1473,226 +1546,100 @@ async fn http_network_or_cache_fetch(
     }
 
     // TODO(#33616) Step 8.22 If there’s a proxy-authentication entry, use it as appropriate.
+    let should_wait = {
+        // Enter critical section on cache entry.
+        let mut cache_guard = block_for_cache_ready(
+            context,
+            http_request,
+            done_chan,
+            &mut revalidating_flag,
+            &mut response,
+        )
+        .await;
 
-    // If the cache is not ready to construct a response, wait.
-    //
-    // The cache is not ready if a previous fetch checked the cache, found nothing,
-    // and moved on to a network fetch, and hasn't updated the cache yet with a pending resource.
-    //
-    // Note that this is a different workflow from the one involving `wait_for_cached_response`.
-    // That one happens when a fetch gets a cache hit, and the resource is pending completion from the network.
-    {
-        let (lock, cvar) = {
-            let entry_key = CacheKey::new(http_request);
-            let mut state_map = context.state.http_cache_state.lock().unwrap();
-            &*state_map
-                .entry(entry_key)
-                .or_insert_with(|| {
-                    Arc::new((
-                        Mutex::new(HttpCacheEntryState::ReadyToConstruct),
-                        Condvar::new(),
-                    ))
-                })
-                .clone()
-        };
+        // TODO(#33616): Step 9. If aborted, then return the appropriate network error for fetchParams.
 
-        // Start of critical section on http-cache state.
-        let mut state = lock.lock().unwrap();
-        while let HttpCacheEntryState::PendingStore(_) = *state {
-            let (current_state, time_out) = cvar
-                .wait_timeout(state, Duration::from_millis(500))
-                .unwrap();
-            state = current_state;
-            if time_out.timed_out() {
-                // After a timeout, ignore the pending store.
-                break;
+        // Step 10. If response is null, then:
+        if response.is_none() {
+            // Step 10.1 If httpRequest’s cache mode is "only-if-cached", then return a network error.
+            if http_request.cache_mode == CacheMode::OnlyIfCached {
+                // Exit critical section of cache entry.
+                return Response::network_error(NetworkError::Internal(
+                    "Couldn't find response in cache".into(),
+                ));
             }
-        }
 
-        // TODO(#33616): Step 8.23 Set httpCache to the result of determining the
-        // HTTP cache partition, given httpRequest.
-        if let Ok(http_cache) = context.state.http_cache.read() {
-            // Step 8.25.1 Set storedResponse to the result of selecting a response from the httpCache,
-            //              possibly needing validation, as per the "Constructing Responses from Caches"
-            //              chapter of HTTP Caching, if any.
-            let stored_response = http_cache.construct_response(http_request, done_chan);
+            // Step 10.2 Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams,
+            // includeCredentials, and isNewConnectionFetch.
+            drop(cache_guard);
+            let forward_response =
+                http_network_fetch(http_fetch_params, include_credentials, done_chan, context)
+                    .await;
 
-            // Step 8.25.2 If storedResponse is non-null, then:
-            if let Some(response_from_cache) = stored_response {
-                let response_headers = response_from_cache.response.headers.clone();
-                // Substep 1, 2, 3, 4
-                let (cached_response, needs_revalidation) =
-                    match (http_request.cache_mode, &http_request.mode) {
-                        (CacheMode::ForceCache, _) => (Some(response_from_cache.response), false),
-                        (CacheMode::OnlyIfCached, &RequestMode::SameOrigin) => {
-                            (Some(response_from_cache.response), false)
-                        },
-                        (CacheMode::OnlyIfCached, _) |
-                        (CacheMode::NoStore, _) |
-                        (CacheMode::Reload, _) => (None, false),
-                        (_, _) => (
-                            Some(response_from_cache.response),
-                            response_from_cache.needs_validation,
-                        ),
-                    };
-
-                if needs_revalidation {
-                    revalidating_flag = true;
-                    // Substep 5
-                    if let Some(http_date) = response_headers.typed_get::<LastModified>() {
-                        let http_date: SystemTime = http_date.into();
-                        http_request
-                            .headers
-                            .typed_insert(IfModifiedSince::from(http_date));
-                    }
-                    if let Some(entity_tag) = response_headers.get(header::ETAG) {
-                        http_request
-                            .headers
-                            .insert(header::IF_NONE_MATCH, entity_tag.clone());
-                    }
-                } else {
-                    // Substep 6
-                    response = cached_response;
+            let http_request = &mut http_fetch_params.request;
+            let request_key = CacheKey::new(http_request);
+            cache_guard = context
+                .state
+                .http_cache
+                .get_or_guard(request_key.clone())
+                .await;
+            // Step 10.3 If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399,
+            // inclusive, invalidate appropriate stored responses in httpCache, as per the
+            // "Invalidating Stored Responses" chapter of HTTP Caching, and set storedResponse to null.
+            if forward_response.status.in_range(200..=399) && !http_request.method.is_safe() {
+                if let Some(guard) = cache_guard.try_as_mut() {
+                    invalidate(http_request, &forward_response, guard).await;
                 }
-                if response.is_none() {
-                    // Ensure the done chan is not set if we're not using the cached response,
-                    // as the cache might have set it to Some if it constructed a pending response.
-                    *done_chan = None;
-
-                    // Update the cache state, incrementing the pending store count,
-                    // or starting the count.
-                    if let HttpCacheEntryState::PendingStore(i) = *state {
-                        let new = i + 1;
-                        *state = HttpCacheEntryState::PendingStore(new);
-                    } else {
-                        *state = HttpCacheEntryState::PendingStore(1);
-                    }
-                }
+                context
+                    .state
+                    .http_cache
+                    .invalidate_related_urls(http_request, &forward_response, &request_key)
+                    .await;
             }
-        }
-        // Notify the next thread waiting in line, if there is any.
-        if *state == HttpCacheEntryState::ReadyToConstruct {
-            cvar.notify_one();
-        }
-        // End of critical section on http-cache state.
-    }
 
-    // Decrement the number of pending stores,
-    // and set the state to ready to construct,
-    // if no stores are pending.
-    fn update_http_cache_state(context: &FetchContext, http_request: &Request) {
-        let (lock, cvar) = {
-            let entry_key = CacheKey::new(http_request);
-            let mut state_map = context.state.http_cache_state.lock().unwrap();
-            &*state_map
-                .get_mut(&entry_key)
-                .expect("Entry in http-cache state to have been previously inserted")
-                .clone()
-        };
-        let mut state = lock.lock().unwrap();
-        if let HttpCacheEntryState::PendingStore(i) = *state {
-            let new = i - 1;
-            if new == 0 {
-                *state = HttpCacheEntryState::ReadyToConstruct;
-                // Notify the next thread waiting in line, if there is any.
-                cvar.notify_one();
-            } else {
-                *state = HttpCacheEntryState::PendingStore(new);
-            }
-        }
-    }
-
-    async fn wait_for_cached_response(
-        done_chan: &mut DoneChannel,
-        response: &mut Option<Response>,
-    ) {
-        if let Some(ref mut ch) = *done_chan {
-            // The cache constructed a response with a body of ResponseBody::Receiving.
-            // We wait for the response in the cache to "finish",
-            // with a body of either Done or Cancelled.
-            assert!(response.is_some());
-
-            loop {
-                match ch.1.recv().await {
-                    Some(Data::Payload(_)) => {},
-                    Some(Data::Done) => break, // Return the full response as if it was initially cached as such.
-                    Some(Data::Cancelled) => {
-                        // The response was cancelled while the fetch was ongoing.
-                        // Set response to None, which will trigger a network fetch below.
-                        *response = None;
-                        break;
-                    },
-                    _ => panic!("HTTP cache should always send Done or Cancelled"),
-                }
-            }
-        }
-        // Set done_chan back to None, it's cache-related usefulness ends here.
-        *done_chan = None;
-    }
-
-    wait_for_cached_response(done_chan, &mut response).await;
-
-    // TODO(#33616): Step 9. If aborted, then return the appropriate network error for fetchParams.
-
-    // Step 10. If response is null, then:
-    if response.is_none() {
-        // Step 10.1 If httpRequest’s cache mode is "only-if-cached", then return a network error.
-        if http_request.cache_mode == CacheMode::OnlyIfCached {
-            // The cache will not be updated,
-            // set its state to ready to construct.
-            update_http_cache_state(context, http_request);
-            return Response::network_error(NetworkError::Internal(
-                "Couldn't find response in cache".into(),
-            ));
-        }
-
-        // Step 10.2 Let forwardResponse be the result of running HTTP-network fetch given httpFetchParams,
-        // includeCredentials, and isNewConnectionFetch.
-        let forward_response =
-            http_network_fetch(http_fetch_params, include_credentials, done_chan, context).await;
-
-        let http_request = &mut http_fetch_params.request;
-        // Step 10.3 If httpRequest’s method is unsafe and forwardResponse’s status is in the range 200 to 399,
-        // inclusive, invalidate appropriate stored responses in httpCache, as per the
-        // "Invalidating Stored Responses" chapter of HTTP Caching, and set storedResponse to null.
-        if forward_response.status.in_range(200..=399) && !http_request.method.is_safe() {
-            if let Ok(mut http_cache) = context.state.http_cache.write() {
-                http_cache.invalidate(http_request, &forward_response);
-            }
-        }
-
-        // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
-        if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
-            if let Ok(mut http_cache) = context.state.http_cache.write() {
+            // Step 10.4 If the revalidatingFlag is set and forwardResponse’s status is 304, then:
+            if revalidating_flag && forward_response.status == StatusCode::NOT_MODIFIED {
                 // Ensure done_chan is None,
                 // since the network response will be replaced by the revalidated stored one.
                 *done_chan = None;
-                response = http_cache.refresh(http_request, forward_response.clone(), done_chan);
-            }
-            wait_for_cached_response(done_chan, &mut response).await;
-        }
+                if let Some(guard) = cache_guard.try_as_mut() {
+                    response =
+                        refresh(http_request, forward_response.clone(), done_chan, guard).await;
+                }
 
-        // Step 10.5 If response is null, then:
-        if response.is_none() {
-            // Step 10.5.1 Set response to forwardResponse.
-            let forward_response = response.insert(forward_response);
-
-            // Per https://httpwg.org/specs/rfc9111.html#response.cacheability we must not cache responses
-            // if the No-Store directive is present
-            if http_request.cache_mode != CacheMode::NoStore {
-                // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
-                //             "Storing Responses in Caches" chapter of HTTP Caching.
-                if let Ok(mut http_cache) = context.state.http_cache.write() {
-                    http_cache.store(http_request, forward_response);
+                if let Some(response) = &mut response {
+                    response.cache_state = CacheState::Validated;
                 }
             }
+
+            // Step 10.5 If response is null, then:
+            if response.is_none() {
+                // Step 10.5.1 Set response to forwardResponse.
+                let forward_response = response.insert(forward_response);
+
+                // Per https://httpwg.org/specs/rfc9111.html#response.cacheability we must not cache responses
+                // if the No-Store directive is present
+                if http_request.cache_mode != CacheMode::NoStore {
+                    // Step 10.5.2 Store httpRequest and forwardResponse in httpCache, as per the
+                    //             "Storing Responses in Caches" chapter of HTTP Caching.
+                    cache_guard.insert(http_request, forward_response).await;
+                }
+            }
+            false
+        } else {
+            true
         }
+    }; // Exit Critical Section on cache entry
+
+    if should_wait {
+        // If the cache constructed a response, and that is still receiving from the network,
+        // we must wait for it to finish in case it is still receiving from the network.
+        // Note: this means only the fetch from which the original network response originated
+        // will be able to stream it; all others receive a cached response in one chunk.
+        wait_for_inflight_requests(done_chan, &mut response).await;
     }
 
     let http_request = &mut http_fetch_params.request;
-    // The cache has been updated, set its state to ready to construct.
-    update_http_cache_state(context, http_request);
-
     let mut response = response.unwrap();
 
     // FIXME: The spec doesn't tell us to do this *here*, but if we don't do it then
@@ -1718,8 +1665,12 @@ async fn http_network_or_cache_fetch(
     // Step 14. If response’s status is 401, httpRequest’s response tainting is not "cors",
     // includeCredentials is true, and request’s window is an environment settings object, then:
     // TODO(#33616): Figure out what to do with request window objects
-    if let (Some(StatusCode::UNAUTHORIZED), false, true) =
-        (response.status.try_code(), cors_flag, include_credentials)
+    // NOTE: Requiring a WWW-Authenticate header here is ad-hoc, but seems to match what other browsers are
+    // doing. See Step 14.1.
+    if response.status.try_code() == Some(StatusCode::UNAUTHORIZED) &&
+        !cors_flag &&
+        include_credentials &&
+        response.headers.contains_key(WWW_AUTHENTICATE)
     {
         // TODO: Step 14.1 Spec says requires testing on multiple WWW-Authenticate headers
 
@@ -1771,9 +1722,9 @@ async fn http_network_or_cache_fetch(
     // Step 15. If response’s status is 407, then:
     if response.status == StatusCode::PROXY_AUTHENTICATION_REQUIRED {
         let request = &mut fetch_params.request;
-        // Step 15.1 If request’s window is "no-window", then return a network error.
+        // Step 15.1 If request’s traversable for user prompts is "no-traversable", then return a network error.
 
-        if request_has_no_window {
+        if request.traversable_for_user_prompts == TraversableForUserPrompts::NoTraversable {
             return Response::network_error(NetworkError::Internal(
                 "Can't find Window object".into(),
             ));
@@ -1796,7 +1747,7 @@ async fn http_network_or_cache_fetch(
             password: credentials.password,
         };
         {
-            let mut auth_cache = context.state.auth_cache.write().unwrap();
+            let mut auth_cache = context.state.auth_cache.write();
             let key = request.current_url().origin().ascii_serialization();
             auth_cache.entries.insert(key, entry);
         }
@@ -1829,6 +1780,110 @@ async fn http_network_or_cache_fetch(
 
     // Step 18. Return response.
     response
+}
+/// If the cache is not ready to construct a response, wait.
+///
+/// The cache is not ready if a previous fetch checked the cache, found nothing,
+/// and moved on to a network fetch, and hasn't updated the cache yet with a pending resource.
+///
+/// Note that this is a different workflow from the one involving `wait_for_cached_response`.
+/// That one happens when a fetch gets a cache hit, and the resource is pending completion from the network.
+///
+async fn block_for_cache_ready<'a>(
+    context: &'a FetchContext,
+    http_request: &mut Request,
+    done_chan: &mut DoneChannel,
+    revalidating_flag: &mut bool,
+    response: &mut Option<Response>,
+) -> CachedResourcesOrGuard<'a> {
+    let entry_key = CacheKey::new(http_request);
+    let guard_result = context.state.http_cache.get_or_guard(entry_key).await;
+
+    match guard_result {
+        CachedResourcesOrGuard::Guard(_) => {
+            *done_chan = None;
+        },
+        CachedResourcesOrGuard::Value(ref cached_resources) => {
+            // TODO(#33616): Step 8.23 Set httpCache to the result of determining the
+            // HTTP cache partition, given httpRequest.
+            // Step 8.25.1 Set storedResponse to the result of selecting a response from the httpCache,
+            //              possibly needing validation, as per the "Constructing Responses from Caches"
+            //              chapter of HTTP Caching, if any.
+            let stored_response = construct_response(http_request, done_chan, cached_resources);
+            // Step 8.25.2 If storedResponse is non-null, then:
+            if let Some(response_from_cache) = stored_response {
+                let response_headers = response_from_cache.response.headers.clone();
+                // Substep 1, 2, 3, 4
+                let (cached_response, needs_revalidation) =
+                    match (http_request.cache_mode, &http_request.mode) {
+                        (CacheMode::ForceCache, _) => (Some(response_from_cache.response), false),
+                        (CacheMode::OnlyIfCached, &RequestMode::SameOrigin) => {
+                            (Some(response_from_cache.response), false)
+                        },
+                        (CacheMode::OnlyIfCached, _) |
+                        (CacheMode::NoStore, _) |
+                        (CacheMode::Reload, _) => (None, false),
+                        (_, _) => (
+                            Some(response_from_cache.response),
+                            response_from_cache.needs_validation,
+                        ),
+                    };
+
+                if needs_revalidation {
+                    *revalidating_flag = true;
+                    // Substep 5
+                    if let Some(http_date) = response_headers.typed_get::<LastModified>() {
+                        let http_date: SystemTime = http_date.into();
+                        http_request
+                            .headers
+                            .typed_insert(IfModifiedSince::from(http_date));
+                    }
+                    if let Some(entity_tag) = response_headers.get(header::ETAG) {
+                        http_request
+                            .headers
+                            .insert(header::IF_NONE_MATCH, entity_tag.clone());
+                    }
+                } else {
+                    // Substep 6
+                    *response = cached_response;
+                    if let Some(response) = response {
+                        response.cache_state = CacheState::Local;
+                    }
+                }
+                if response.is_none() {
+                    // Ensure the done chan is not set if we're not using the cached response,
+                    // as the cache might have set it to Some if it constructed a pending response.
+                    *done_chan = None;
+                }
+            }
+        },
+    }
+    guard_result
+}
+
+/// Wait for a cached response from channel.
+/// Happens when a fetch gets a cache hit, and the resource is pending completion from the network.
+async fn wait_for_inflight_requests(done_chan: &mut DoneChannel, response: &mut Option<Response>) {
+    if let Some(ref mut ch) = *done_chan {
+        // The cache constructed a response with a body of ResponseBody::Receiving.
+        // We wait for the response in the cache to "finish",
+        // with a body of either Done or Cancelled.
+        assert!(response.is_some());
+
+        loop {
+            match ch.1.recv().await {
+                Some(Data::Payload(_)) => {},
+                Some(Data::Done) => break, // Return the full response as if it was initially cached as such.
+                Some(Data::Cancelled) => {
+                    // The response was cancelled while the fetch was ongoing.
+                    break;
+                },
+                _ => panic!("HTTP cache should always send Done or Cancelled"),
+            }
+        }
+    }
+    // Set done_chan back to None, it's cache-related usefulness ends here.
+    *done_chan = None;
 }
 
 /// <https://fetch.spec.whatwg.org/#cross-origin-resource-policy-check>
@@ -1908,9 +1963,7 @@ impl Drop for ResponseEndTimer {
         let ResponseEndTimer(resource_fetch_timing_opt) = self;
 
         resource_fetch_timing_opt.as_ref().map_or((), |t| {
-            t.lock()
-                .unwrap()
-                .set_attribute(ResourceAttribute::ResponseEnd);
+            t.lock().set_attribute(ResourceAttribute::ResponseEnd);
         })
     }
 }
@@ -1964,32 +2017,81 @@ async fn http_network_fetch(
         let _ = fetch_terminated_sender.send(false);
     }
 
-    let browsing_context_id = request.target_webview_id.map(|id| id.0);
+    let browsing_context_id = request.target_webview_id.map(Into::into);
 
-    let response_future = obtain_response(
-        &context.state.client,
-        &url,
-        &request.method,
-        &mut request.headers,
-        body,
-        request
-            .body
-            .as_ref()
-            .map(|body| body.source_is_null())
-            .unwrap_or(false),
-        &request.pipeline_id,
-        Some(&request_id),
-        request.destination,
-        is_xhr,
-        context,
-        fetch_terminated_sender,
-        browsing_context_id,
-    );
+    let (res, msg) = match &request.mode {
+        RequestMode::WebSocket {
+            protocols,
+            original_url: _,
+        } => {
+            // https://fetch.spec.whatwg.org/#websocket-opening-handshake
 
-    // This will only get the headers, the body is read later
-    let (res, msg) = match response_future.await {
-        Ok(wrapped_response) => wrapped_response,
-        Err(error) => return Response::network_error(error),
+            let (resource_event_sender, dom_action_receiver) = {
+                let mut websocket_chan = context.websocket_chan.as_ref().unwrap().lock();
+                (
+                    websocket_chan.sender.clone(),
+                    websocket_chan.receiver.take().unwrap(),
+                )
+            };
+
+            let mut tls_config = create_tls_config(
+                context.ca_certificates.clone(),
+                context.ignore_certificate_errors,
+                context.state.override_manager.clone(),
+            );
+            tls_config.alpn_protocols = vec!["http/1.1".to_string().into()];
+
+            let response = match start_websocket(
+                context.state.clone(),
+                resource_event_sender,
+                protocols,
+                request,
+                tls_config,
+                dom_action_receiver,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(e) => {
+                    return Response::network_internal_error(e.to_string());
+                },
+            };
+
+            let response = response.map(|r| match r {
+                Some(body) => Full::from(body).map_err(|_| unreachable!()).boxed(),
+                None => http_body_util::Empty::new()
+                    .map_err(|_| unreachable!())
+                    .boxed(),
+            });
+            (Decoder::detect(response, url.is_secure_scheme()), None)
+        },
+        _ => {
+            let response_future = obtain_response(
+                &context.state.client,
+                &url,
+                &request.method,
+                &mut request.headers,
+                body,
+                request
+                    .body
+                    .as_ref()
+                    .is_some_and(|body| body.source_is_null()),
+                &request.pipeline_id,
+                Some(&request_id),
+                request.destination,
+                is_xhr,
+                context,
+                fetch_terminated_sender,
+                browsing_context_id,
+            );
+
+            // This will only get the headers, the body is read later
+            let (res, msg) = match response_future.await {
+                Ok(wrapped_response) => wrapped_response,
+                Err(error) => return Response::network_error(error),
+            };
+            (res, msg)
+        },
     };
 
     if log_enabled!(log::Level::Info) {
@@ -2036,11 +2138,25 @@ async fn http_network_fetch(
     });
 
     if !(is_same_origin || req_origin_in_timing_allow || wildcard_present) {
-        context.timing.lock().unwrap().mark_timing_check_failed();
+        context.timing.lock().mark_timing_check_failed();
     }
 
-    let timing = context.timing.lock().unwrap().clone();
+    let timing = context.timing.lock().clone();
     let mut response = Response::new(url.clone(), timing);
+
+    if let Some(handshake_info) = res.extensions().get::<TlsHandshakeInfo>() {
+        let mut hsts_enabled = url
+            .host_str()
+            .is_some_and(|host| context.state.hsts_list.read().is_host_secure(host));
+
+        if url.scheme() == "https" {
+            if let Some(sts) = res.headers().typed_get::<StrictTransportSecurity>() {
+                // max-age > 0 enables HSTS, max-age = 0 disables it (RFC 6797 Section 6.1.1)
+                hsts_enabled = sts.max_age().as_secs() > 0;
+            }
+        }
+        response.tls_security_info = Some(build_tls_security_info(handshake_info, hsts_enabled));
+    }
 
     let status_text = res
         .extensions()
@@ -2068,11 +2184,11 @@ async fn http_network_fetch(
         return Response::network_error(NetworkError::Internal("Fetch aborted".into()));
     }
 
-    *res_body.lock().unwrap() = ResponseBody::Receiving(vec![]);
+    *res_body.lock() = ResponseBody::Receiving(vec![]);
     let res_body2 = res_body.clone();
 
     if let Some(ref sender) = devtools_sender {
-        let sender = sender.lock().unwrap();
+        let sender = sender.lock();
         if let Some(m) = msg {
             send_request_to_devtools(m, &sender);
         }
@@ -2097,11 +2213,11 @@ async fn http_network_fetch(
             })
             .try_fold(res_body, move |res_body, chunk| {
                 if cancellation_listener.cancelled() {
-                    *res_body.lock().unwrap() = ResponseBody::Done(vec![]);
+                    *res_body.lock() = ResponseBody::Done(vec![]);
                     let _ = done_sender.send(Data::Cancelled);
                     return future::ready(Err(()));
                 }
-                if let ResponseBody::Receiving(ref mut body) = *res_body.lock().unwrap() {
+                if let ResponseBody::Receiving(ref mut body) = *res_body.lock() {
                     let bytes = chunk;
                     body.extend_from_slice(&bytes);
                     let _ = done_sender.send(Data::Payload(bytes.to_vec()));
@@ -2110,7 +2226,7 @@ async fn http_network_fetch(
             })
             .and_then(move |res_body| {
                 debug!("successfully finished response for {:?}", url1);
-                let mut body = res_body.lock().unwrap();
+                let mut body = res_body.lock();
                 let completed_body = match *body {
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
@@ -2121,19 +2237,19 @@ async fn http_network_fetch(
                     Some(headers),
                     status,
                     Some(devtools_response_body),
+                    CacheState::None,
                     &devtools_request,
                     devtools_chan,
                 );
                 timing_ptr2
                     .lock()
-                    .unwrap()
                     .set_attribute(ResourceAttribute::ResponseEnd);
                 let _ = done_sender2.send(Data::Done);
                 future::ready(Ok(()))
             })
             .map_err(move |_| {
                 debug!("finished response for {:?}", url2);
-                let mut body = res_body2.lock().unwrap();
+                let mut body = res_body2.lock();
                 let completed_body = match *body {
                     ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                     _ => vec![],
@@ -2141,7 +2257,6 @@ async fn http_network_fetch(
                 *body = ResponseBody::Done(completed_body);
                 timing_ptr3
                     .lock()
-                    .unwrap()
                     .set_attribute(ResourceAttribute::ResponseEnd);
                 let _ = done_sender3.send(Data::Done);
             }),
@@ -2176,7 +2291,6 @@ async fn http_network_fetch(
         .state
         .hsts_list
         .write()
-        .unwrap()
         .update_hsts_list_from_response(&url, &response.headers);
 
     // TODO these steps
@@ -2203,7 +2317,10 @@ async fn cors_preflight_fetch(
     cache: &mut CorsCache,
     context: &FetchContext,
 ) -> Response {
-    // Step 1
+    // Step 1. Let preflight be a new request whose method is `OPTIONS`, URL list is a clone
+    // of request’s URL list, initiator is request’s initiator, destination is request’s destination,
+    // origin is request’s origin, referrer is request’s referrer, referrer policy is request’s
+    // referrer policy, mode is "cors", and response tainting is "cors".
     let mut preflight = RequestBuilder::new(
         request.target_webview_id,
         request.current_url(),
@@ -2222,21 +2339,27 @@ async fn cors_preflight_fetch(
     .referrer_policy(request.referrer_policy)
     .mode(RequestMode::CorsMode)
     .response_tainting(ResponseTainting::CorsTainting)
+    .policy_container(match &request.policy_container {
+        RequestPolicyContainer::Client => {
+            unreachable!("We should have a policy container for request in cors_preflight_fetch")
+        },
+        RequestPolicyContainer::PolicyContainer(policy_container) => policy_container.clone(),
+    })
     .build();
 
-    // Step 2
+    // Step 2. Append (`Accept`, `*/*`) to preflight’s header list.
     preflight
         .headers
         .insert(ACCEPT, HeaderValue::from_static("*/*"));
 
-    // Step 3
+    // Step 3. Append (`Access-Control-Request-Method`, request’s method) to preflight’s header list.
     preflight
         .headers
         .typed_insert::<AccessControlRequestMethod>(AccessControlRequestMethod::from(
             request.method.clone(),
         ));
 
-    // Step 4
+    // Step 4. Let headers be the CORS-unsafe request-header names with request’s header list.
     let headers = get_cors_unsafe_header_names(&request.headers);
 
     // Step 5 If headers is not empty, then:
@@ -2250,20 +2373,23 @@ async fn cors_preflight_fetch(
         );
     }
 
-    // Step 6
+    // Step 6. Let response be the result of running HTTP-network-or-cache fetch given a
+    // new fetch params whose request is preflight.
     let mut fetch_params = FetchParams::new(preflight);
     let response =
         http_network_or_cache_fetch(&mut fetch_params, false, false, &mut None, context).await;
-    // Step 7
+
+    // Step 7. If a CORS check for request and response returns success and response’s status is an ok status, then:
     if cors_check(request, &response).is_ok() && response.status.code().is_success() {
-        // Substep 1
+        // Step 7.1 Let methods be the result of extracting header list values given
+        // `Access-Control-Allow-Methods` and response’s header list.
         let mut methods = if response
             .headers
             .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS)
         {
             match response.headers.typed_get::<AccessControlAllowMethods>() {
                 Some(methods) => methods.iter().collect(),
-                // Substep 3
+                // Step 7.3 If either methods or headerNames is failure, return a network error.
                 None => {
                     return Response::network_error(NetworkError::Internal(
                         "CORS ACAM check failed".into(),
@@ -2274,14 +2400,15 @@ async fn cors_preflight_fetch(
             vec![]
         };
 
-        // Substep 2
+        // Step 7.2 Let headerNames be the result of extracting header list values given
+        // `Access-Control-Allow-Headers` and response’s header list.
         let header_names = if response
             .headers
             .contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS)
         {
             match response.headers.typed_get::<AccessControlAllowHeaders>() {
                 Some(names) => names.iter().collect(),
-                // Substep 3
+                // Step 7.3 If either methods or headerNames is failure, return a network error.
                 None => {
                     return Response::network_error(NetworkError::Internal(
                         "CORS ACAH check failed".into(),
@@ -2297,18 +2424,20 @@ async fn cors_preflight_fetch(
             methods, request.method
         );
 
-        // Substep 4
+        // Step 7.4 If methods is null and request’s use-CORS-preflight flag is set,
+        // then set methods to a new list containing request’s method.
         if methods.is_empty() && request.use_cors_preflight {
             methods = vec![request.method.clone()];
         }
 
-        // Substep 5
+        // Step 7.5 If request’s method is not in methods, request’s method is not a CORS-safelisted method,
+        // and request’s credentials mode is "include" or methods does not contain `*`, then return a network error.
         if methods
             .iter()
-            .all(|m| *m.as_str() != *request.method.as_ref()) &&
+            .all(|method| *method.as_str() != *request.method.as_ref()) &&
             !is_cors_safelisted_method(&request.method) &&
             (request.credentials_mode == CredentialsMode::Include ||
-                methods.iter().all(|m| m.as_ref() != "*"))
+                methods.iter().all(|method| method.as_ref() != "*"))
         {
             return Response::network_error(NetworkError::Internal(
                 "CORS method check failed".into(),
@@ -2320,21 +2449,25 @@ async fn cors_preflight_fetch(
             header_names, request.headers
         );
 
-        // Substep 6
+        // Step 7.6 If one of request’s header list’s names is a CORS non-wildcard request-header name
+        // and is not a byte-case-insensitive match for an item in headerNames, then return a network error.
         if request.headers.iter().any(|(name, _)| {
             is_cors_non_wildcard_request_header_name(name) &&
-                header_names.iter().all(|hn| hn != name)
+                header_names.iter().all(|header_name| header_name != name)
         }) {
             return Response::network_error(NetworkError::Internal(
                 "CORS authorization check failed".into(),
             ));
         }
 
-        // Substep 7
+        // Step 7.7 For each unsafeName of the CORS-unsafe request-header names with request’s header list,
+        // if unsafeName is not a byte-case-insensitive match for an item in headerNames and request’s credentials
+        // mode is "include" or headerNames does not contain `*`, return a network error.
         let unsafe_names = get_cors_unsafe_header_names(&request.headers);
-        #[allow(clippy::mutable_key_type)] // We don't mutate the items in the set
         let header_names_set: HashSet<&HeaderName> = HashSet::from_iter(header_names.iter());
-        let header_names_contains_star = header_names.iter().any(|hn| hn.as_str() == "*");
+        let header_names_contains_star = header_names
+            .iter()
+            .any(|header_name| header_name.as_str() == "*");
         for unsafe_name in unsafe_names.iter() {
             if !header_names_set.contains(unsafe_name) &&
                 (request.credentials_mode == CredentialsMode::Include ||
@@ -2346,78 +2479,84 @@ async fn cors_preflight_fetch(
             }
         }
 
-        // Substep 8, 9
-        let max_age: Duration = response
+        // Step 7.8 Let max-age be the result of extracting header list values given
+        // `Access-Control-Max-Age` and response’s header list.
+        let max_age: Option<Duration> = response
             .headers
             .typed_get::<AccessControlMaxAge>()
-            .map(|acma| acma.into())
-            .unwrap_or(Duration::from_secs(5));
-        // Substep 10
+            .map(|acma| acma.into());
+
+        // Step 7.9 If max-age is failure or null, then set max-age to 5.
+        let max_age = max_age.unwrap_or(Duration::from_secs(5));
+
+        // Step 7.10 If max-age is greater than an imposed limit on max-age, then set max-age to the imposed limit.
         // TODO: Need to define what an imposed limit on max-age is
 
-        // Substep 11 ignored, we do have a CORS cache
+        // Step 7.11 If the user agent does not provide for a cache, then return response.
+        // NOTE: This can be ignored, we do have a CORS cache
 
-        // Substep 12, 13
+        // Step 7.12 For each method in methods for which there is a method cache entry match using request,
+        // set matching entry’s max-age to max-age.
+        // Step 7.13 For each method in methods for which there is no method cache entry match using request,
+        // create a new cache entry with request, max-age, method, and null.
         for method in &methods {
             cache.match_method_and_update(request, method.clone(), max_age);
         }
 
-        // Substep 14, 15
+        // Step 7.14 For each headerName in headerNames for which there is a header-name cache entry match using request,
+        // set matching entry’s max-age to max-age.
+        // Step 7.15 For each headerName in headerNames for which there is no header-name cache entry match using request,
+        // create a new cache entry with request, max-age, null, and headerName.
         for header_name in &header_names {
             cache.match_header_and_update(request, header_name, max_age);
         }
 
-        // Substep 16
+        // Step 7.16 Return response.
         return response;
     }
 
-    // Step 8
+    // Step 8. Otherwise, return a network error.
     Response::network_error(NetworkError::Internal("CORS check failed".into()))
 }
 
 /// [CORS check](https://fetch.spec.whatwg.org#concept-cors-check)
 fn cors_check(request: &Request, response: &Response) -> Result<(), ()> {
-    // Step 1
-    let origin = response.headers.typed_get::<AccessControlAllowOrigin>();
+    // Step 1. Let origin be the result of getting `Access-Control-Allow-Origin` from response’s header list.
+    let Some(origins) =
+        get_value_from_header_list(ACCESS_CONTROL_ALLOW_ORIGIN.as_str(), &response.headers)
+    else {
+        // Step 2. If origin is null, then return failure.
+        return Err(());
+    };
+    let origin = origins.into_iter().map(char::from).collect::<String>();
 
-    // Step 2
-    let origin = origin.ok_or(())?;
-
-    // Step 3
-    if request.credentials_mode != CredentialsMode::Include &&
-        origin == AccessControlAllowOrigin::ANY
-    {
+    // Step 3. If request’s credentials mode is not "include" and origin is `*`, then return success.
+    if request.credentials_mode != CredentialsMode::Include && origin == "*" {
         return Ok(());
     }
 
-    // Step 4
-    let origin = match origin.origin() {
-        Some(origin) => origin,
-        // if it's Any or Null at this point, there's nothing to do but return Err(())
-        None => return Err(()),
-    };
-
+    // Step 4. If the result of byte-serializing a request origin with request is not origin, then return failure.
     match request.origin {
-        Origin::Origin(ref o) if o.ascii_serialization() == origin.to_string().trim() => {},
+        Origin::Origin(ref o) if *o.ascii_serialization() == *origin => {},
         _ => return Err(()),
     }
 
-    // Step 5
+    // Step 5. If request’s credentials mode is not "include", then return success.
     if request.credentials_mode != CredentialsMode::Include {
         return Ok(());
     }
 
-    // Step 6
+    // Step 6. Let credentials be the result of getting `Access-Control-Allow-Credentials` from response’s header list.
     let credentials = response
         .headers
         .typed_get::<AccessControlAllowCredentials>();
 
-    // Step 7
+    // Step 7. If credentials is `true`, then return success.
     if credentials.is_some() {
         return Ok(());
     }
 
-    // Step 8
+    // Step 8. Return failure.
     Err(())
 }
 

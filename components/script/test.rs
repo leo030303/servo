@@ -10,19 +10,19 @@ pub use crate::dom::bindings::str::{ByteString, DOMString};
 // pub use crate::dom::node::Node;
 
 pub mod area {
-    pub use crate::dom::htmlareaelement::{Area, Shape};
+    pub use crate::dom::html::htmlareaelement::{Area, Shape};
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub mod size_of {
     use std::mem::size_of;
 
     use crate::dom::characterdata::CharacterData;
     use crate::dom::element::Element;
     use crate::dom::eventtarget::EventTarget;
-    use crate::dom::htmldivelement::HTMLDivElement;
-    use crate::dom::htmlelement::HTMLElement;
-    use crate::dom::htmlspanelement::HTMLSpanElement;
+    use crate::dom::html::htmldivelement::HTMLDivElement;
+    use crate::dom::html::htmlelement::HTMLElement;
+    use crate::dom::html::htmlspanelement::HTMLSpanElement;
     use crate::dom::node::Node;
     use crate::dom::text::Text;
 
@@ -60,7 +60,9 @@ pub mod size_of {
 }
 
 pub mod srcset {
-    pub use crate::dom::htmlimageelement::{Descriptor, ImageSource, parse_a_srcset_attribute};
+    pub use crate::dom::html::htmlimageelement::{
+        Descriptor, ImageSource, parse_a_srcset_attribute,
+    };
 }
 
 pub mod timeranges {
@@ -70,7 +72,12 @@ pub mod timeranges {
 pub mod textinput {
     pub use crate::clipboard_provider::ClipboardProvider;
     pub use crate::textinput::{
-        Direction, Lines, Selection, SelectionDirection, TextInput, TextPoint, UTF8Bytes,
-        UTF16CodeUnits,
+        Direction, Lines, Selection, SelectionDirection, TextInput, TextPoint,
+    };
+}
+
+pub mod encoding_detection {
+    pub use crate::dom::servoparser::encoding::{
+        get_xml_encoding, prescan_the_byte_stream_to_determine_the_encoding,
     };
 }

@@ -12,8 +12,8 @@ use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::reflect_dom_object;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
-use crate::dom::htmlformelement::HTMLFormElement;
-use crate::dom::htmlinputelement::{HTMLInputElement, InputType};
+use crate::dom::html::htmlformelement::HTMLFormElement;
+use crate::dom::html::htmlinputelement::{HTMLInputElement, InputType};
 use crate::dom::node::Node;
 use crate::dom::nodelist::{NodeList, NodeListType, RadioList, RadioListMode};
 use crate::dom::window::Window;
@@ -78,16 +78,16 @@ impl RadioNodeList {
 
 impl RadioNodeListMethods<crate::DomTypeHolder> for RadioNodeList {
     // https://dom.spec.whatwg.org/#dom-nodelist-length
-    // https://github.com/servo/servo/issues/5875
+    /// <https://github.com/servo/servo/issues/5875>
     fn Length(&self) -> u32 {
         self.node_list.Length()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-radionodelist-value
+    /// <https://html.spec.whatwg.org/multipage/#dom-radionodelist-value>
     fn Value(&self) -> DOMString {
         self.upcast::<NodeList>()
             .iter()
-            .filter_map(|node| {
+            .find_map(|node| {
                 // Step 1
                 node.downcast::<HTMLInputElement>().and_then(|input| {
                     if input.input_type() == InputType::Radio && input.Checked() {
@@ -103,13 +103,12 @@ impl RadioNodeListMethods<crate::DomTypeHolder> for RadioNodeList {
                     }
                 })
             })
-            .next()
             // Step 2
             .unwrap_or(DOMString::from(""))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-radionodelist-value
-    fn SetValue(&self, value: DOMString) {
+    /// <https://html.spec.whatwg.org/multipage/#dom-radionodelist-value>
+    fn SetValue(&self, value: DOMString, can_gc: CanGc) {
         for node in self.upcast::<NodeList>().iter() {
             // Step 1
             if let Some(input) = node.downcast::<HTMLInputElement>() {
@@ -118,14 +117,14 @@ impl RadioNodeListMethods<crate::DomTypeHolder> for RadioNodeList {
                         // Step 2
                         let val = input.Value();
                         if val.is_empty() || val == value {
-                            input.SetChecked(true);
+                            input.SetChecked(true, can_gc);
                             return;
                         }
                     },
                     InputType::Radio => {
                         // Step 2
                         if input.Value() == value {
-                            input.SetChecked(true);
+                            input.SetChecked(true, can_gc);
                             return;
                         }
                     },
@@ -139,7 +138,7 @@ impl RadioNodeListMethods<crate::DomTypeHolder> for RadioNodeList {
     // RadioNodeList) implements IndexedGetter.
     // https://github.com/servo/servo/issues/5875
     //
-    // https://dom.spec.whatwg.org/#dom-nodelist-item
+    /// <https://dom.spec.whatwg.org/#dom-nodelist-item>
     fn IndexedGetter(&self, index: u32) -> Option<DomRoot<Node>> {
         self.node_list.IndexedGetter(index)
     }

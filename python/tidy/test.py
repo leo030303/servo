@@ -124,10 +124,6 @@ class CheckTidiness(unittest.TestCase):
         self.assertEqual("Comments starting with `//` should also include a space", next(errors)[2])
         self.assertNoMoreErrors(errors)
 
-        feature_errors = tidy.collect_errors_for_files(iterFile("lib.rs"), [], [tidy.check_rust], print_text=False)
-
-        self.assertNoMoreErrors(feature_errors)
-
         ban_errors = tidy.collect_errors_for_files(iterFile("ban.rs"), [], [tidy.check_rust], print_text=False)
         self.assertEqual("Banned type Cell<JSVal> detected. Use MutDom<JSVal> instead", next(ban_errors)[2])
         self.assertNoMoreErrors(ban_errors)
@@ -178,9 +174,21 @@ class CheckTidiness(unittest.TestCase):
         lst = list(file_list)
         self.assertEqual([os.path.join(file_path, "whee", "test.rs")], lst)
 
-    def test_multiline_string(self):
-        errors = tidy.collect_errors_for_files(iterFile("multiline_string.rs"), [], [tidy.check_rust], print_text=False)
-        self.assertNoMoreErrors(errors)
+    def test_feature_annotation(self):
+        errors = tidy.check_feature_annotation(
+            "prefs.rs",
+            [
+                b"// feature:",
+                b"// feature: a | #a | a |",
+                b"// feature: | 123 |",
+            ],
+        )
+        self.assertEqual("Feature annotation has too few | separators", next(errors)[1])
+        self.assertEqual("Feature annotation has too many | separators", next(errors)[1])
+        self.assertEqual("Feature annotation issue number is not a number", next(errors)[1])
+        self.assertEqual("Feature annotation name is missing", next(errors)[1])
+        self.assertEqual("Feature annotation issue number must start with #", next(errors)[1])
+        self.assertEqual("Feature annotation URL path is missing", next(errors)[1])
 
     def test_raw_url_in_rustdoc(self):
         def assert_has_a_single_rustdoc_error(errors: Iterable[tuple[int, str]]):

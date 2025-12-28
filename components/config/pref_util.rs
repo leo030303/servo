@@ -9,6 +9,7 @@ use serde_json::Value;
 pub enum PrefValue {
     Float(f64),
     Int(i64),
+    UInt(u64),
     Str(String),
     Bool(bool),
     Array(Vec<PrefValue>),
@@ -85,6 +86,7 @@ macro_rules! impl_from_pref {
 impl_pref_from! {
     f64 => PrefValue::Float,
     i64 => PrefValue::Int,
+    u64 => PrefValue::UInt,
     String => PrefValue::Str,
     &str => PrefValue::Str,
     bool => PrefValue::Bool,
@@ -93,6 +95,7 @@ impl_pref_from! {
 impl_from_pref! {
     PrefValue::Float => f64,
     PrefValue::Int => i64,
+    PrefValue::UInt => u64,
     PrefValue::Str => String,
     PrefValue::Bool => bool,
 }
@@ -130,20 +133,25 @@ impl From<PrefValue> for [f64; 4] {
     }
 }
 
-#[test]
-fn test_pref_value_from_str() {
-    let value = PrefValue::from_booleanish_str("21");
-    assert_eq!(value, PrefValue::Int(21));
+#[cfg(test)]
+mod test {
+    use super::*;
 
-    let value = PrefValue::from_booleanish_str("12.5");
-    assert_eq!(value, PrefValue::Float(12.5));
+    #[test]
+    fn test_pref_value_from_str() {
+        let value = PrefValue::from_booleanish_str("21");
+        assert_eq!(value, PrefValue::Int(21));
 
-    let value = PrefValue::from_booleanish_str("a string");
-    assert_eq!(value, PrefValue::Str("a string".into()));
+        let value = PrefValue::from_booleanish_str("12.5");
+        assert_eq!(value, PrefValue::Float(12.5));
 
-    let value = PrefValue::from_booleanish_str("false");
-    assert_eq!(value, PrefValue::Bool(false));
+        let value = PrefValue::from_booleanish_str("a string");
+        assert_eq!(value, PrefValue::Str("a string".into()));
 
-    let value = PrefValue::from_booleanish_str("true");
-    assert_eq!(value, PrefValue::Bool(true));
+        let value = PrefValue::from_booleanish_str("false");
+        assert_eq!(value, PrefValue::Bool(false));
+
+        let value = PrefValue::from_booleanish_str("true");
+        assert_eq!(value, PrefValue::Bool(true));
+    }
 }

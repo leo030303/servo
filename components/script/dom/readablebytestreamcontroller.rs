@@ -10,12 +10,12 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, Type};
 use js::jsval::UndefinedValue;
+use js::realm::CurrentRealm;
 use js::rust::{HandleObject, HandleValue as SafeHandleValue, HandleValue};
 use js::typedarray::{ArrayBufferU8, ArrayBufferViewU8};
 
 use super::bindings::buffer_source::HeapBufferSource;
 use super::bindings::cell::DomRefCell;
-use super::bindings::codegen::Bindings::ReadableStreamBYOBReaderBinding::ReadableStreamBYOBReaderReadOptions;
 use super::bindings::reflector::reflect_dom_object;
 use super::bindings::root::Dom;
 use super::readablestreambyobreader::ReadIntoRequest;
@@ -107,7 +107,8 @@ struct StartAlgorithmFulfillmentHandler {
 impl Callback for StartAlgorithmFulfillmentHandler {
     /// Continuation of <https://streams.spec.whatwg.org/#set-up-readable-byte-stream-controller>
     /// Upon fulfillment of startPromise,
-    fn callback(&self, _cx: SafeJSContext, _v: HandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: HandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         // Set controller.[[started]] to true.
         self.controller.started.set(true);
 
@@ -133,7 +134,8 @@ struct StartAlgorithmRejectionHandler {
 impl Callback for StartAlgorithmRejectionHandler {
     /// Continuation of <https://streams.spec.whatwg.org/#set-up-readable-byte-stream-controller>
     /// Upon rejection of startPromise with reason r,
-    fn callback(&self, _cx: SafeJSContext, v: HandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: HandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         // Perform ! ReadableByteStreamControllerError(controller, r).
         self.controller.error(v, can_gc);
     }
@@ -150,7 +152,8 @@ struct PullAlgorithmFulfillmentHandler {
 impl Callback for PullAlgorithmFulfillmentHandler {
     /// Continuation of <https://streams.spec.whatwg.org/#readable-byte-stream-controller-call-pull-if-needed>
     /// Upon fulfillment of pullPromise
-    fn callback(&self, _cx: SafeJSContext, _v: HandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: HandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         // Set controller.[[pulling]] to false.
         self.controller.pulling.set(false);
 
@@ -176,7 +179,8 @@ struct PullAlgorithmRejectionHandler {
 impl Callback for PullAlgorithmRejectionHandler {
     /// Continuation of <https://streams.spec.whatwg.org/#readable-stream-byte-controller-call-pull-if-needed>
     /// Upon rejection of pullPromise with reason e.
-    fn callback(&self, _cx: SafeJSContext, v: HandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: HandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         // Perform ! ReadableByteStreamControllerError(controller, e).
         self.controller.error(v, can_gc);
     }
@@ -273,7 +277,7 @@ impl ReadableByteStreamController {
         cx: SafeJSContext,
         read_into_request: &ReadIntoRequest,
         view: HeapBufferSource<ArrayBufferViewU8>,
-        options: &ReadableStreamBYOBReaderReadOptions,
+        min: u64,
         can_gc: CanGc,
     ) {
         // Let stream be controller.[[stream]].
@@ -297,7 +301,7 @@ impl ReadableByteStreamController {
         }
 
         // Let minimumFill be min × elementSize.
-        let minimum_fill = options.min * element_size;
+        let minimum_fill = min * element_size;
 
         // Assert: minimumFill ≥ 0 and minimumFill ≤ view.[[ByteLength]].
         assert!(minimum_fill <= (view.byte_length() as u64));
@@ -505,7 +509,10 @@ impl ReadableByteStreamController {
             }
 
             // Set firstDescriptor’s buffer to ! TransferArrayBuffer(firstDescriptor’s buffer).
-            first_descriptor.buffer = first_descriptor.buffer.transfer_array_buffer(cx)?;
+            first_descriptor.buffer = first_descriptor
+                .buffer
+                .transfer_array_buffer(cx)
+                .expect("TransferArrayBuffer failed");
         }
 
         // Perform ? ReadableByteStreamControllerRespondInternal(controller, bytesWritten).
@@ -540,7 +547,8 @@ impl ReadableByteStreamController {
             assert_eq!(bytes_written, 0);
 
             // Perform ! ReadableByteStreamControllerRespondInClosedState(controller, firstDescriptor).
-            self.respond_in_closed_state(cx, can_gc)?;
+            self.respond_in_closed_state(cx, can_gc)
+                .expect("respond_in_closed_state failed");
         } else {
             // Assert: state is "readable".
             assert!(stream.is_readable());
@@ -601,7 +609,8 @@ impl ReadableByteStreamController {
             // For each filledPullInto of filledPullIntos,
             for filled_pull_into in filled_pull_intos {
                 // Perform ! ReadableByteStreamControllerCommitPullIntoDescriptor(stream, filledPullInto).
-                self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)?;
+                self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)
+                    .expect("commit_pull_into_descriptor failed");
             }
         }
 
@@ -643,7 +652,8 @@ impl ReadableByteStreamController {
             for filled_pull_into in filled_pull_intos {
                 // Perform ! ReadableByteStreamControllerCommitPullIntoDescriptor(controller.[[stream]]
                 // , filledPullInto).
-                self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)?;
+                self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)
+                    .expect("commit_pull_into_descriptor failed");
             }
 
             // Return.
@@ -692,12 +702,14 @@ impl ReadableByteStreamController {
         let filled_pull_intos = self.process_pull_into_descriptors_using_queue(cx);
 
         // Perform ! ReadableByteStreamControllerCommitPullIntoDescriptor(controller.[[stream]], pullIntoDescriptor).
-        self.commit_pull_into_descriptor(cx, &pull_into_descriptor, can_gc)?;
+        self.commit_pull_into_descriptor(cx, &pull_into_descriptor, can_gc)
+            .expect("commit_pull_into_descriptor failed");
 
         // For each filledPullInto of filledPullIntos,
         for filled_pull_into in filled_pull_intos {
             // Perform ! ReadableByteStreamControllerCommitPullIntoDescriptor(controller.[[stream]], filledPullInto).
-            self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)?;
+            self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)
+                .expect("commit_pull_into_descriptor failed");
         }
 
         Ok(())
@@ -829,7 +841,8 @@ impl ReadableByteStreamController {
                 &first_descriptor.buffer,
                 byte_offset as usize,
                 byte_length as usize,
-            )?;
+            )
+            .expect("Construct Uint8Array failed");
 
             // Let byobRequest be a new ReadableStreamBYOBRequest.
             let byob_request = ReadableStreamBYOBRequest::new(&self.global(), can_gc);
@@ -1018,7 +1031,10 @@ impl ReadableByteStreamController {
                 self.invalidate_byob_request();
 
                 // Set firstPendingPullInto’s buffer to ! TransferArrayBuffer(firstPendingPullInto’s buffer).
-                first_descriptor.buffer = first_descriptor.buffer.transfer_array_buffer(cx)?;
+                first_descriptor.buffer = first_descriptor
+                    .buffer
+                    .transfer_array_buffer(cx)
+                    .expect("TransferArrayBuffer failed");
 
                 // If firstPendingPullInto’s reader type is "none",
                 if first_descriptor.reader_type.is_none() {
@@ -1035,7 +1051,8 @@ impl ReadableByteStreamController {
         // If ! ReadableStreamHasDefaultReader(stream) is true,
         if stream.has_default_reader() {
             // Perform ! ReadableByteStreamControllerProcessReadRequestsUsingQueue(controller).
-            self.process_read_requests_using_queue(cx, can_gc)?;
+            self.process_read_requests_using_queue(cx, can_gc)
+                .expect("process_read_requests_using_queue failed");
 
             // If ! ReadableStreamGetNumReadRequests(stream) is 0,
             if stream.get_num_read_requests() == 0 {
@@ -1075,7 +1092,8 @@ impl ReadableByteStreamController {
                     &transferred_buffer,
                     byte_offset,
                     byte_length,
-                )?;
+                )
+                .expect("Construct Uint8Array failed");
 
                 // Perform ! ReadableStreamFulfillReadRequest(stream, transferredView, false).
                 rooted!(in(*cx) let mut view_value = UndefinedValue());
@@ -1095,7 +1113,8 @@ impl ReadableByteStreamController {
             // For each filledPullInto of filledPullIntos,
             // Perform ! ReadableByteStreamControllerCommitPullIntoDescriptor(stream, filledPullInto).
             for filled_pull_into in filled_pull_intos {
-                self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)?;
+                self.commit_pull_into_descriptor(cx, &filled_pull_into, can_gc)
+                    .expect("commit_pull_into_descriptor failed");
             }
         } else {
             // Assert: ! IsReadableStreamLocked(stream) is false.
@@ -1142,7 +1161,9 @@ impl ReadableByteStreamController {
         }
 
         // Let filledView be ! ReadableByteStreamControllerConvertPullIntoDescriptor(pullIntoDescriptor).
-        let filled_view = self.convert_pull_into_descriptor(cx, pull_into_descriptor)?;
+        let filled_view = self
+            .convert_pull_into_descriptor(cx, pull_into_descriptor)
+            .expect("convert_pull_into_descriptor failed");
 
         rooted!(in(*cx) let mut view_value = UndefinedValue());
         filled_view.get_buffer_view_value(cx, view_value.handle_mut());
@@ -1184,17 +1205,21 @@ impl ReadableByteStreamController {
         assert!(bytes_filled % element_size == 0);
 
         // Let buffer be ! TransferArrayBuffer(pullIntoDescriptor’s buffer).
-        let buffer = pull_into_descriptor.buffer.transfer_array_buffer(cx)?;
+        let buffer = pull_into_descriptor
+            .buffer
+            .transfer_array_buffer(cx)
+            .expect("TransferArrayBuffer failed");
 
         // Return ! Construct(pullIntoDescriptor’s view constructor,
         // « buffer, pullIntoDescriptor’s byte offset, bytesFilled ÷ elementSize »).
-        create_buffer_source_with_constructor(
+        Ok(create_buffer_source_with_constructor(
             cx,
             &pull_into_descriptor.view_constructor,
             &buffer,
             pull_into_descriptor.byte_offset as usize,
             (bytes_filled / element_size) as usize,
         )
+        .expect("Construct view failed"))
     }
 
     /// <https://streams.spec.whatwg.org/#readable-byte-stream-controller-process-pull-into-descriptors-using-queue>
@@ -1437,7 +1462,7 @@ impl ReadableByteStreamController {
         can_gc: CanGc,
     ) -> Fallible<()> {
         // Let cloneResult be CloneArrayBuffer(buffer, byteOffset, byteLength, %ArrayBuffer%).
-        if let Some(clone_result) =
+        if let Ok(clone_result) =
             buffer.clone_array_buffer(cx, byte_offset as usize, byte_length as usize)
         {
             // Perform ! ReadableByteStreamControllerEnqueueChunkToQueue
@@ -1534,7 +1559,8 @@ impl ReadableByteStreamController {
             &entry.buffer,
             entry.byte_offset,
             entry.byte_length,
-        )?;
+        )
+        .expect("Construct Uint8Array failed");
 
         // Perform readRequest’s chunk steps, given view.
         let result = RootedTraceableBox::new(Heap::default());
@@ -1542,7 +1568,7 @@ impl ReadableByteStreamController {
         view.get_buffer_view_value(cx, view_value.handle_mut());
         result.set(*view_value);
 
-        read_request.chunk_steps(result, can_gc);
+        read_request.chunk_steps(result, &self.global(), can_gc);
 
         Ok(())
     }
@@ -1922,6 +1948,10 @@ impl ReadableByteStreamController {
 
     pub(crate) fn get_queue_total_size(&self) -> f64 {
         self.queue_total_size.get()
+    }
+
+    pub(crate) fn get_pending_pull_intos_size(&self) -> usize {
+        self.pending_pull_intos.borrow().len()
     }
 }
 

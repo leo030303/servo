@@ -12,7 +12,6 @@ mod layout_damage;
 pub mod wrapper_traits;
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -20,27 +19,26 @@ use std::time::Duration;
 
 use app_units::Au;
 use atomic_refcell::AtomicRefCell;
+use background_hang_monitor_api::BackgroundHangMonitorRegister;
 use base::Epoch;
 use base::generic_channel::GenericSender;
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use bitflags::bitflags;
-use compositing_traits::CrossProcessCompositorApi;
-use constellation_traits::LoadData;
+use compositing_traits::CrossProcessPaintApi;
 use embedder_traits::{Cursor, Theme, UntrustedNodeAddress, ViewportDetails};
 use euclid::Point2D;
 use euclid::default::{Point2D as UntypedPoint2D, Rect};
-use fnv::FnvHashMap;
-use fonts::{FontContext, SystemFontServiceProxy};
-use fxhash::FxHashMap;
+use fonts::{FontContext, WebFontDocumentContext};
 pub use layout_damage::LayoutDamage;
 use libc::c_void;
 use malloc_size_of::{MallocSizeOf as MallocSizeOfTrait, MallocSizeOfOps, malloc_size_of_is_0};
 use malloc_size_of_derive::MallocSizeOf;
-use net_traits::image_cache::{ImageCache, PendingImageId};
+use net_traits::image_cache::{ImageCache, ImageCacheFactory, PendingImageId};
 use parking_lot::RwLock;
 use pixels::RasterImage;
 use profile_traits::mem::Report;
 use profile_traits::time;
+use rustc_hash::FxHashMap;
 use script_traits::{InitialScriptState, Painter, ScriptThreadMessage};
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
@@ -52,10 +50,11 @@ use style::data::ElementData;
 use style::dom::OpaqueNode;
 use style::invalidation::element::restyle_hints::RestyleHint;
 use style::media_queries::Device;
-use style::properties::PropertyId;
 use style::properties::style_structs::Font;
+use style::properties::{ComputedValues, PropertyId};
 use style::selector_parser::{PseudoElement, RestyleDamage, Snapshot};
 use style::stylesheets::{Stylesheet, UrlExtraData};
+use style::values::computed::Overflow;
 use style_traits::CSSPixel;
 use webrender_api::units::{DeviceIntSize, LayoutPoint, LayoutVector2D};
 use webrender_api::{ExternalScrollId, ImageKey};
@@ -128,7 +127,7 @@ pub enum LayoutElementType {
 }
 
 pub struct HTMLCanvasData {
-    pub source: Option<ImageKey>,
+    pub image_key: Option<ImageKey>,
     pub width: u32,
     pub height: u32,
 }
@@ -145,7 +144,7 @@ pub struct SVGElementData {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrustedNodeAddress(pub *const c_void);
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl Send for TrustedNodeAddress {}
 
 /// Whether the pending image needs to be fetched or is waiting on an existing fetch.
@@ -153,6 +152,13 @@ unsafe impl Send for TrustedNodeAddress {}
 pub enum PendingImageState {
     Unrequested(ServoUrl),
     PendingResponse,
+}
+
+/// The destination in layout where an image is needed.
+#[derive(Debug, MallocSizeOf)]
+pub enum LayoutImageDestination {
+    BoxTreeConstruction,
+    DisplayListBuilding,
 }
 
 /// The data associated with an image that is not yet present in the image cache.
@@ -164,6 +170,7 @@ pub struct PendingImage {
     pub node: UntrustedNodeAddress,
     pub id: PendingImageId,
     pub origin: ImmutableOrigin,
+    pub destination: LayoutImageDestination,
 }
 
 /// A data structure to tarck vector image that are fully loaded (i.e has a parsed SVG
@@ -202,7 +209,7 @@ pub struct LayoutConfig {
     pub image_cache: Arc<dyn ImageCache>,
     pub font_context: Arc<FontContext>,
     pub time_profiler_chan: time::ProfilerChan,
-    pub compositor_api: CrossProcessCompositorApi,
+    pub paint_api: CrossProcessPaintApi,
     pub viewport_details: ViewportDetails,
     pub theme: Theme,
 }
@@ -234,12 +241,23 @@ pub trait Layout {
     /// resolve font metrics.
     fn device(&self) -> &Device;
 
-    /// The currently laid out Epoch that this Layout has finished.
-    fn current_epoch(&self) -> Epoch;
+    /// Set the theme on this [`Layout`]'s [`Device`]. The caller should also trigger a
+    /// new layout when this happens, though it can happen later. Returns `true` if the
+    /// [`Theme`] actually changed or `false` otherwise.
+    fn set_theme(&mut self, theme: Theme) -> bool;
+
+    /// Set the [`ViewportDetails`] on this [`Layout`]'s [`Device`]. The caller should also
+    /// trigger a new layout when this happens, though it can happen later. Returns `true`
+    /// if the [`ViewportDetails`] actually changed or `false` otherwise.
+    fn set_viewport_details(&mut self, viewport_details: ViewportDetails) -> bool;
 
     /// Load all fonts from the given stylesheet, returning the number of fonts that
     /// need to be loaded.
-    fn load_web_fonts_from_stylesheet(&self, stylesheet: ServoArc<Stylesheet>);
+    fn load_web_fonts_from_stylesheet(
+        &self,
+        stylesheet: &ServoArc<Stylesheet>,
+        font_context: &WebFontDocumentContext,
+    );
 
     /// Add a stylesheet to this Layout. This will add it to the Layout's `Stylist` as well as
     /// loading all web fonts defined in the stylesheet. The second stylesheet is the insertion
@@ -248,6 +266,7 @@ pub trait Layout {
         &mut self,
         stylesheet: ServoArc<Stylesheet>,
         before_stylsheet: Option<ServoArc<Stylesheet>>,
+        font_context: &WebFontDocumentContext,
     );
 
     /// Inform the layout that its ScriptThread is about to exit.
@@ -278,10 +297,10 @@ pub trait Layout {
         painter: Box<dyn Painter>,
     );
 
-    /// Set the scroll states of this layout after a compositor scroll.
+    /// Set the scroll states of this layout after a `Paint` scroll.
     fn set_scroll_offsets_from_renderer(
         &mut self,
-        scroll_states: &HashMap<ExternalScrollId, LayoutVector2D>,
+        scroll_states: &FxHashMap<ExternalScrollId, LayoutVector2D>,
     );
 
     /// Get the scroll offset of the given scroll node with id of [`ExternalScrollId`] or `None` if it does
@@ -291,11 +310,28 @@ pub trait Layout {
     /// Returns true if this layout needs to produce a new display list for rendering updates.
     fn needs_new_display_list(&self) -> bool;
 
-    fn query_box_area(&self, node: TrustedNodeAddress, area: BoxAreaType) -> Option<Rect<Au>>;
+    /// Marks that this layout needs to produce a new display list for rendering updates.
+    fn set_needs_new_display_list(&self);
+
+    fn query_padding(&self, node: TrustedNodeAddress) -> Option<PhysicalSides>;
+    fn query_box_area(
+        &self,
+        node: TrustedNodeAddress,
+        area: BoxAreaType,
+        exclude_transform_and_inline: bool,
+    ) -> Option<Rect<Au>>;
     fn query_box_areas(&self, node: TrustedNodeAddress, area: BoxAreaType) -> Vec<Rect<Au>>;
     fn query_client_rect(&self, node: TrustedNodeAddress) -> Rect<i32>;
+    fn query_current_css_zoom(&self, node: TrustedNodeAddress) -> f32;
     fn query_element_inner_outer_text(&self, node: TrustedNodeAddress) -> String;
     fn query_offset_parent(&self, node: TrustedNodeAddress) -> OffsetParentResponse;
+    /// Query the scroll container for the given node. If node is `None`, the scroll container for
+    /// the viewport is returned.
+    fn query_scroll_container(
+        &self,
+        node: Option<TrustedNodeAddress>,
+        flags: ScrollContainerQueryFlags,
+    ) -> Option<ScrollContainerResponse>;
     fn query_resolved_style(
         &self,
         node: TrustedNodeAddress,
@@ -332,8 +368,8 @@ pub trait ScriptThreadFactory {
     fn create(
         state: InitialScriptState,
         layout_factory: Arc<dyn LayoutFactory>,
-        system_font_service: Arc<SystemFontServiceProxy>,
-        load_data: LoadData,
+        image_cache_factory: Arc<dyn ImageCacheFactory>,
+        background_hang_monitor_register: Box<dyn BackgroundHangMonitorRegister>,
     ) -> JoinHandle<()>;
 }
 
@@ -346,10 +382,67 @@ pub enum BoxAreaType {
     Border,
 }
 
+#[derive(Default)]
+pub struct PhysicalSides {
+    pub left: Au,
+    pub top: Au,
+    pub right: Au,
+    pub bottom: Au,
+}
+
 #[derive(Clone, Default)]
 pub struct OffsetParentResponse {
     pub node_address: Option<UntrustedNodeAddress>,
     pub rect: Rect<Au>,
+}
+
+bitflags! {
+    #[derive(PartialEq)]
+    pub struct ScrollContainerQueryFlags: u8 {
+        /// Whether or not this query is for the purposes of a `scrollParent` layout query.
+        const ForScrollParent = 1 << 0;
+        /// Whether or not to consider the original element's scroll box for the return value.
+        const Inclusive = 1 << 1;
+    }
+}
+
+#[derive(Clone, Copy, Debug, MallocSizeOf)]
+pub struct AxesOverflow {
+    pub x: Overflow,
+    pub y: Overflow,
+}
+
+impl Default for AxesOverflow {
+    fn default() -> Self {
+        Self {
+            x: Overflow::Visible,
+            y: Overflow::Visible,
+        }
+    }
+}
+
+impl From<&ComputedValues> for AxesOverflow {
+    fn from(style: &ComputedValues) -> Self {
+        Self {
+            x: style.clone_overflow_x(),
+            y: style.clone_overflow_y(),
+        }
+    }
+}
+
+impl AxesOverflow {
+    pub fn to_scrollable(&self) -> Self {
+        Self {
+            x: self.x.to_scrollable(),
+            y: self.y.to_scrollable(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum ScrollContainerResponse {
+    Viewport(AxesOverflow),
+    Element(UntrustedNodeAddress, AxesOverflow),
 }
 
 #[derive(Debug, PartialEq)]
@@ -357,16 +450,19 @@ pub enum QueryMsg {
     BoxArea,
     BoxAreas,
     ClientRectQuery,
+    CurrentCSSZoomQuery,
     ElementInnerOuterTextQuery,
     ElementsFromPoint,
     InnerWindowDimensionsQuery,
     NodesFromPointQuery,
     OffsetParentQuery,
+    ScrollParentQuery,
     ResolvedFontStyleQuery,
     ResolvedStyleQuery,
     ScrollingAreaOrOffsetQuery,
     StyleQuery,
     TextIndexQuery,
+    PaddingQuery,
 }
 
 /// The goal of a reflow request.
@@ -397,7 +493,7 @@ pub struct IFrameSize {
     pub viewport_details: ViewportDetails,
 }
 
-pub type IFrameSizes = FnvHashMap<BrowsingContextId, IFrameSize>;
+pub type IFrameSizes = FxHashMap<BrowsingContextId, IFrameSize>;
 
 bitflags! {
     /// Conditions which cause a [`Document`] to need to be restyled during reflow, which
@@ -409,7 +505,7 @@ bitflags! {
         const PendingRestyles = 1 << 2;
         const HighlightedDOMNodeChanged = 1 << 3;
         const ThemeChanged = 1 << 4;
-        const ViewportSizeChanged = 1 << 5;
+        const ViewportChanged = 1 << 5;
         const PaintWorkletLoaded = 1 << 6;
     }
 }
@@ -452,14 +548,17 @@ bitflags! {
         const BuiltStackingContextTree = 1 << 2;
         const BuiltDisplayList = 1 << 3;
         const UpdatedScrollNodeOffset = 1 << 4;
-        const UpdatedCanvasContents = 1 << 5;
+        /// Image data for a WebRender image key has been updated, without necessarily
+        /// updating style or layout. This is used when updating canvas contents and
+        /// progressing to a new animated image frame.
+        const UpdatedImageData = 1 << 5;
     }
 }
 
 impl ReflowPhasesRun {
     pub fn needs_frame(&self) -> bool {
         self.intersects(
-            Self::BuiltDisplayList | Self::UpdatedScrollNodeOffset | Self::UpdatedCanvasContents,
+            Self::BuiltDisplayList | Self::UpdatedScrollNodeOffset | Self::UpdatedImageData,
         )
     }
 }
@@ -483,6 +582,8 @@ pub struct ReflowRequestRestyle {
 pub struct ReflowRequest {
     /// The document node.
     pub document: TrustedNodeAddress,
+    /// The current layout [`Epoch`] managed by the script thread.
+    pub epoch: Epoch,
     /// If a restyle is necessary, all of the informatio needed to do that restyle.
     pub restyle: Option<ReflowRequestRestyle>,
     /// The current [`ViewportDetails`] to use for this reflow.
@@ -497,12 +598,12 @@ pub struct ReflowRequest {
     pub animation_timeline_value: f64,
     /// The set of animations for this document.
     pub animations: DocumentAnimationSet,
-    /// The set of image animations.
-    pub node_to_animating_image_map: Arc<RwLock<FxHashMap<OpaqueNode, ImageAnimationState>>>,
-    /// The theme for the window
-    pub theme: Theme,
+    /// An [`AnimatingImages`] struct used to track images that are animating.
+    pub animating_images: Arc<RwLock<AnimatingImages>>,
     /// The node highlighted by the devtools, if any
     pub highlighted_dom_node: Option<OpaqueNode>,
+    /// The current font context.
+    pub document_context: WebFontDocumentContext,
 }
 
 impl ReflowRequest {
@@ -586,7 +687,7 @@ pub fn node_id_from_scroll_id(id: usize) -> Option<usize> {
 
 #[derive(Clone, Debug, MallocSizeOf)]
 pub struct ImageAnimationState {
-    #[ignore_malloc_size_of = "Arc is hard"]
+    #[ignore_malloc_size_of = "RasterImage"]
     pub image: Arc<RasterImage>,
     pub active_frame: usize,
     frame_start_time: f64,
@@ -633,7 +734,7 @@ impl ImageAnimationState {
                 .frames
                 .get(self.active_frame)
                 .unwrap()
-                .delay
+                .delay()
                 .unwrap()
                 .as_secs_f64();
         let mut next_active_frame_id = self.active_frame;
@@ -643,7 +744,7 @@ impl ImageAnimationState {
                 .frames
                 .get(next_active_frame_id)
                 .unwrap()
-                .delay
+                .delay()
                 .unwrap()
                 .as_secs_f64();
         }
@@ -678,12 +779,57 @@ bitflags! {
     }
 }
 
+#[derive(Debug, Default, MallocSizeOf)]
+pub struct AnimatingImages {
+    /// A map from the [`OpaqueNode`] to the state of an animating image. This is used
+    /// to update frames in script and to track newly animating nodes.
+    pub node_to_state_map: FxHashMap<OpaqueNode, ImageAnimationState>,
+    /// Whether or not this map has changed during a layout. This is used by script to
+    /// trigger future animation updates.
+    pub dirty: bool,
+}
+
+impl AnimatingImages {
+    pub fn maybe_insert_or_update(
+        &mut self,
+        node: OpaqueNode,
+        image: Arc<RasterImage>,
+        current_timeline_value: f64,
+    ) {
+        let entry = self.node_to_state_map.entry(node).or_insert_with(|| {
+            self.dirty = true;
+            ImageAnimationState::new(image.clone(), current_timeline_value)
+        });
+
+        // If the entry exists, but it is for a different image id, replace it as the image
+        // has changed during this layout.
+        if entry.image.id != image.id {
+            self.dirty = true;
+            *entry = ImageAnimationState::new(image.clone(), current_timeline_value);
+        }
+    }
+
+    pub fn remove(&mut self, node: OpaqueNode) {
+        if self.node_to_state_map.remove(&node).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Clear the dirty bit on this [`AnimatingImages`] and return the previous value.
+    pub fn clear_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.dirty)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.node_to_state_map.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use ipc_channel::ipc::IpcSharedMemory;
     use pixels::{CorsStatus, ImageFrame, ImageMetadata, PixelFormat, RasterImage};
 
     use crate::ImageAnimationState;
@@ -705,9 +851,10 @@ mod test {
             },
             format: PixelFormat::BGRA8,
             id: None,
-            bytes: IpcSharedMemory::from_byte(1, 1),
+            bytes: Arc::new(vec![1]),
             frames: image_frames,
             cors_status: CorsStatus::Unsafe,
+            is_opaque: false,
         };
         let mut image_animation_state = ImageAnimationState::new(Arc::new(image), 0.0);
 

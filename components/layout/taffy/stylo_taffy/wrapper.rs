@@ -10,6 +10,7 @@ use style::values::computed::{GridTemplateAreas, LengthPercentage};
 use style::values::generics::grid::{TrackListValue, TrackRepeat, TrackSize};
 use style::values::specified::position::NamedArea;
 use style::{Atom, OwnedSlice};
+use taffy::prelude::TaffyAuto;
 
 use super::{convert, stylo};
 
@@ -73,6 +74,19 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
 
     #[inline]
     fn inset(&self) -> taffy::Rect<taffy::LengthPercentageAuto> {
+        // Taffy doesn't support static nor sticky positionings, they are treated
+        // as relative. As a workaround, ignore the insets.
+        if matches!(
+            self.style.get_box().position,
+            stylo::Position::Static | stylo::Position::Sticky
+        ) {
+            return taffy::Rect {
+                left: taffy::LengthPercentageAuto::AUTO,
+                right: taffy::LengthPercentageAuto::AUTO,
+                top: taffy::LengthPercentageAuto::AUTO,
+                bottom: taffy::LengthPercentageAuto::AUTO,
+            };
+        }
         let position_styles = self.style.get_position();
         taffy::Rect {
             left: convert::inset(&position_styles.left),
@@ -359,12 +373,12 @@ impl<T: Deref<Target = ComputedValues>> taffy::GridContainerStyle for TaffyStylo
 
     #[inline]
     fn align_content(&self) -> Option<taffy::AlignContent> {
-        convert::content_alignment(self.style.get_position().align_content.0)
+        convert::content_alignment(self.style.get_position().align_content)
     }
 
     #[inline]
     fn justify_content(&self) -> Option<taffy::JustifyContent> {
-        convert::content_alignment(self.style.get_position().justify_content.0)
+        convert::content_alignment(self.style.get_position().justify_content)
     }
 
     #[inline]
@@ -374,7 +388,7 @@ impl<T: Deref<Target = ComputedValues>> taffy::GridContainerStyle for TaffyStylo
 
     #[inline]
     fn justify_items(&self) -> Option<taffy::AlignItems> {
-        convert::item_alignment(self.style.get_position().justify_items.computed.0)
+        convert::item_alignment(self.style.get_position().justify_items.computed.0.0)
     }
 }
 
@@ -399,11 +413,11 @@ impl<T: Deref<Target = ComputedValues>> taffy::GridItemStyle for TaffyStyloStyle
 
     #[inline]
     fn align_self(&self) -> Option<taffy::AlignSelf> {
-        convert::item_alignment(self.style.get_position().align_self.0.0)
+        convert::item_alignment(self.style.get_position().align_self.0)
     }
 
     #[inline]
     fn justify_self(&self) -> Option<taffy::AlignSelf> {
-        convert::item_alignment(self.style.get_position().justify_self.0.0)
+        convert::item_alignment(self.style.get_position().justify_self.0)
     }
 }

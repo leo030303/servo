@@ -7,9 +7,10 @@ use std::cell::Cell;
 use std::cmp;
 use std::default::Default;
 use std::str::{self, FromStr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use atomic_refcell::AtomicRefCell;
 use constellation_traits::BlobImpl;
 use data_url::mime::Mime;
 use dom_struct::dom_struct;
@@ -24,16 +25,17 @@ use js::jsapi::{Heap, JS_ClearPendingException};
 use js::jsval::{JSVal, NullValue};
 use js::rust::wrappers::JS_ParseJSON;
 use js::rust::{HandleObject, MutableHandleValue};
-use js::typedarray::{ArrayBuffer, ArrayBufferU8};
+use js::typedarray::{ArrayBufferU8, HeapArrayBuffer};
 use net_traits::fetch::headers::extract_mime_type_as_dataurl_mime;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{CredentialsMode, Referrer, RequestBuilder, RequestId, RequestMode};
 use net_traits::{
-    FetchMetadata, FetchResponseListener, FilteredMetadata, NetworkError, ReferrerPolicy,
-    ResourceFetchTiming, ResourceTimingType, trim_http_whitespace,
+    FetchMetadata, FilteredMetadata, NetworkError, ReferrerPolicy, ResourceFetchTiming,
+    trim_http_whitespace,
 };
 use script_bindings::conversions::SafeToJSValConvertible;
 use script_bindings::num::Finite;
+use script_bindings::trace::RootedTraceableBox;
 use script_traits::DocumentActivity;
 use servo_url::ServoUrl;
 use stylo_atoms::Atom;
@@ -62,17 +64,18 @@ use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::headers::is_forbidden_request_header;
 use crate::dom::node::Node;
-use crate::dom::performanceresourcetiming::InitiatorType;
+use crate::dom::performance::performanceresourcetiming::InitiatorType;
 use crate::dom::progressevent::ProgressEvent;
 use crate::dom::readablestream::ReadableStream;
 use crate::dom::servoparser::ServoParser;
+use crate::dom::servoparser::html::HtmlSerialize;
 use crate::dom::window::Window;
 use crate::dom::workerglobalscope::WorkerGlobalScope;
 use crate::dom::xmlhttprequesteventtarget::XMLHttpRequestEventTarget;
 use crate::dom::xmlhttprequestupload::XMLHttpRequestUpload;
 use crate::fetch::FetchCanceller;
 use crate::mime::{APPLICATION, CHARSET, HTML, MimeExt, TEXT, XML};
-use crate::network_listener::{self, PreInvoke, ResourceTimingListener};
+use crate::network_listener::{self, FetchResponseListener, ResourceTimingListener};
 use crate::script_runtime::{CanGc, JSContext};
 use crate::task_source::{SendableTaskSource, TaskSourceName};
 use crate::timers::{OneshotTimerCallback, OneshotTimerHandle};
@@ -94,8 +97,7 @@ pub(crate) struct GenerationId(u32);
 struct XHRContext {
     xhr: TrustedXHRAddress,
     gen_id: GenerationId,
-    sync_status: DomRefCell<Option<ErrorResult>>,
-    resource_timing: ResourceFetchTiming,
+    sync_status: Arc<AtomicRefCell<Option<ErrorResult>>>,
     url: ServoUrl,
 }
 
@@ -123,33 +125,29 @@ impl FetchResponseListener for XHRContext {
     }
 
     fn process_response_eof(
-        &mut self,
+        self,
         _: RequestId,
         response: Result<ResourceFetchTiming, NetworkError>,
     ) {
         let rv = self.xhr.root().process_response_complete(
             self.gen_id,
-            response.map(|_| ()),
+            response.clone().map(|_| ()),
             CanGc::note(),
         );
         *self.sync_status.borrow_mut() = Some(rv);
-    }
 
-    fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming {
-        &mut self.resource_timing
-    }
-
-    fn resource_timing(&self) -> &ResourceFetchTiming {
-        &self.resource_timing
-    }
-
-    fn submit_resource_timing(&mut self) {
-        network_listener::submit_timing(self, CanGc::note())
+        if let Ok(response) = response {
+            network_listener::submit_timing(&self, &response, CanGc::note());
+        }
     }
 
     fn process_csp_violations(&mut self, _request_id: RequestId, violations: Vec<Violation>) {
         let global = &self.resource_timing_global();
         global.report_csp_violations(violations, None, None);
+    }
+
+    fn should_invoke(&self) -> bool {
+        self.xhr.root().generation_id.get() == self.gen_id
     }
 }
 
@@ -163,12 +161,6 @@ impl ResourceTimingListener for XHRContext {
     }
 }
 
-impl PreInvoke for XHRContext {
-    fn should_invoke(&self) -> bool {
-        self.xhr.root().generation_id.get() == self.gen_id
-    }
-}
-
 #[derive(Clone)]
 pub(crate) enum XHRProgress {
     /// Notify that headers have been received
@@ -177,7 +169,7 @@ pub(crate) enum XHRProgress {
     Loading(GenerationId, Vec<u8>),
     /// Loading is done
     Done(GenerationId),
-    /// There was an error (only Error::Abort, Error::Timeout or Error::Network is used)
+    /// There was an error (only Error::Abort(None), Error::Timeout(None) or Error::Network(None) is used)
     Errored(GenerationId, Error),
 }
 
@@ -339,7 +331,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         // Step 1
         if let Some(window) = DomRoot::downcast::<Window>(self.global()) {
             if !window.Document().is_fully_active() {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             }
         }
 
@@ -361,12 +353,12 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
 
         match maybe_method {
             // Step 4
-            Some(Method::CONNECT) | Some(Method::TRACE) => Err(Error::Security),
-            Some(ref t) if t.as_str() == "TRACK" => Err(Error::Security),
+            Some(Method::CONNECT) | Some(Method::TRACE) => Err(Error::Security(None)),
+            Some(ref t) if t.as_str() == "TRACK" => Err(Error::Security(None)),
             Some(parsed_method) => {
                 // Step 3
                 if !is_token(&method) {
-                    return Err(Error::Syntax);
+                    return Err(Error::Syntax(None));
                 }
 
                 // Step 2
@@ -375,7 +367,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 let mut parsed_url = match base.join(&url.0) {
                     Ok(parsed) => parsed,
                     // Step 7
-                    Err(_) => return Err(Error::Syntax),
+                    Err(_) => return Err(Error::Syntax(None)),
                 };
 
                 // Step 9
@@ -394,7 +386,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                     if !self.timeout.get().is_zero() ||
                         self.response_type.get() != XMLHttpRequestResponseType::_empty
                     {
-                        return Err(Error::InvalidAccess);
+                        return Err(Error::InvalidAccess(None));
                     }
                 }
                 // Step 11 - abort existing requests
@@ -424,7 +416,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             // Step 3
             // This includes cases where as_str() returns None, and when is_token() returns false,
             // both of which indicate invalid extension method names
-            _ => Err(Error::Syntax),
+            _ => Err(Error::Syntax(None)),
         }
     }
 
@@ -433,7 +425,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         // Step 1: If this’s state is not opened, then throw an "InvalidStateError" DOMException.
         // Step 2: If this’s send() flag is set, then throw an "InvalidStateError" DOMException.
         if self.ready_state.get() != XMLHttpRequestState::Opened || self.send_flag.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 3: Normalize value.
@@ -442,10 +434,10 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         // Step 4: If name is not a header name or value is not a header value, then throw a
         // "SyntaxError" DOMException.
         if !is_token(&name) || !is_field_value(value) {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         }
 
-        let name_str = name.as_str().ok_or(Error::Syntax)?;
+        let name_str = name.as_str().ok_or(Error::Syntax(None))?;
 
         // Step 5: If (name, value) is a forbidden request-header, then return.
         if is_forbidden_request_header(name_str, value) {
@@ -487,7 +479,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
     fn SetTimeout(&self, timeout: u32) -> ErrorResult {
         // Step 1
         if self.sync_in_window() {
-            return Err(Error::InvalidAccess);
+            return Err(Error::InvalidAccess(None));
         }
 
         // Step 2
@@ -521,9 +513,9 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             // Step 1
             XMLHttpRequestState::HeadersReceived |
             XMLHttpRequestState::Loading |
-            XMLHttpRequestState::Done => Err(Error::InvalidState),
+            XMLHttpRequestState::Done => Err(Error::InvalidState(None)),
             // Step 2
-            _ if self.send_flag.get() => Err(Error::InvalidState),
+            _ if self.send_flag.get() => Err(Error::InvalidState(None)),
             // Step 3
             _ => {
                 self.with_credentials.set(with_credentials);
@@ -541,7 +533,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
     fn Send(&self, data: Option<DocumentOrXMLHttpRequestBodyInit>, can_gc: CanGc) -> ErrorResult {
         // Step 1, 2
         if self.ready_state.get() != XMLHttpRequestState::Opened || self.send_flag.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 3
@@ -552,7 +544,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         // Step 4 (first half)
         let mut extracted_or_serialized = match data {
             Some(DocumentOrXMLHttpRequestBodyInit::Document(ref doc)) => {
-                let bytes = Vec::from(serialize_document(doc)?.as_ref());
+                let bytes = Vec::from(&*serialize_document(doc)?.as_bytes());
                 let content_type = if doc.is_html_document() {
                     "text/html;charset=UTF-8"
                 } else {
@@ -570,7 +562,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             },
             Some(DocumentOrXMLHttpRequestBodyInit::Blob(ref b)) => {
                 let extracted_body = b
-                    .extract(&self.global(), can_gc)
+                    .extract(&self.global(), false, can_gc)
                     .expect("Couldn't extract body.");
                 if !extracted_body.in_memory() && self.sync.get() {
                     warn!("Sync XHR with not in-memory Blob as body not supported");
@@ -581,16 +573,16 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             },
             Some(DocumentOrXMLHttpRequestBodyInit::FormData(ref formdata)) => Some(
                 formdata
-                    .extract(&self.global(), can_gc)
+                    .extract(&self.global(), false, can_gc)
                     .expect("Couldn't extract body."),
             ),
             Some(DocumentOrXMLHttpRequestBodyInit::String(ref str)) => Some(
-                str.extract(&self.global(), can_gc)
+                str.extract(&self.global(), false, can_gc)
                     .expect("Couldn't extract body."),
             ),
             Some(DocumentOrXMLHttpRequestBodyInit::URLSearchParams(ref urlsp)) => Some(
                 urlsp
-                    .extract(&self.global(), can_gc)
+                    .extract(&self.global(), false, can_gc)
                     .expect("Couldn't extract body."),
             ),
             Some(DocumentOrXMLHttpRequestBodyInit::ArrayBuffer(ref typedarray)) => {
@@ -720,7 +712,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             if !request.headers.contains_key(header::CONTENT_TYPE) {
                 request.headers.insert(
                     header::CONTENT_TYPE,
-                    HeaderValue::from_str(&content_type).unwrap(),
+                    HeaderValue::from_str(&content_type.str()).unwrap(),
                 );
                 content_type_set = true;
             }
@@ -739,7 +731,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                                     .collect();
 
                                 let new_mime = format!(
-                                    "{}/{}; charset={}{}{}",
+                                    "{}/{};charset={}{}{}",
                                     mime.type_,
                                     mime.subtype,
                                     encoding,
@@ -750,9 +742,11 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                                         .collect::<Vec<String>>()
                                         .join("; ")
                                 );
-                                request
-                                    .headers
-                                    .typed_insert(ContentType::from_str(&new_mime).unwrap())
+
+                                request.headers.insert(
+                                    header::CONTENT_TYPE,
+                                    HeaderValue::from_str(&new_mime).unwrap(),
+                                );
                             }
                         }
                     }
@@ -762,7 +756,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
 
         self.fetch_time.set(Instant::now());
 
-        let rv = self.fetch(request, &self.global());
+        let rv = self.fetch(request, &self.global(), can_gc);
         // Step 10
         if self.sync.get() {
             return rv;
@@ -786,7 +780,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             state == XMLHttpRequestState::Loading
         {
             let gen_id = self.generation_id.get();
-            self.process_partial_response(XHRProgress::Errored(gen_id, Error::Abort), can_gc);
+            self.process_partial_response(XHRProgress::Errored(gen_id, Error::Abort(None)), can_gc);
             // If open was called in one of the handlers invoked by the
             // above call then we should terminate the abort sequence
             if self.generation_id.get() != gen_id {
@@ -871,7 +865,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         //   DOMException.
         match self.ready_state.get() {
             XMLHttpRequestState::Loading | XMLHttpRequestState::Done => {
-                return Err(Error::InvalidState);
+                return Err(Error::InvalidState(None));
             },
             _ => {},
         }
@@ -883,7 +877,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
             Ok(mime) => mime,
             Err(_) => "application/octet-stream"
                 .parse::<Mime>()
-                .map_err(|_| Error::Syntax)?,
+                .map_err(|_| Error::Syntax(None))?,
         };
 
         *self.override_mime_type.borrow_mut() = Some(override_mime);
@@ -905,11 +899,13 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
         }
         match self.ready_state.get() {
             // Step 2
-            XMLHttpRequestState::Loading | XMLHttpRequestState::Done => Err(Error::InvalidState),
+            XMLHttpRequestState::Loading | XMLHttpRequestState::Done => {
+                Err(Error::InvalidState(None))
+            },
             _ => {
                 if self.sync_in_window() {
                     // Step 3
-                    Err(Error::InvalidAccess)
+                    Err(Error::InvalidAccess(None))
                 } else {
                     // Step 4
                     self.response_type.set(response_type);
@@ -928,10 +924,10 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 if ready_state == XMLHttpRequestState::Done ||
                     ready_state == XMLHttpRequestState::Loading
                 {
-                    self.text_response().safe_to_jsval(cx, rval);
+                    self.text_response().safe_to_jsval(cx, rval, can_gc);
                 } else {
                     // Step 1
-                    "".safe_to_jsval(cx, rval);
+                    "".safe_to_jsval(cx, rval, can_gc);
                 }
             },
             // Step 1
@@ -939,14 +935,16 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 rval.set(NullValue());
             },
             // Step 2
-            XMLHttpRequestResponseType::Document => {
-                self.document_response(can_gc).safe_to_jsval(cx, rval)
-            },
+            XMLHttpRequestResponseType::Document => self
+                .document_response(can_gc)
+                .safe_to_jsval(cx, rval, can_gc),
             XMLHttpRequestResponseType::Json => self.json_response(cx, rval),
-            XMLHttpRequestResponseType::Blob => self.blob_response(can_gc).safe_to_jsval(cx, rval),
+            XMLHttpRequestResponseType::Blob => {
+                self.blob_response(can_gc).safe_to_jsval(cx, rval, can_gc)
+            },
             XMLHttpRequestResponseType::Arraybuffer => {
                 match self.arraybuffer_response(cx, can_gc) {
-                    Some(array_buffer) => array_buffer.safe_to_jsval(cx, rval),
+                    Some(array_buffer) => array_buffer.safe_to_jsval(cx, rval, can_gc),
                     None => rval.set(NullValue()),
                 }
             },
@@ -967,7 +965,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 }))
             },
             // Step 1
-            _ => Err(Error::InvalidState),
+            _ => Err(Error::InvalidState(None)),
         }
     }
 
@@ -984,7 +982,7 @@ impl XMLHttpRequestMethods<crate::DomTypeHolder> for XMLHttpRequest {
                 }
             },
             // Step 1
-            _ => Err(Error::InvalidState),
+            _ => Err(Error::InvalidState(None)),
         }
     }
 }
@@ -1019,13 +1017,16 @@ impl XMLHttpRequest {
                 FetchMetadata::Filtered { filtered, .. } => match filtered {
                     FilteredMetadata::Basic(m) => m,
                     FilteredMetadata::Cors(m) => m,
-                    FilteredMetadata::Opaque => return Err(Error::Network),
-                    FilteredMetadata::OpaqueRedirect(_) => return Err(Error::Network),
+                    FilteredMetadata::Opaque => return Err(Error::Network(None)),
+                    FilteredMetadata::OpaqueRedirect(_) => return Err(Error::Network(None)),
                 },
             },
             Err(_) => {
-                self.process_partial_response(XHRProgress::Errored(gen_id, Error::Network), can_gc);
-                return Err(Error::Network);
+                self.process_partial_response(
+                    XHRProgress::Errored(gen_id, Error::Network(None)),
+                    can_gc,
+                );
+                return Err(Error::Network(None));
             },
         };
 
@@ -1059,8 +1060,11 @@ impl XMLHttpRequest {
                 Ok(())
             },
             Err(_) => {
-                self.process_partial_response(XHRProgress::Errored(gen_id, Error::Network), can_gc);
-                Err(Error::Network)
+                self.process_partial_response(
+                    XHRProgress::Errored(gen_id, Error::Network(None)),
+                    can_gc,
+                );
+                Err(Error::Network(None))
             },
         }
     }
@@ -1193,8 +1197,8 @@ impl XMLHttpRequest {
                 return_if_fetch_was_terminated!();
 
                 let errormsg = match e {
-                    Error::Abort => "abort",
-                    Error::Timeout => "timeout",
+                    Error::Abort(None) => "abort",
+                    Error::Timeout(None) => "timeout",
                     _ => "error",
                 };
 
@@ -1216,7 +1220,7 @@ impl XMLHttpRequest {
     }
 
     fn terminate_ongoing_fetch(&self) {
-        self.canceller.borrow_mut().cancel();
+        self.canceller.borrow_mut().abort();
         let GenerationId(prev_id) = self.generation_id.get();
         self.generation_id.set(GenerationId(prev_id + 1));
         self.response_status.set(Ok(()));
@@ -1264,7 +1268,7 @@ impl XMLHttpRequest {
         can_gc: CanGc,
     ) {
         // If partial_load is Ok(None), loading has completed and we can just use the value from the request body
-        // If an error occured, we pass 0 for both loaded and total
+        // If an error occurred, we pass 0 for both loaded and total
 
         let request_body_len = self.request_body_len.get() as u64;
         let (loaded, total) = match partial_load {
@@ -1339,7 +1343,11 @@ impl XMLHttpRequest {
     }
 
     /// <https://xhr.spec.whatwg.org/#arraybuffer-response>
-    fn arraybuffer_response(&self, cx: JSContext, can_gc: CanGc) -> Option<ArrayBuffer> {
+    fn arraybuffer_response(
+        &self,
+        cx: JSContext,
+        can_gc: CanGc,
+    ) -> Option<RootedTraceableBox<HeapArrayBuffer>> {
         // Step 5: Set the response object to a new ArrayBuffer with the received bytes
         // For caching purposes, skip this step if the response is already created
         if !self.response_arraybuffer.is_initialized() {
@@ -1438,7 +1446,7 @@ impl XMLHttpRequest {
         self.response_xml.get()
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     /// <https://xhr.spec.whatwg.org/#json-response>
     fn json_response(&self, cx: JSContext, mut rval: MutableHandleValue) {
         // Step 1
@@ -1486,6 +1494,8 @@ impl XMLHttpRequest {
             &document,
             Some(DOMString::from(decoded)),
             wr.get_url(),
+            None,
+            None,
             can_gc,
         );
         document
@@ -1502,6 +1512,7 @@ impl XMLHttpRequest {
             &document,
             Some(DOMString::from(decoded)),
             wr.get_url(),
+            None,
             can_gc,
         );
         document
@@ -1533,6 +1544,8 @@ impl XMLHttpRequest {
             false,
             Some(doc.insecure_requests_policy()),
             doc.has_trustworthy_ancestor_origin(),
+            doc.custom_element_reaction_stack(),
+            doc.creation_sandboxing_flag_set(),
             can_gc,
         )
     }
@@ -1550,16 +1563,21 @@ impl XMLHttpRequest {
         self.response_status.set(Err(()));
     }
 
-    fn fetch(&self, request_builder: RequestBuilder, global: &GlobalScope) -> ErrorResult {
+    fn fetch(
+        &self,
+        request_builder: RequestBuilder,
+        global: &GlobalScope,
+        can_gc: CanGc,
+    ) -> ErrorResult {
         let xhr = Trusted::new(self);
 
-        let context = Arc::new(Mutex::new(XHRContext {
+        let sync_status = Arc::new(AtomicRefCell::new(None));
+        let context = XHRContext {
             xhr,
             gen_id: self.generation_id.get(),
-            sync_status: DomRefCell::new(None),
-            resource_timing: ResourceFetchTiming::new(ResourceTimingType::Resource),
+            sync_status: sync_status.clone(),
             url: request_builder.url.clone(),
-        }));
+        };
 
         let (task_source, script_port) = if self.sync.get() {
             let (sender, receiver) = global.new_script_pair();
@@ -1579,19 +1597,21 @@ impl XMLHttpRequest {
             )
         };
 
-        *self.canceller.borrow_mut() =
-            FetchCanceller::new(request_builder.id, global.core_resource_thread());
-        global.fetch(request_builder, context.clone(), task_source);
+        *self.canceller.borrow_mut() = FetchCanceller::new(
+            request_builder.id,
+            request_builder.keep_alive,
+            global.core_resource_thread(),
+        );
+
+        global.fetch(request_builder, context, task_source);
 
         if let Some(script_port) = script_port {
             loop {
-                if !global.process_event(script_port.recv().unwrap()) {
+                if !global.process_event(script_port.recv().unwrap(), can_gc) {
                     // We're exiting.
-                    return Err(Error::Abort);
+                    return Err(Error::Abort(None));
                 }
-                let context = context.lock().unwrap();
-                let sync_status = context.sync_status.borrow();
-                if let Some(ref status) = *sync_status {
+                if let Some(ref status) = *sync_status.borrow() {
                     return status.clone();
                 }
             }
@@ -1658,7 +1678,7 @@ impl XHRTimeoutCallback {
         let xhr = self.xhr.root();
         if xhr.ready_state.get() != XMLHttpRequestState::Done {
             xhr.process_partial_response(
-                XHRProgress::Errored(self.generation_id, Error::Timeout),
+                XHRProgress::Errored(self.generation_id, Error::Timeout(None)),
                 can_gc,
             );
         }
@@ -1667,9 +1687,13 @@ impl XHRTimeoutCallback {
 
 fn serialize_document(doc: &Document) -> Fallible<DOMString> {
     let mut writer = vec![];
-    match serialize(&mut writer, &doc.upcast::<Node>(), SerializeOpts::default()) {
+    match serialize(
+        &mut writer,
+        &HtmlSerialize::new(doc.upcast::<Node>()),
+        SerializeOpts::default(),
+    ) {
         Ok(_) => Ok(DOMString::from(String::from_utf8(writer).unwrap())),
-        Err(_) => Err(Error::InvalidState),
+        Err(_) => Err(Error::InvalidState(None)),
     }
 }
 

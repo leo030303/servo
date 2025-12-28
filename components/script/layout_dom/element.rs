@@ -50,7 +50,7 @@ use crate::dom::bindings::inheritance::{
 use crate::dom::bindings::root::LayoutDom;
 use crate::dom::characterdata::LayoutCharacterDataHelpers;
 use crate::dom::element::{Element, LayoutElementHelpers};
-use crate::dom::htmlslotelement::HTMLSlotElement;
+use crate::dom::html::htmlslotelement::HTMLSlotElement;
 use crate::dom::node::{LayoutNodeHelpers, Node, NodeFlags};
 use crate::layout_dom::{ServoLayoutNode, ServoShadowRoot, ServoThreadSafeLayoutNode};
 
@@ -126,19 +126,14 @@ impl<'dom> ServoLayoutElement<'dom> {
             return false;
         }
 
-        self.parent_element()
-            .map(|element| {
-                element.is_root() && element.element.local_name() == &local_name!("html")
-            })
-            .unwrap_or(false)
+        self.parent_element().is_some_and(|element| {
+            element.is_root() && element.element.local_name() == &local_name!("html")
+        })
     }
 
     /// Returns the parent element of this element, if it has one.
     fn parent_element(&self) -> Option<Self> {
-        self.element
-            .upcast()
-            .composed_parent_node_ref()
-            .and_then(|node| node.downcast().map(ServoLayoutElement::from_layout_js))
+        self.as_node().parent_element()
     }
 
     fn is_root(&self) -> bool {
@@ -220,9 +215,7 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
             return self.pseudo_element_originating_element();
         }
 
-        // FIXME: By default the inheritance parent would be the Self::parent_element
-        //        but probably we should use the flattened tree parent.
-        self.parent_element()
+        self.traversal_parent()
     }
 
     fn is_html_element(&self) -> bool {
@@ -564,7 +557,7 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
     where
         F: FnMut(&AtomIdent),
     {
-        self.element.each_custom_state(callback);
+        self.element.each_custom_state_for_layout(callback);
     }
 
     /// Returns the implicit scope root for given sheet index and host.
@@ -615,7 +608,35 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
                 return true;
             }
 
+            if new_box.position.is_absolutely_positioned() &&
+                old_box.original_display != new_box.original_display
+            {
+                // The original display only affects the static position, which is only used
+                // when both insets in some axis are auto.
+                // <https://drafts.csswg.org/css-position/#resolving-insets>
+                let position = new.get_position();
+                if (position.top.is_auto() && position.bottom.is_auto()) ||
+                    (position.left.is_auto() && position.right.is_auto())
+                {
+                    return true;
+                }
+            }
+
             if old.get_font() != new.get_font() {
+                return true;
+            }
+
+            if old.get_position().order != new.get_position().order {
+                return true;
+            }
+
+            // Only consider changes to the `quotes` attribute if they actually apply to this
+            // style (if it is a pseudo-element that supports it).
+            if matches!(
+                new.pseudo(),
+                Some(PseudoElement::Before | PseudoElement::After | PseudoElement::Marker),
+            ) && old.get_list().quotes != new.get_list().quotes
+            {
                 return true;
             }
 
@@ -627,7 +648,7 @@ impl<'dom> style::dom::TElement for ServoLayoutElement<'dom> {
             {
                 let alignment_establishes_new_block_formatting_context =
                     |style: &ComputedValues| {
-                        style.get_position().align_content.0.primary() != AlignFlags::NORMAL
+                        style.get_position().align_content.primary() != AlignFlags::NORMAL
                     };
 
                 let old_column = old.get_column();
@@ -775,7 +796,6 @@ impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
             NamespaceConstraint::Any => self
                 .element
                 .get_attr_vals_for_layout(local_name)
-                .iter()
                 .any(|value| value.eval_selector(operation)),
         }
     }
@@ -931,7 +951,6 @@ impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
         self.element.is::<HTMLSlotElement>()
     }
 
-    #[allow(unsafe_code)]
     fn assigned_slot(&self) -> Option<Self> {
         self.as_node().assigned_slot()
     }
@@ -964,7 +983,7 @@ impl<'dom> ::selectors::Element for ServoLayoutElement<'dom> {
     fn has_custom_state(&self, name: &AtomIdent) -> bool {
         let mut has_state = false;
         self.element
-            .each_custom_state(|state| has_state |= state == name);
+            .each_custom_state_for_layout(|state| has_state |= state == name);
 
         has_state
     }
@@ -1189,7 +1208,6 @@ impl ::selectors::Element for ServoThreadSafeLayoutElement<'_> {
                 .element
                 .element
                 .get_attr_vals_for_layout(local_name)
-                .iter()
                 .any(|v| v.eval_selector(operation)),
         }
     }

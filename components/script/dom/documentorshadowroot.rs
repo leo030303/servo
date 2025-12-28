@@ -9,11 +9,11 @@ use std::fmt;
 use embedder_traits::UntrustedNodeAddress;
 use js::rust::HandleValue;
 use layout_api::ElementsFromPointFlags;
+use rustc_hash::FxBuildHasher;
 use script_bindings::error::{Error, ErrorResult};
-use script_bindings::script_runtime::JSContext;
+use script_bindings::script_runtime::{CanGc, JSContext};
 use servo_arc::Arc;
 use servo_config::pref;
-use style::invalidation::media_queries::{MediaListKey, ToMediaListKey};
 use style::media_queries::MediaList;
 use style::shared_lock::{SharedRwLock as StyleSharedRwLock, SharedRwLockReadGuard};
 use style::stylesheets::scope_rule::ImplicitScopeRoot;
@@ -29,11 +29,11 @@ use crate::dom::bindings::conversions::{ConversionResult, SafeFromJSValConvertib
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::css::stylesheetlist::StyleSheetListOwner;
 use crate::dom::element::Element;
-use crate::dom::htmlelement::HTMLElement;
+use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::{self, Node, VecPreOrderInsertionHelper};
 use crate::dom::shadowroot::ShadowRoot;
-use crate::dom::stylesheetlist::StyleSheetListOwner;
 use crate::dom::types::CSSStyleSheet;
 use crate::dom::window::Window;
 use crate::stylesheet_set::StylesheetSetRef;
@@ -70,7 +70,7 @@ impl StylesheetSource {
 #[derive(Clone, JSTraceable, MallocSizeOf)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct ServoStylesheetInDocument {
-    #[ignore_malloc_size_of = "Arc"]
+    #[ignore_malloc_size_of = "Stylo"]
     #[no_trace]
     pub(crate) sheet: Arc<Stylesheet>,
     /// The object that owns this stylesheet. For constructed stylesheet, it would be the
@@ -99,12 +99,6 @@ impl PartialEq for ServoStylesheetInDocument {
     }
 }
 
-impl ToMediaListKey for ServoStylesheetInDocument {
-    fn to_media_list_key(&self) -> MediaListKey {
-        self.sheet.contents.to_media_list_key()
-    }
-}
-
 impl ::style::stylesheets::StylesheetInDocument for ServoStylesheetInDocument {
     fn enabled(&self) -> bool {
         self.sheet.enabled()
@@ -114,8 +108,8 @@ impl ::style::stylesheets::StylesheetInDocument for ServoStylesheetInDocument {
         self.sheet.media(guard)
     }
 
-    fn contents(&self) -> &StylesheetContents {
-        self.sheet.contents()
+    fn contents<'a>(&'a self, guard: &'a SharedRwLockReadGuard) -> &'a StylesheetContents {
+        self.sheet.contents(guard)
     }
 
     fn implicit_scope_root(&self) -> Option<ImplicitScopeRoot> {
@@ -137,7 +131,7 @@ impl DocumentOrShadowRoot {
         }
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     // https://drafts.csswg.org/cssom-view/#dom-document-elementfrompoint
     pub(crate) fn element_from_point(
         &self,
@@ -187,7 +181,7 @@ impl DocumentOrShadowRoot {
         }
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     // https://drafts.csswg.org/cssom-view/#dom-document-elementsfrompoint
     pub(crate) fn elements_from_point(
         &self,
@@ -307,7 +301,7 @@ impl DocumentOrShadowRoot {
     /// Remove any existing association between the provided id/name and any elements in this document.
     pub(crate) fn unregister_named_element(
         &self,
-        id_map: &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
+        id_map: &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>, FxBuildHasher>>,
         to_unregister: &Element,
         id: &Atom,
     ) {
@@ -335,7 +329,7 @@ impl DocumentOrShadowRoot {
     /// Associate an element present in this document with the provided id/name.
     pub(crate) fn register_named_element(
         &self,
-        id_map: &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
+        id_map: &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>, FxBuildHasher>>,
         element: &Element,
         id: &Atom,
         root: DomRoot<Node>,
@@ -381,7 +375,7 @@ impl DocumentOrShadowRoot {
             // > If value’s constructed flag is not set, or its constructor document is not equal
             // > to this DocumentOrShadowRoot’s node document, throw a "NotAllowedError" DOMException.
             if !sheet.constructor_document_matches(owner_doc) {
-                return Err(Error::NotAllowed);
+                return Err(Error::NotAllowed(None));
             }
         }
 
@@ -437,9 +431,10 @@ impl DocumentOrShadowRoot {
         adopted_stylesheets: &mut Vec<Dom<CSSStyleSheet>>,
         incoming_value: HandleValue,
         owner: &StyleSheetListOwner,
+        can_gc: CanGc,
     ) -> ErrorResult {
         let maybe_stylesheets =
-            Vec::<DomRoot<CSSStyleSheet>>::safe_from_jsval(context, incoming_value, ());
+            Vec::<DomRoot<CSSStyleSheet>>::safe_from_jsval(context, incoming_value, (), can_gc);
 
         match maybe_stylesheets {
             Ok(ConversionResult::Success(stylesheets)) => {

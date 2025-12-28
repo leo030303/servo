@@ -50,7 +50,7 @@ interface Document : Node {
   ProcessingInstruction createProcessingInstruction(DOMString target, DOMString data);
 
   [CEReactions, NewObject, Throws]
-  Node importNode(Node node, optional boolean deep = false);
+  Node importNode(Node node, optional (boolean or ImportNodeOptions) options = false);
   [CEReactions, Throws]
   Node adoptNode(Node node);
 
@@ -84,9 +84,17 @@ dictionary ElementCreationOptions {
   DOMString is;
 };
 
+dictionary ImportNodeOptions {
+  CustomElementRegistry customElementRegistry;
+  boolean selfOnly = false;
+};
+
 // https://html.spec.whatwg.org/multipage/#the-document-object
 // [LegacyOverrideBuiltIns]
 partial /*sealed*/ interface Document {
+  [NewObject, Throws]
+  static Document parseHTMLUnsafe((TrustedHTML or DOMString) html);
+
   // resource metadata management
   [PutForwards=href, LegacyUnforgeable]
   readonly attribute Location? location;

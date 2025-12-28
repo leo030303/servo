@@ -7,15 +7,13 @@
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::prelude::*;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Weak};
 use std::thread;
-use std::time::Duration;
 
-use base::generic_channel::GenericSender;
 use base::id::CookieStoreId;
+use base::threadpool::ThreadPool;
 use cookie::Cookie;
 use crossbeam_channel::Sender;
 use devtools_traits::DevtoolsControlMsg;
@@ -25,24 +23,25 @@ use ipc_channel::ipc::{self, IpcReceiver, IpcReceiverSet, IpcSender};
 use log::{debug, trace, warn};
 use net_traits::blob_url_store::parse_blob_url;
 use net_traits::filemanager_thread::FileTokenCheck;
-use net_traits::indexeddb_thread::IndexedDBThreadMsg;
 use net_traits::pub_domains::public_suffix_list_size_of;
 use net_traits::request::{Destination, RequestBuilder, RequestId};
 use net_traits::response::{Response, ResponseInit};
-use net_traits::storage_thread::StorageThreadMsg;
 use net_traits::{
     AsyncRuntime, CookieAsyncResponse, CookieData, CookieSource, CoreResourceMsg,
     CoreResourceThread, CustomResponseMediator, DiscardFetch, FetchChannels, FetchTaskTarget,
     ResourceFetchTiming, ResourceThreads, ResourceTimingType, WebSocketDomAction,
     WebSocketNetworkEvent,
 };
+use parking_lot::{Mutex, RwLock};
 use profile_traits::mem::{
     ProcessReports, ProfilerChan as MemProfilerChan, Report, ReportKind, ReportsChan,
     perform_memory_report,
 };
 use profile_traits::path;
 use profile_traits::time::ProfilerChan;
-use rustls::RootCertStore;
+use rustc_hash::FxHashMap;
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::{ImmutableOrigin, ServoUrl};
@@ -55,25 +54,26 @@ use crate::cookie::ServoCookie;
 use crate::cookie_storage::CookieStorage;
 use crate::fetch::cors_cache::CorsCache;
 use crate::fetch::fetch_params::FetchParams;
-use crate::fetch::methods::{CancellationListener, FetchContext, fetch};
+use crate::fetch::methods::{CancellationListener, FetchContext, WebSocketChannel, fetch};
 use crate::filemanager_thread::FileManager;
 use crate::hsts::{self, HstsList};
 use crate::http_cache::HttpCache;
 use crate::http_loader::{HttpState, http_redirect_fetch};
-use crate::indexeddb::idb_thread::IndexedDBThreadFactory;
 use crate::protocols::ProtocolRegistry;
 use crate::request_interceptor::RequestInterceptor;
-use crate::storage_thread::StorageThreadFactory;
-use crate::websocket_loader;
+use crate::websocket_loader::create_handshake_request;
 
 /// Load a file with CA certificate and produce a RootCertStore with the results.
-fn load_root_cert_store_from_file(file_path: String) -> io::Result<RootCertStore> {
-    let mut root_cert_store = RootCertStore::empty();
-
+fn load_root_cert_store_from_file(file_path: String) -> io::Result<Vec<CertificateDer<'static>>> {
     let mut pem = BufReader::new(File::open(file_path)?);
-    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut pem).collect();
-    root_cert_store.add_parsable_certificates(certs?);
-    Ok(root_cert_store)
+
+    let certs = CertificateDer::pem_reader_iter(&mut pem)
+        .filter_map(|cert| {
+            cert.inspect_err(|e| log::error!("Could not load certificate ({e}). Ignoring it."))
+                .ok()
+        })
+        .collect();
+    Ok(certs)
 }
 
 /// Returns a tuple of (public, private) senders to the new threads.
@@ -91,16 +91,13 @@ pub fn new_resource_threads(
     // Initialize the async runtime, and get a handle to it for use in clean shutdown.
     let async_runtime = init_async_runtime();
 
-    let ca_certificates = match certificate_path {
-        Some(path) => match load_root_cert_store_from_file(path) {
-            Ok(root_cert_store) => CACertificates::Override(root_cert_store),
-            Err(error) => {
-                warn!("Could not load CA file. Falling back to defaults. {error:?}");
-                CACertificates::Default
-            },
-        },
-        None => CACertificates::Default,
-    };
+    let ca_certificates = certificate_path
+        .and_then(|path| {
+            Some(CACertificates::Override(
+                load_root_cert_store_from_file(path).ok()?,
+            ))
+        })
+        .unwrap_or_default();
 
     let (public_core, private_core) = new_core_resource_thread(
         devtools_sender,
@@ -112,12 +109,9 @@ pub fn new_resource_threads(
         ignore_certificate_errors,
         protocols,
     );
-    let idb: IpcSender<IndexedDBThreadMsg> = IndexedDBThreadFactory::new(config_dir.clone());
-    let storage: GenericSender<StorageThreadMsg> =
-        StorageThreadFactory::new(config_dir, mem_profiler_chan);
     (
-        ResourceThreads::new(public_core, storage.clone(), idb.clone()),
-        ResourceThreads::new(private_core, storage, idb),
+        ResourceThreads::new(public_core),
+        ResourceThreads::new(private_core),
         async_runtime,
     )
 }
@@ -130,7 +124,7 @@ pub fn new_core_resource_thread(
     mem_profiler_chan: MemProfilerChan,
     embedder_proxy: EmbedderProxy,
     config_dir: Option<PathBuf>,
-    ca_certificates: CACertificates,
+    ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     protocols: Arc<ProtocolRegistry>,
 ) -> (CoreResourceThread, CoreResourceThread) {
@@ -180,26 +174,26 @@ pub fn new_core_resource_thread(
 struct ResourceChannelManager {
     resource_manager: CoreResourceManager,
     config_dir: Option<PathBuf>,
-    ca_certificates: CACertificates,
+    ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
-    cancellation_listeners: HashMap<RequestId, Weak<CancellationListener>>,
-    cookie_listeners: HashMap<CookieStoreId, IpcSender<CookieAsyncResponse>>,
+    cancellation_listeners: FxHashMap<RequestId, Weak<CancellationListener>>,
+    cookie_listeners: FxHashMap<CookieStoreId, IpcSender<CookieAsyncResponse>>,
 }
 
+/// This returns a tuple HttpState and a private HttpState.
 fn create_http_states(
     config_dir: Option<&Path>,
-    ca_certificates: CACertificates,
+    ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
     embedder_proxy: EmbedderProxy,
 ) -> (Arc<HttpState>, Arc<HttpState>) {
     let mut hsts_list = HstsList::default();
     let mut auth_cache = AuthCache::default();
-    let http_cache = HttpCache::default();
     let mut cookie_jar = CookieStorage::new(150);
     if let Some(config_dir) = config_dir {
-        read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
-        read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
-        read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
+        base::read_json_from_file(&mut auth_cache, config_dir, "auth_cache.json");
+        base::read_json_from_file(&mut hsts_list, config_dir, "hsts_list.json");
+        base::read_json_from_file(&mut cookie_jar, config_dir, "cookie_jar.json");
     }
 
     let override_manager = CertificateErrorOverrideManager::new();
@@ -207,9 +201,8 @@ fn create_http_states(
         hsts_list: RwLock::new(hsts_list),
         cookie_jar: RwLock::new(cookie_jar),
         auth_cache: RwLock::new(auth_cache),
-        history_states: RwLock::new(HashMap::new()),
-        http_cache: RwLock::new(http_cache),
-        http_cache_state: Mutex::new(HashMap::new()),
+        history_states: RwLock::new(FxHashMap::default()),
+        http_cache: HttpCache::default(),
         client: create_http_client(create_tls_config(
             ca_certificates.clone(),
             ignore_certificate_errors,
@@ -224,9 +217,8 @@ fn create_http_states(
         hsts_list: RwLock::new(HstsList::default()),
         cookie_jar: RwLock::new(CookieStorage::new(150)),
         auth_cache: RwLock::new(AuthCache::default()),
-        history_states: RwLock::new(HashMap::new()),
-        http_cache: RwLock::new(HttpCache::default()),
-        http_cache_state: Mutex::new(HashMap::new()),
+        history_states: RwLock::new(FxHashMap::default()),
+        http_cache: HttpCache::default(),
         client: create_http_client(create_tls_config(
             ca_certificates,
             ignore_certificate_errors,
@@ -240,7 +232,6 @@ fn create_http_states(
 }
 
 impl ResourceChannelManager {
-    #[allow(unsafe_code)]
     fn start(
         &mut self,
         public_receiver: IpcReceiver<CoreResourceMsg>,
@@ -378,12 +369,19 @@ impl ResourceChannelManager {
                 FetchChannels::WebSocket {
                     event_sender,
                     action_receiver,
-                } => self.resource_manager.websocket_connect(
-                    request_builder,
-                    event_sender,
-                    action_receiver,
-                    http_state,
-                ),
+                } => {
+                    let cancellation_listener =
+                        self.get_or_create_cancellation_listener(request_builder.id);
+
+                    self.resource_manager.websocket_connect(
+                        request_builder,
+                        event_sender,
+                        action_receiver,
+                        http_state,
+                        cancellation_listener,
+                        protocols,
+                    )
+                },
                 FetchChannels::Prefetch => self.resource_manager.fetch(
                     request_builder,
                     None,
@@ -401,19 +399,20 @@ impl ResourceChannelManager {
                     cancellation_listener.cancel();
                 }
             },
-            CoreResourceMsg::DeleteCookies(request) => {
+            CoreResourceMsg::DeleteCookies(request, sender) => {
                 http_state
                     .cookie_jar
                     .write()
-                    .unwrap()
-                    .clear_storage(&request);
+                    .clear_storage(request.as_ref());
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                }
                 return true;
             },
             CoreResourceMsg::DeleteCookie(request, name) => {
                 http_state
                     .cookie_jar
                     .write()
-                    .unwrap()
                     .delete_cookie_with_name(&request, name);
                 return true;
             },
@@ -421,7 +420,6 @@ impl ResourceChannelManager {
                 http_state
                     .cookie_jar
                     .write()
-                    .unwrap()
                     .delete_cookie_with_name(&url, name);
                 self.send_cookie_response(cookie_store_id, CookieData::Delete(Ok(())));
             },
@@ -460,14 +458,14 @@ impl ResourceChannelManager {
                 self.send_cookie_response(cookie_store_id, CookieData::Set(Ok(())));
             },
             CoreResourceMsg::GetCookiesForUrl(url, consumer, source) => {
-                let mut cookie_jar = http_state.cookie_jar.write().unwrap();
+                let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 consumer
                     .send(cookie_jar.cookies_for_url(&url, source))
                     .unwrap();
             },
             CoreResourceMsg::GetCookieDataForUrlAsync(cookie_store_id, url, name) => {
-                let mut cookie_jar = http_state.cookie_jar.write().unwrap();
+                let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookie = cookie_jar
                     .query_cookies(&url, name)
@@ -477,7 +475,7 @@ impl ResourceChannelManager {
                 self.send_cookie_response(cookie_store_id, CookieData::Get(cookie));
             },
             CoreResourceMsg::GetAllCookieDataForUrlAsync(cookie_store_id, url, name) => {
-                let mut cookie_jar = http_state.cookie_jar.write().unwrap();
+                let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookies = cookie_jar
                     .query_cookies(&url, name)
@@ -499,7 +497,7 @@ impl ResourceChannelManager {
                     .insert(origin, mediator_chan);
             },
             CoreResourceMsg::GetCookiesDataForUrl(url, consumer, source) => {
-                let mut cookie_jar = http_state.cookie_jar.write().unwrap();
+                let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 let cookies = cookie_jar
                     .cookies_data_for_url(&url, source)
@@ -507,42 +505,42 @@ impl ResourceChannelManager {
                     .collect();
                 consumer.send(cookies).unwrap();
             },
+            CoreResourceMsg::ListCookies(sender) => {
+                let mut cookie_jar = http_state.cookie_jar.write();
+                cookie_jar.remove_all_expired_cookies();
+                let _ = sender.send(cookie_jar.cookie_site_descriptors());
+            },
             CoreResourceMsg::GetHistoryState(history_state_id, consumer) => {
-                let history_states = http_state.history_states.read().unwrap();
+                let history_states = http_state.history_states.read();
                 consumer
                     .send(history_states.get(&history_state_id).cloned())
                     .unwrap();
             },
             CoreResourceMsg::SetHistoryState(history_state_id, structured_data) => {
-                let mut history_states = http_state.history_states.write().unwrap();
+                let mut history_states = http_state.history_states.write();
                 history_states.insert(history_state_id, structured_data);
             },
             CoreResourceMsg::RemoveHistoryStates(states_to_remove) => {
-                let mut history_states = http_state.history_states.write().unwrap();
+                let mut history_states = http_state.history_states.write();
                 for history_state in states_to_remove {
                     history_states.remove(&history_state);
                 }
             },
-            CoreResourceMsg::ClearCache => {
-                http_state.http_cache.write().unwrap().clear();
+            CoreResourceMsg::ClearCache(sender) => {
+                http_state.http_cache.clear();
+                if let Some(sender) = sender {
+                    let _ = sender.send(());
+                }
             },
             CoreResourceMsg::ToFileManager(msg) => self.resource_manager.filemanager.handle(msg),
             CoreResourceMsg::Exit(sender) => {
                 if let Some(ref config_dir) = self.config_dir {
-                    match http_state.auth_cache.read() {
-                        Ok(auth_cache) => {
-                            write_json_to_file(&*auth_cache, config_dir, "auth_cache.json")
-                        },
-                        Err(_) => warn!("Error writing auth cache to disk"),
-                    }
-                    match http_state.cookie_jar.read() {
-                        Ok(jar) => write_json_to_file(&*jar, config_dir, "cookie_jar.json"),
-                        Err(_) => warn!("Error writing cookie jar to disk"),
-                    }
-                    match http_state.hsts_list.read() {
-                        Ok(hsts) => write_json_to_file(&*hsts, config_dir, "hsts_list.json"),
-                        Err(_) => warn!("Error writing hsts list to disk"),
-                    }
+                    let auth_cache = http_state.auth_cache.read();
+                    base::write_json_to_file(&*auth_cache, config_dir, "auth_cache.json");
+                    let jar = http_state.cookie_jar.read();
+                    base::write_json_to_file(&*jar, config_dir, "cookie_jar.json");
+                    let hsts = http_state.hsts_list.read();
+                    base::write_json_to_file(&*hsts, config_dir, "hsts_list.json");
                 }
                 self.resource_manager.exit();
                 let _ = sender.send(());
@@ -551,49 +549,6 @@ impl ResourceChannelManager {
         }
         true
     }
-}
-
-pub fn read_json_from_file<T>(data: &mut T, config_dir: &Path, filename: &str)
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let path = config_dir.join(filename);
-    let display = path.display();
-
-    let mut file = match File::open(&path) {
-        Err(why) => {
-            warn!("couldn't open {}: {}", display, why);
-            return;
-        },
-        Ok(file) => file,
-    };
-
-    let mut string_buffer: String = String::new();
-    match file.read_to_string(&mut string_buffer) {
-        Err(why) => panic!("couldn't read from {}: {}", display, why),
-        Ok(_) => trace!("successfully read from {}", display),
-    }
-
-    match serde_json::from_str(&string_buffer) {
-        Ok(decoded_buffer) => *data = decoded_buffer,
-        Err(why) => warn!("Could not decode buffer{}", why),
-    }
-}
-
-pub fn write_json_to_file<T>(data: &T, config_dir: &Path, filename: &str)
-where
-    T: Serialize,
-{
-    let path = config_dir.join(filename);
-    let display = path.display();
-
-    let mut file = match File::create(&path) {
-        Err(why) => panic!("couldn't create {}: {}", display, why),
-        Ok(file) => file,
-    };
-    let mut writer = BufWriter::new(&mut file);
-    serde_json::to_writer_pretty(&mut writer, data).expect("Could not serialize to file");
-    trace!("successfully wrote to {display}");
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -622,139 +577,9 @@ pub struct CoreResourceManager {
     sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
     request_interceptor: RequestInterceptor,
-    thread_pool: Arc<CoreResourceThreadPool>,
-    ca_certificates: CACertificates,
+    thread_pool: Arc<ThreadPool>,
+    ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
-}
-
-/// The state of the thread-pool used by CoreResource.
-struct ThreadPoolState {
-    /// The number of active workers.
-    active_workers: u32,
-    /// Whether the pool can spawn additional work.
-    active: bool,
-}
-
-impl ThreadPoolState {
-    pub fn new() -> ThreadPoolState {
-        ThreadPoolState {
-            active_workers: 0,
-            active: true,
-        }
-    }
-
-    /// Is the pool still able to spawn new work?
-    pub fn is_active(&self) -> bool {
-        self.active
-    }
-
-    /// How many workers are currently active?
-    pub fn active_workers(&self) -> u32 {
-        self.active_workers
-    }
-
-    /// Prevent additional work from being spawned.
-    pub fn switch_to_inactive(&mut self) {
-        self.active = false;
-    }
-
-    /// Add to the count of active workers.
-    pub fn increment_active(&mut self) {
-        self.active_workers += 1;
-    }
-
-    /// Substract from the count of active workers.
-    pub fn decrement_active(&mut self) {
-        self.active_workers -= 1;
-    }
-}
-
-/// Threadpool used by Fetch and file operations.
-pub struct CoreResourceThreadPool {
-    pool: rayon::ThreadPool,
-    state: Arc<Mutex<ThreadPoolState>>,
-}
-
-impl CoreResourceThreadPool {
-    pub fn new(num_threads: usize, pool_name: String) -> CoreResourceThreadPool {
-        debug!("Creating new CoreResourceThreadPool with {num_threads} threads!");
-        let pool = rayon::ThreadPoolBuilder::new()
-            .thread_name(move |i| format!("{pool_name}#{i}"))
-            .num_threads(num_threads)
-            .build()
-            .unwrap();
-        let state = Arc::new(Mutex::new(ThreadPoolState::new()));
-        CoreResourceThreadPool { pool, state }
-    }
-
-    /// Spawn work on the thread-pool, if still active.
-    ///
-    /// There is no need to give feedback to the caller,
-    /// because if we do not perform work,
-    /// it is because the system as a whole is exiting.
-    pub fn spawn<OP>(&self, work: OP)
-    where
-        OP: FnOnce() + Send + 'static,
-    {
-        {
-            let mut state = self.state.lock().unwrap();
-            if state.is_active() {
-                state.increment_active();
-            } else {
-                // Don't spawn any work.
-                return;
-            }
-        }
-
-        let state = self.state.clone();
-
-        self.pool.spawn(move || {
-            {
-                let mut state = state.lock().unwrap();
-                if !state.is_active() {
-                    // Decrement number of active workers and return,
-                    // without doing any work.
-                    return state.decrement_active();
-                }
-            }
-            // Perform work.
-            work();
-            {
-                // Decrement number of active workers.
-                let mut state = state.lock().unwrap();
-                state.decrement_active();
-            }
-        });
-    }
-
-    /// Prevent further work from being spawned,
-    /// and wait until all workers are done,
-    /// or a timeout of roughly one second has been reached.
-    pub fn exit(&self) {
-        {
-            let mut state = self.state.lock().unwrap();
-            state.switch_to_inactive();
-        }
-        let mut rounds = 0;
-        loop {
-            rounds += 1;
-            {
-                let state = self.state.lock().unwrap();
-                let still_active = state.active_workers();
-
-                if still_active == 0 || rounds == 10 {
-                    if still_active > 0 {
-                        debug!(
-                            "Exiting CoreResourceThreadPool with {:?} still working(should be zero)",
-                            still_active
-                        );
-                    }
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-    }
 }
 
 impl CoreResourceManager {
@@ -762,14 +587,14 @@ impl CoreResourceManager {
         devtools_sender: Option<Sender<DevtoolsControlMsg>>,
         _profiler_chan: ProfilerChan,
         embedder_proxy: EmbedderProxy,
-        ca_certificates: CACertificates,
+        ca_certificates: CACertificates<'static>,
         ignore_certificate_errors: bool,
     ) -> CoreResourceManager {
         let num_threads = thread::available_parallelism()
             .map(|i| i.get())
             .unwrap_or(servo_config::pref!(threadpools_fallback_worker_num) as usize)
             .min(servo_config::pref!(threadpools_resource_workers_max).max(1) as usize);
-        let pool = CoreResourceThreadPool::new(num_threads, "CoreResourceThreadPool".to_string());
+        let pool = ThreadPool::new(num_threads, "CoreResourceThreadPool".to_string());
         let pool_handle = Arc::new(pool);
         CoreResourceManager {
             devtools_sender,
@@ -800,7 +625,7 @@ impl CoreResourceManager {
         http_state: &Arc<HttpState>,
     ) {
         if let Some(cookie) = ServoCookie::new_wrapped(cookie, request, source) {
-            let mut cookie_jar = http_state.cookie_jar.write().unwrap();
+            let mut cookie_jar = http_state.cookie_jar.write();
             cookie_jar.push(cookie, request, source)
         }
     }
@@ -848,6 +673,9 @@ impl CoreResourceManager {
             _ => (FileTokenCheck::NotRequired, None),
         };
 
+        let ca_certificates = self.ca_certificates.clone();
+        let ignore_certificate_errors = self.ignore_certificate_errors;
+
         spawn_task(async move {
             // XXXManishearth: Check origin against pipeline id (also ensure that the mode is allowed)
             // todo load context / mimesniff in fetch
@@ -863,6 +691,9 @@ impl CoreResourceManager {
                 cancellation_listener,
                 timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(request.timing_type()))),
                 protocols,
+                websocket_chan: None,
+                ca_certificates,
+                ignore_certificate_errors,
             };
 
             match res_init_ {
@@ -891,26 +722,72 @@ impl CoreResourceManager {
                 context
                     .filemanager
                     .lock()
-                    .unwrap()
                     .invalidate_token(&context.file_token, id);
             }
         });
     }
 
+    /// <https://websockets.spec.whatwg.org/#concept-websocket-establish>
     fn websocket_connect(
         &self,
-        request: RequestBuilder,
+        mut request: RequestBuilder,
         event_sender: IpcSender<WebSocketNetworkEvent>,
         action_receiver: IpcReceiver<WebSocketDomAction>,
         http_state: &Arc<HttpState>,
+        cancellation_listener: Arc<CancellationListener>,
+        protocols: Arc<ProtocolRegistry>,
     ) {
-        websocket_loader::init(
-            request,
-            event_sender,
-            action_receiver,
-            http_state.clone(),
-            self.ca_certificates.clone(),
-            self.ignore_certificate_errors,
-        );
+        let http_state = http_state.clone();
+        let dc = self.devtools_sender.clone();
+        let filemanager = self.filemanager.clone();
+        let request_interceptor = self.request_interceptor.clone();
+
+        let ca_certificates = self.ca_certificates.clone();
+        let ignore_certificate_errors = self.ignore_certificate_errors;
+
+        spawn_task(async move {
+            let mut event_sender = event_sender;
+
+            // Let requestURL be a copy of url, with its scheme set to "http", if url’s scheme is
+            // "ws"; otherwise to "https"
+            let scheme = match request.url.scheme() {
+                "ws" => "http",
+                _ => "https",
+            };
+            request
+                .url
+                .as_mut_url()
+                .set_scheme(scheme)
+                .unwrap_or_else(|_| panic!("Can't set scheme to {scheme}"));
+
+            match create_handshake_request(request, http_state.clone()) {
+                Ok(request) => {
+                    let context = FetchContext {
+                        state: http_state,
+                        user_agent: servo_config::pref!(user_agent),
+                        devtools_chan: dc.map(|dc| Arc::new(Mutex::new(dc))),
+                        filemanager: Arc::new(Mutex::new(filemanager)),
+                        file_token: FileTokenCheck::NotRequired,
+                        request_interceptor: Arc::new(Mutex::new(request_interceptor)),
+                        cancellation_listener,
+                        timing: ServoArc::new(Mutex::new(ResourceFetchTiming::new(
+                            request.timing_type(),
+                        ))),
+                        protocols: protocols.clone(),
+                        websocket_chan: Some(Arc::new(Mutex::new(WebSocketChannel::new(
+                            event_sender.clone(),
+                            Some(action_receiver),
+                        )))),
+                        ca_certificates,
+                        ignore_certificate_errors,
+                    };
+                    fetch(request, &mut event_sender, &context).await;
+                },
+                Err(e) => {
+                    trace!("unable to create websocket handshake request {:?}", e);
+                    let _ = event_sender.send(WebSocketNetworkEvent::Fail);
+                },
+            }
+        });
     }
 }

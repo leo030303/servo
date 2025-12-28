@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 
 use std::borrow::Cow;
 use std::fmt;
@@ -405,6 +405,11 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
         this.image_density()
     }
 
+    fn showing_broken_image_icon(&self) -> bool {
+        let this = unsafe { self.get_jsmanaged() };
+        this.showing_broken_image_icon()
+    }
+
     fn image_data(&self) -> Option<(Option<Image>, Option<ImageMetadata>)> {
         let this = unsafe { self.get_jsmanaged() };
         this.image_data()
@@ -470,6 +475,19 @@ impl<'dom> ThreadSafeLayoutNode<'dom> for ServoThreadSafeLayoutNode<'dom> {
             pseudo_element_chain,
         }
     }
+
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
+    fn set_uses_content_attribute_with_attr(&self, uses_content_attribute_with_attr: bool) {
+        unsafe {
+            self.node.node.set_flag(
+                NodeFlags::USES_ATTR_IN_CONTENT_ATTRIBUTE,
+                uses_content_attribute_with_attr,
+            )
+        }
+    }
 }
 
 pub enum ServoThreadSafeLayoutNodeChildrenIterator<'dom> {
@@ -480,7 +498,7 @@ pub enum ServoThreadSafeLayoutNodeChildrenIterator<'dom> {
 }
 
 impl<'dom> ServoThreadSafeLayoutNodeChildrenIterator<'dom> {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn new(
         parent: ServoThreadSafeLayoutNode<'dom>,
     ) -> ServoThreadSafeLayoutNodeChildrenIterator<'dom> {

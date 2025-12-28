@@ -45,10 +45,10 @@ impl IIRFilterNode {
         if !(1..=20).contains(&options.feedforward.len()) ||
             !(1..=20).contains(&options.feedback.len())
         {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
         if options.feedforward.iter().all(|v| **v == 0.0) || *options.feedback[0] == 0.0 {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         let node_options =
             options
@@ -110,7 +110,6 @@ impl IIRFilterNodeMethods<crate::DomTypeHolder> for IIRFilterNode {
         IIRFilterNode::new_with_proto(window, proto, context, options, can_gc)
     }
 
-    #[allow(unsafe_code)]
     /// <https://webaudio.github.io/web-audio-api/#dom-iirfilternode-getfrequencyresponse>
     fn GetFrequencyResponse(
         &self,
@@ -120,7 +119,7 @@ impl IIRFilterNodeMethods<crate::DomTypeHolder> for IIRFilterNode {
     ) -> Result<(), Error> {
         let len = frequency_hz.len();
         if len != mag_response.len() || len != phase_response.len() {
-            return Err(Error::InvalidAccess);
+            return Err(Error::InvalidAccess(None));
         }
         let feedforward: Vec<f64> = (self.feedforward.iter().map(|v| **v).collect_vec()).to_vec();
         let feedback: Vec<f64> = (self.feedback.iter().map(|v| **v).collect_vec()).to_vec();

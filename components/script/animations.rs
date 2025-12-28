@@ -10,8 +10,8 @@ use base::id::PipelineId;
 use constellation_traits::ScriptToConstellationMessage;
 use cssparser::ToCss;
 use embedder_traits::{AnimationState as AnimationsPresentState, UntrustedNodeAddress};
-use fxhash::{FxHashMap, FxHashSet};
 use libc::c_void;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use style::animation::{
     Animation, AnimationSetKey, AnimationState, DocumentAnimationSet, ElementAnimationSet,
@@ -336,7 +336,7 @@ impl Animations {
 
     /// Ensure that all nodes with new animations are rooted. This should be called
     /// immediately after a restyle, to ensure that these addresses are still valid.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn root_newly_animating_dom_nodes(
         &self,
         sets: &FxHashMap<AnimationSetKey, ElementAnimationSet>,

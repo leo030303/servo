@@ -3,12 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::collections::HashMap;
 
 use base::id::{DomRectId, DomRectIndex};
 use constellation_traits::DomRect;
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use rustc_hash::FxHashMap;
 
 use crate::dom::bindings::codegen::Bindings::DOMRectReadOnlyBinding::{
     DOMRectInit, DOMRectReadOnlyMethods,
@@ -92,7 +92,7 @@ impl DOMRectReadOnly {
 }
 
 impl DOMRectReadOnlyMethods<crate::DomTypeHolder> for DOMRectReadOnly {
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-domrectreadonly
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-domrectreadonly>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -119,27 +119,27 @@ impl DOMRectReadOnlyMethods<crate::DomTypeHolder> for DOMRectReadOnly {
         reflect_dom_object(Box::new(dom_rect), global, can_gc)
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-x
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-x>
     fn X(&self) -> f64 {
         self.x.get()
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-y
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-y>
     fn Y(&self) -> f64 {
         self.y.get()
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-width
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-width>
     fn Width(&self) -> f64 {
         self.width.get()
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-height
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-height>
     fn Height(&self) -> f64 {
         self.height.get()
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-top
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-top>
     fn Top(&self) -> f64 {
         let height = self.height.get();
         if height >= 0f64 {
@@ -149,7 +149,7 @@ impl DOMRectReadOnlyMethods<crate::DomTypeHolder> for DOMRectReadOnly {
         }
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-right
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-right>
     fn Right(&self) -> f64 {
         let width = self.width.get();
         if width < 0f64 {
@@ -159,7 +159,7 @@ impl DOMRectReadOnlyMethods<crate::DomTypeHolder> for DOMRectReadOnly {
         }
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-bottom
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-bottom>
     fn Bottom(&self) -> f64 {
         let height = self.height.get();
         if height < 0f64 {
@@ -169,7 +169,7 @@ impl DOMRectReadOnlyMethods<crate::DomTypeHolder> for DOMRectReadOnly {
         }
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domrectreadonly-left
+    /// <https://drafts.fxtf.org/geometry/#dom-domrectreadonly-left>
     fn Left(&self) -> f64 {
         let width = self.width.get();
         if width >= 0f64 {
@@ -239,7 +239,7 @@ impl Serializable for DOMRectReadOnly {
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<Type, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<Type, Self::Data>> {
         match data {
             StructuredData::Reader(reader) => &mut reader.rects,
             StructuredData::Writer(writer) => &mut writer.rects,

@@ -45,10 +45,25 @@ pub struct LogicalSides<T> {
     pub block_end: T,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct LogicalSides1D<T> {
     pub start: T,
     pub end: T,
+}
+
+impl<T> LogicalSides1D<T> {
+    pub(crate) fn map<U>(&self, f: impl Fn(&T) -> U) -> LogicalSides1D<U> {
+        LogicalSides1D {
+            start: f(&self.start),
+            end: f(&self.end),
+        }
+    }
+}
+
+impl LogicalSides1D<AutoOr<&LengthPercentage>> {
+    pub(crate) fn percentages_relative_to(&self, basis: Au) -> LogicalSides1D<AutoOr<Au>> {
+        self.map(|value| value.map(|length_percentage| length_percentage.to_used_value(basis)))
+    }
 }
 
 impl<T: fmt::Debug> fmt::Debug for LogicalVec2<T> {
@@ -480,13 +495,6 @@ impl<T> LogicalSides1D<AutoOr<T>> {
     #[inline]
     pub(crate) fn either_auto(&self) -> bool {
         self.start.is_auto() || self.end.is_auto()
-    }
-}
-
-impl<T: Add + Copy> LogicalSides1D<T> {
-    #[inline]
-    pub(crate) fn sum(&self) -> T::Output {
-        self.start + self.end
     }
 }
 

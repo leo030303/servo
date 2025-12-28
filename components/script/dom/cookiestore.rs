@@ -6,27 +6,26 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
+use base::IpcSend;
 use base::id::CookieStoreId;
-use cookie::Expiration::DateTime;
 use cookie::{Cookie, SameSite};
 use dom_struct::dom_struct;
 use hyper_serde::Serde;
 use ipc_channel::ipc;
+use ipc_channel::ipc::IpcSender;
 use ipc_channel::router::ROUTER;
 use itertools::Itertools;
 use js::jsval::NullValue;
 use net_traits::CookieSource::NonHTTP;
-use net_traits::{CookieAsyncResponse, CookieData, CoreResourceMsg, IpcSend};
+use net_traits::{CookieAsyncResponse, CookieData, CoreResourceMsg};
 use script_bindings::script_runtime::CanGc;
 use servo_url::ServoUrl;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CookieStoreBinding::{
-    CookieInit, CookieListItem, CookieSameSite, CookieStoreDeleteOptions, CookieStoreGetOptions,
-    CookieStoreMethods,
+    CookieInit, CookieListItem, CookieStoreDeleteOptions, CookieStoreGetOptions, CookieStoreMethods,
 };
 use crate::dom::bindings::error::Error;
-use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
@@ -44,11 +43,14 @@ use crate::task_source::SendableTaskSource;
 #[dom_struct]
 pub(crate) struct CookieStore {
     eventtarget: EventTarget,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     in_flight: DomRefCell<VecDeque<Rc<Promise>>>,
     // Store an id so that we can send it with requests and the resource thread knows who to respond to
     #[no_trace]
     store_id: CookieStoreId,
+    #[ignore_malloc_size_of = "Channels are hard"]
+    #[no_trace]
+    unregister_channel: IpcSender<CoreResourceMsg>,
 }
 
 struct CookieListener {
@@ -95,16 +97,23 @@ impl CookieListener {
 }
 
 impl CookieStore {
-    fn new_inherited() -> CookieStore {
+    fn new_inherited(unregister_channel: IpcSender<CoreResourceMsg>) -> CookieStore {
         CookieStore {
             eventtarget: EventTarget::new_inherited(),
             in_flight: Default::default(),
             store_id: CookieStoreId::new(),
+            unregister_channel,
         }
     }
 
     pub(crate) fn new(global: &GlobalScope, can_gc: CanGc) -> DomRoot<CookieStore> {
-        let store = reflect_dom_object(Box::new(CookieStore::new_inherited()), global, can_gc);
+        let store = reflect_dom_object(
+            Box::new(CookieStore::new_inherited(
+                global.resource_threads().core_thread.clone(),
+            )),
+            global,
+            can_gc,
+        );
         store.setup_route();
         store
     }
@@ -149,36 +158,8 @@ fn cookie_to_list_item(cookie: Cookie) -> CookieListItem {
     // TODO: Investigate if we need to explicitly UTF-8 decode without BOM here or if thats
     // already being done by cookie-rs or implicitly by using rust strings
     CookieListItem {
-        // Let domain be the result of running UTF-8 decode without BOM on cookie’s domain.
-        domain: cookie
-            .domain()
-            .map(|domain| Some(domain.to_string().into())),
-
-        // Let expires be cookie’s expiry-time (as a timestamp).
-        expires: match cookie.expires() {
-            None | Some(cookie::Expiration::Session) => None,
-            Some(DateTime(time)) => Some(Some(Finite::wrap((time.unix_timestamp() * 1000) as f64))),
-        },
-
         // Let name be the result of running UTF-8 decode without BOM on cookie’s name.
         name: Some(cookie.name().to_string().into()),
-
-        // Let partitioned be a boolean indicating that the user agent supports cookie partitioning and that i
-        // that cookie has a partition key.
-        partitioned: Some(false), // Do we support partitioning? Spec says true only if UA supports it
-
-        // Let path be the result of running UTF-8 decode without BOM on cookie’s path.
-        path: cookie.path().map(|path| path.to_string().into()),
-
-        sameSite: match cookie.same_site() {
-            Some(SameSite::None) => Some(CookieSameSite::None),
-            Some(SameSite::Lax) => Some(CookieSameSite::Lax),
-            Some(SameSite::Strict) => Some(CookieSameSite::Strict),
-            None => None, // The spec doesnt handle this case, which implies the default of Lax?
-        },
-
-        // Let secure be cookie’s secure-only-flag.
-        secure: cookie.secure(),
 
         // Let value be the result of running UTF-8 decode without BOM on cookie’s value.
         value: Some(cookie.value().to_string().into()),
@@ -199,7 +180,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
 
@@ -213,7 +194,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
             .send(CoreResourceMsg::GetCookieDataForUrlAsync(
                 self.store_id,
                 creation_url.clone(),
-                Some(name.to_string()),
+                Some(name.into()),
             ));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");
@@ -238,7 +219,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
 
@@ -259,12 +240,12 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
             // 6.1. Let parsed be the result of parsing options["url"] with settings’s API base URL.
             let parsed_url = ServoUrl::parse_with_base(Some(&global.api_base_url()), get_url);
 
-            // 6.2. If this’s relevant global object is a Window object and parsed does not equal url,
+            // 6.2. If this’s relevant global object is a Window object and parsed does not equal url with exclude fragments set to true,
             // then return a promise rejected with a TypeError.
             if let Some(_window) = DomRoot::downcast::<Window>(self.global()) {
                 if parsed_url
                     .as_ref()
-                    .is_ok_and(|parsed| parsed.as_url() != creation_url.as_url())
+                    .is_ok_and(|parsed| !parsed.is_equal_excluding_fragments(creation_url))
                 {
                     p.reject_error(
                         Error::Type("URL does not match context".to_string()),
@@ -321,7 +302,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
         // 4. Let url be settings’s creation URL.
@@ -354,38 +335,31 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
         // 2. Let origin be settings’s origin.
         let origin = global.origin();
 
-        // 7. Let p be a new promise.
+        // 6. Let p be a new promise.
         let p = Promise::new(&global, can_gc);
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
 
         // 4. Let url be settings’s creation URL.
         let creation_url = global.creation_url();
 
-        // 5. If options is empty, then return a promise rejected with a TypeError.
-        // "is empty" is not strictly defined anywhere in the spec but the only value we require here is "url"
-        if options.url.is_none() && options.name.is_none() {
-            p.reject_error(Error::Type("Options cannot be empty".to_string()), can_gc);
-            return p;
-        }
-
         let mut final_url = creation_url.clone();
 
-        // 6. If options["url"] is present, then run these steps:
+        // 5. If options["url"] is present, then run these steps:
         if let Some(get_url) = &options.url {
-            // 6.1. Let parsed be the result of parsing options["url"] with settings’s API base URL.
+            // 5.1. Let parsed be the result of parsing options["url"] with settings’s API base URL.
             let parsed_url = ServoUrl::parse_with_base(Some(&global.api_base_url()), get_url);
 
-            // 6.2. If this’s relevant global object is a Window object and parsed does not equal url,
+            // If this’s relevant global object is a Window object and parsed does not equal url with exclude fragments set to true,
             // then return a promise rejected with a TypeError.
             if let Some(_window) = DomRoot::downcast::<Window>(self.global()) {
                 if parsed_url
                     .as_ref()
-                    .is_ok_and(|parsed| parsed.as_url() != creation_url.as_url())
+                    .is_ok_and(|parsed| !parsed.is_equal_excluding_fragments(creation_url))
                 {
                     p.reject_error(
                         Error::Type("URL does not match context".to_string()),
@@ -395,7 +369,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 }
             }
 
-            // 6.3. If parsed’s origin and url’s origin are not the same origin,
+            // 5.3. If parsed’s origin and url’s origin are not the same origin,
             // then return a promise rejected with a TypeError.
             if parsed_url
                 .as_ref()
@@ -405,13 +379,13 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
                 return p;
             }
 
-            // 6.4. Set url to parsed.
+            // 5.4. Set url to parsed.
             if let Ok(url) = parsed_url {
                 final_url = url;
             }
         }
 
-        // 6. Run the following steps in parallel:
+        // 7. Run the following steps in parallel:
         let res =
             self.global()
                 .resource_threads()
@@ -443,7 +417,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
 
@@ -493,7 +467,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
 
@@ -542,7 +516,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
 
@@ -578,7 +552,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 
         // 3. If origin is an opaque origin, then return a promise rejected with a "SecurityError" DOMException.
         if !origin.is_tuple() {
-            p.reject_error(Error::Security, can_gc);
+            p.reject_error(Error::Security(None), can_gc);
             return p;
         }
 
@@ -605,8 +579,7 @@ impl CookieStoreMethods<crate::DomTypeHolder> for CookieStore {
 impl Drop for CookieStore {
     fn drop(&mut self) {
         let res = self
-            .global()
-            .resource_threads()
+            .unregister_channel
             .send(CoreResourceMsg::RemoveCookieListener(self.store_id));
         if res.is_err() {
             error!("Failed to send cookiestore message to resource threads");

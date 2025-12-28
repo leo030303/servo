@@ -12,19 +12,22 @@
 
 use std::cell::OnceCell;
 use std::cmp::max;
-use std::collections::{HashMap, hash_map};
+use std::collections::hash_map;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::thread;
 
-use base::id::PipelineId;
+use base::IpcSend;
+use base::id::{PipelineId, WebViewId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use dom_struct::dom_struct;
-use js::jsapi::{GCReason, JS_GC, JS_GetGCParameter, JSGCParamKey, JSTracer};
+use js::jsapi::{GCReason, JSGCParamKey, JSTracer};
+use js::rust::wrappers2::{JS_GC, JS_GetGCParameter};
 use malloc_size_of::malloc_size_of_is_0;
-use net_traits::IpcSend;
+use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, RequestBuilder, RequestMode};
+use rustc_hash::FxHashMap;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use style::thread_state::{self, ThreadState};
 use swapper::{Swapper, swapper};
@@ -38,7 +41,7 @@ use crate::dom::bindings::error::Error;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::refcounted::TrustedPromise;
 use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object};
-use crate::dom::bindings::root::{Dom, DomRoot, RootCollection, ThreadLocalStackRoots};
+use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::USVString;
 use crate::dom::bindings::trace::{CustomTraceable, JSTraceable, RootedTraceableBox};
 use crate::dom::csp::Violation;
@@ -119,7 +122,7 @@ impl Worklet {
         self.droppable_field.worklet_id
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn worklet_global_scope_type(&self) -> WorkletGlobalScopeType {
         self.global_type
     }
@@ -143,7 +146,7 @@ impl WorkletMethods<crate::DomTypeHolder> for Worklet {
             Err(err) => {
                 // Step 4.
                 debug!("URL {:?} parse error {:?}.", module_url.0, err);
-                promise.reject_error(Error::Syntax, can_gc);
+                promise.reject_error(Error::Syntax(None), can_gc);
                 return promise;
             },
         };
@@ -151,20 +154,24 @@ impl WorkletMethods<crate::DomTypeHolder> for Worklet {
 
         // Steps 6-12 in parallel.
         let pending_tasks_struct = PendingTasksStruct::new();
+        let global_scope = self.window.as_global_scope();
 
         self.droppable_field
             .thread_pool
             .get_or_init(|| ScriptThread::worklet_thread_pool(self.global().image_cache()))
             .fetch_and_invoke_a_worklet_script(
+                self.window.webview_id(),
                 self.window.pipeline_id(),
                 self.droppable_field.worklet_id,
                 self.global_type,
                 self.window.origin().immutable().clone(),
-                self.window.as_global_scope().api_base_url(),
+                global_scope.api_base_url(),
                 module_url_record,
+                global_scope.policy_container(),
                 options.credentials,
                 pending_tasks_struct,
                 &promise,
+                global_scope.inherited_secure_context(),
             );
 
         // Step 5.
@@ -181,7 +188,7 @@ malloc_size_of_is_0!(WorkletId);
 
 impl WorkletId {
     fn new() -> WorkletId {
-        WorkletId(servo_rand::random_uuid())
+        WorkletId(Uuid::new_v4())
     }
 }
 
@@ -313,15 +320,18 @@ impl WorkletThreadPool {
     #[allow(clippy::too_many_arguments)]
     fn fetch_and_invoke_a_worklet_script(
         &self,
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         worklet_id: WorkletId,
         global_type: WorkletGlobalScopeType,
         origin: ImmutableOrigin,
         base_url: ServoUrl,
         script_url: ServoUrl,
+        policy_container: PolicyContainer,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: &Rc<Promise>,
+        inherited_secure_context: Option<bool>,
     ) {
         // Send each thread a control message asking it to load the script.
         for sender in &[
@@ -330,15 +340,18 @@ impl WorkletThreadPool {
             &self.control_sender_2,
         ] {
             let _ = sender.send(WorkletControl::FetchAndInvokeAWorkletScript {
+                webview_id,
                 pipeline_id,
                 worklet_id,
                 global_type,
                 origin: origin.clone(),
                 base_url: base_url.clone(),
                 script_url: script_url.clone(),
+                policy_container: policy_container.clone(),
                 credentials,
                 pending_tasks_struct: pending_tasks_struct.clone(),
                 promise: TrustedPromise::new(promise.clone()),
+                inherited_secure_context,
             });
         }
         self.wake_threads();
@@ -385,15 +398,18 @@ enum WorkletData {
 enum WorkletControl {
     ExitWorklet(WorkletId),
     FetchAndInvokeAWorkletScript {
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         worklet_id: WorkletId,
         global_type: WorkletGlobalScopeType,
         origin: ImmutableOrigin,
         base_url: ServoUrl,
         script_url: ServoUrl,
+        policy_container: PolicyContainer,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: TrustedPromise,
+        inherited_secure_context: Option<bool>,
     },
 }
 
@@ -458,7 +474,7 @@ struct WorkletThread {
     global_init: WorkletGlobalScopeInit,
 
     /// The global scopes created by this thread
-    global_scopes: HashMap<WorkletId, Dom<WorkletGlobalScope>>,
+    global_scopes: FxHashMap<WorkletId, Dom<WorkletGlobalScope>>,
 
     /// A one-place buffer for control messages
     control_buffer: Option<WorkletControl>,
@@ -469,17 +485,16 @@ struct WorkletThread {
     gc_threshold: u32,
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl JSTraceable for WorkletThread {
     unsafe fn trace(&self, trc: *mut JSTracer) {
         debug!("Tracing worklet thread.");
-        self.global_scopes.trace(trc);
+        unsafe { self.global_scopes.trace(trc) };
     }
 }
 
 impl WorkletThread {
     /// Spawn a new worklet thread, returning the channel to send it control messages.
-    #[allow(unsafe_code)]
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     fn spawn(
         role: WorkletThreadRole,
@@ -495,8 +510,6 @@ impl WorkletThread {
                 // TODO: configure the JS runtime (e.g. discourage GC, encourage agressive JIT)
                 debug!("Initializing worklet thread.");
                 thread_state::initialize(ThreadState::SCRIPT | ThreadState::IN_WORKER);
-                let roots = RootCollection::new();
-                let _stack_roots = ThreadLocalStackRoots::new(&roots);
                 let mut thread = RootedTraceableBox::new(WorkletThread {
                     role,
                     control_receiver,
@@ -504,7 +517,7 @@ impl WorkletThread {
                     hot_backup_sender: init.hot_backup_sender,
                     cold_backup_sender: init.cold_backup_sender,
                     global_init: init.global_init,
-                    global_scopes: HashMap::new(),
+                    global_scopes: FxHashMap::default(),
                     control_buffer: None,
                     runtime: Runtime::new(None),
                     should_gc: false,
@@ -591,13 +604,13 @@ impl WorkletThread {
     }
 
     /// The current memory usage of the thread
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn current_memory_usage(&self) -> u32 {
-        unsafe { JS_GetGCParameter(self.runtime.cx(), JSGCParamKey::JSGC_BYTES) }
+        unsafe { JS_GetGCParameter(self.runtime.cx_no_gc(), JSGCParamKey::JSGC_BYTES) }
     }
 
     /// Perform a GC.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn gc(&mut self) {
         debug!(
             "BEGIN GC (usage = {}, threshold = {}).",
@@ -617,8 +630,10 @@ impl WorkletThread {
     /// Creates the worklet global scope if it doesn't exist.
     fn get_worklet_global_scope(
         &mut self,
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         worklet_id: WorkletId,
+        inherited_secure_context: Option<bool>,
         global_type: WorkletGlobalScopeType,
         base_url: ServoUrl,
     ) -> DomRoot<WorkletGlobalScope> {
@@ -629,8 +644,10 @@ impl WorkletThread {
                 let executor = WorkletExecutor::new(worklet_id, self.primary_sender.clone());
                 let result = WorkletGlobalScope::new(
                     global_type,
+                    webview_id,
                     pipeline_id,
                     base_url,
+                    inherited_secure_context,
                     executor,
                     &self.global_init,
                 );
@@ -641,7 +658,7 @@ impl WorkletThread {
     }
 
     /// Fetch and invoke a worklet script.
-    /// <https://drafts.css-houdini.org/worklets/#fetch-and-invoke-a-worklet-script>
+    /// <https://html.spec.whatwg.org/multipage/#fetch-a-worklet-script-graph>
     #[allow(clippy::too_many_arguments)]
     fn fetch_and_invoke_a_worklet_script(
         &self,
@@ -649,6 +666,7 @@ impl WorkletThread {
         pipeline_id: PipelineId,
         origin: ImmutableOrigin,
         script_url: ServoUrl,
+        policy_container: PolicyContainer,
         credentials: RequestCredentials,
         pending_tasks_struct: PendingTasksStruct,
         promise: TrustedPromise,
@@ -662,26 +680,24 @@ impl WorkletThread {
         // TODO: Fetch a module graph, not just a single script.
         // TODO: Fetch the script asynchronously?
         // TODO: Caching.
+        let global = global_scope.upcast::<GlobalScope>();
         let resource_fetcher = self.global_init.resource_threads.sender();
-        let request = RequestBuilder::new(
-            None,
-            script_url,
-            global_scope.upcast::<GlobalScope>().get_referrer(),
-        )
-        .destination(Destination::Script)
-        .mode(RequestMode::CorsMode)
-        .credentials_mode(credentials.convert())
-        .origin(origin);
+        let request = RequestBuilder::new(None, script_url, global.get_referrer())
+            .destination(Destination::Script)
+            .mode(RequestMode::CorsMode)
+            .credentials_mode(credentials.convert())
+            .policy_container(policy_container)
+            .origin(origin);
 
         let script = load_whole_resource(
             request,
             &resource_fetcher,
-            global_scope.upcast::<GlobalScope>(),
+            global,
             &WorkletCspProcessor {},
             can_gc,
         )
         .ok()
-        .and_then(|(_, bytes)| String::from_utf8(bytes).ok());
+        .and_then(|(_, bytes, _)| String::from_utf8(bytes).ok());
 
         // Step 4.
         // NOTE: the spec parses and executes the script in separate steps,
@@ -689,16 +705,14 @@ impl WorkletThread {
         // Also, the spec currently doesn't allow exceptions to be propagated
         // to the main script thread.
         // https://github.com/w3c/css-houdini-drafts/issues/407
-        let ok = script
-            .map(|s| global_scope.evaluate_js(&s, can_gc).is_ok())
-            .unwrap_or(false);
+        let ok = script.is_some_and(|s| global_scope.evaluate_js(s.into(), can_gc).is_ok());
 
         if !ok {
             // Step 3.
             debug!("Failed to load script.");
             let old_counter = pending_tasks_struct.set_counter_to(-1);
             if old_counter > 0 {
-                self.run_in_script_thread(promise.reject_task(Error::Abort));
+                self.run_in_script_thread(promise.reject_task(Error::Abort(None)));
             }
         } else {
             // Step 5.
@@ -731,23 +745,33 @@ impl WorkletThread {
                 self.global_scopes.remove(&worklet_id);
             },
             WorkletControl::FetchAndInvokeAWorkletScript {
+                webview_id,
                 pipeline_id,
                 worklet_id,
                 global_type,
                 origin,
                 base_url,
                 script_url,
+                policy_container,
                 credentials,
                 pending_tasks_struct,
                 promise,
+                inherited_secure_context,
             } => {
-                let global =
-                    self.get_worklet_global_scope(pipeline_id, worklet_id, global_type, base_url);
+                let global = self.get_worklet_global_scope(
+                    webview_id,
+                    pipeline_id,
+                    worklet_id,
+                    inherited_secure_context,
+                    global_type,
+                    base_url,
+                );
                 self.fetch_and_invoke_a_worklet_script(
                     &global,
                     pipeline_id,
                     origin,
                     script_url,
+                    policy_container,
                     credentials,
                     pending_tasks_struct,
                     promise,

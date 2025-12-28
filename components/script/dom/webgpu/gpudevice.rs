@@ -2,8 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(unsafe_code)]
-
 use std::borrow::Cow;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -27,9 +25,8 @@ use super::gpusupportedlimits::GPUSupportedLimits;
 use crate::conversions::Convert;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::EventBinding::EventInit;
-use crate::dom::bindings::codegen::Bindings::EventTargetBinding::EventTargetMethods;
 use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
-    GPUBindGroupDescriptor, GPUBindGroupLayoutDescriptor, GPUBufferDescriptor,
+    GPUAdapterMethods, GPUBindGroupDescriptor, GPUBindGroupLayoutDescriptor, GPUBufferDescriptor,
     GPUCommandEncoderDescriptor, GPUComputePipelineDescriptor, GPUDeviceLostReason,
     GPUDeviceMethods, GPUErrorFilter, GPUPipelineErrorReason, GPUPipelineLayoutDescriptor,
     GPURenderBundleEncoderDescriptor, GPURenderPipelineDescriptor, GPUSamplerDescriptor,
@@ -38,15 +35,19 @@ use crate::dom::bindings::codegen::Bindings::WebGPUBinding::{
 };
 use crate::dom::bindings::codegen::UnionTypes::GPUPipelineLayoutOrGPUAutoLayoutMode;
 use crate::dom::bindings::error::{Error, Fallible};
+use crate::dom::bindings::inheritance::Castable;
+use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
+use crate::dom::event::Event;
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 use crate::dom::types::GPUError;
 use crate::dom::webgpu::gpuadapter::GPUAdapter;
+use crate::dom::webgpu::gpuadapterinfo::GPUAdapterInfo;
 use crate::dom::webgpu::gpubindgroup::GPUBindGroup;
 use crate::dom::webgpu::gpubindgrouplayout::GPUBindGroupLayout;
 use crate::dom::webgpu::gpubuffer::GPUBuffer;
@@ -76,12 +77,13 @@ pub(crate) struct GPUDevice {
     extensions: Heap<*mut JSObject>,
     features: Dom<GPUSupportedFeatures>,
     limits: Dom<GPUSupportedLimits>,
+    adapter_info: Dom<GPUAdapterInfo>,
     label: DomRefCell<USVString>,
     #[no_trace]
     device: WebGPUDevice,
     default_queue: Dom<GPUQueue>,
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-lost>
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     lost_promise: DomRefCell<Rc<Promise>>,
     valid: Cell<bool>,
 }
@@ -116,6 +118,7 @@ impl GPUDevice {
         adapter: &GPUAdapter,
         features: &GPUSupportedFeatures,
         limits: &GPUSupportedLimits,
+        adapter_info: &GPUAdapterInfo,
         device: WebGPUDevice,
         queue: &GPUQueue,
         label: String,
@@ -128,6 +131,7 @@ impl GPUDevice {
             extensions: Heap::default(),
             features: Dom::from_ref(features),
             limits: Dom::from_ref(limits),
+            adapter_info: Dom::from_ref(adapter_info),
             label: DomRefCell::new(USVString::from(label)),
             device,
             default_queue: Dom::from_ref(queue),
@@ -152,6 +156,7 @@ impl GPUDevice {
         let queue = GPUQueue::new(global, channel.clone(), queue, can_gc);
         let limits = GPUSupportedLimits::new(global, limits, can_gc);
         let features = GPUSupportedFeatures::Constructor(global, None, features, can_gc).unwrap();
+        let adapter_info = GPUAdapterInfo::clone_from(global, &adapter.Info(), can_gc);
         let lost_promise = Promise::new(global, can_gc);
         let device = reflect_dom_object(
             Box::new(GPUDevice::new_inherited(
@@ -159,6 +164,7 @@ impl GPUDevice {
                 adapter,
                 &features,
                 &limits,
+                &adapter_info,
                 device,
                 &queue,
                 label,
@@ -195,18 +201,30 @@ impl GPUDevice {
         }
     }
 
-    pub(crate) fn fire_uncaptured_error(&self, error: webgpu_traits::Error, can_gc: CanGc) {
-        let error = GPUError::from_error(&self.global(), error, can_gc);
-        let ev = GPUUncapturedErrorEvent::new(
-            &self.global(),
-            DOMString::from("uncapturederror"),
-            &GPUUncapturedErrorEventInit {
-                error,
-                parent: EventInit::empty(),
-            },
-            can_gc,
+    /// <https://gpuweb.github.io/gpuweb/#eventdef-gpudevice-uncapturederror>
+    pub(crate) fn fire_uncaptured_error(&self, error: webgpu_traits::Error) {
+        let this = Trusted::new(self);
+
+        // Queue a global task, using the webgpu task source, to fire an event named
+        // uncapturederror at a GPUDevice using GPUUncapturedErrorEvent.
+        self.global().task_manager().webgpu_task_source().queue(
+            task!(fire_uncaptured_error: move || {
+                let this = this.root();
+                let error = GPUError::from_error(&this.global(), error, CanGc::note());
+
+                let event = GPUUncapturedErrorEvent::new(
+                    &this.global(),
+                    DOMString::from("uncapturederror"),
+                    &GPUUncapturedErrorEventInit {
+                        error,
+                        parent: EventInit::empty(),
+                    },
+                    CanGc::note(),
+                );
+
+                event.upcast::<Event>().fire(this.upcast(), CanGc::note());
+            }),
         );
-        let _ = self.eventtarget.DispatchEvent(ev.event(), can_gc);
     }
 
     /// <https://gpuweb.github.io/gpuweb/#abstract-opdef-validate-texture-format-required-features>
@@ -370,11 +388,20 @@ impl GPUDevice {
     }
 
     /// <https://gpuweb.github.io/gpuweb/#lose-the-device>
-    pub(crate) fn lose(&self, reason: GPUDeviceLostReason, msg: String, can_gc: CanGc) {
-        let lost_promise = &(*self.lost_promise.borrow());
-        let global = &self.global();
-        let lost = GPUDeviceLostInfo::new(global, msg.into(), reason, can_gc);
-        lost_promise.resolve_native(&*lost, can_gc);
+    pub(crate) fn lose(&self, reason: GPUDeviceLostReason, msg: String) {
+        let this = Trusted::new(self);
+
+        // Queue a global task, using the webgpu task source, to resolve device.lost
+        // promise with a new GPUDeviceLostInfo with reason and message.
+        self.global().task_manager().webgpu_task_source().queue(
+            task!(resolve_device_lost: move || {
+                let this = this.root();
+
+                let lost_promise = &(*this.lost_promise.borrow());
+                let lost = GPUDeviceLostInfo::new(&this.global(), msg.into(), reason, CanGc::note());
+                lost_promise.resolve_native(&*lost, CanGc::note());
+            }),
+        );
     }
 }
 
@@ -387,6 +414,11 @@ impl GPUDeviceMethods<crate::DomTypeHolder> for GPUDevice {
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-limits>
     fn Limits(&self) -> DomRoot<GPUSupportedLimits> {
         DomRoot::from_ref(&self.limits)
+    }
+
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-adapterinfo>
+    fn AdapterInfo(&self) -> DomRoot<GPUAdapterInfo> {
+        DomRoot::from_ref(&self.adapter_info)
     }
 
     /// <https://gpuweb.github.io/gpuweb/#dom-gpudevice-queue>
@@ -415,7 +447,6 @@ impl GPUDeviceMethods<crate::DomTypeHolder> for GPUDevice {
     }
 
     /// <https://gpuweb.github.io/gpuweb/#GPUDevice-createBindGroupLayout>
-    #[allow(non_snake_case)]
     fn CreateBindGroupLayout(
         &self,
         descriptor: &GPUBindGroupLayoutDescriptor,
@@ -605,7 +636,7 @@ impl RoutedPromiseListener<WebGPUPoppedErrorScopeResponse> for GPUDevice {
             Ok(None) | Err(PopError::Lost) => {
                 promise.resolve_native(&None::<Option<GPUError>>, can_gc)
             },
-            Err(PopError::Empty) => promise.reject_error(Error::Operation, can_gc),
+            Err(PopError::Empty) => promise.reject_error(Error::Operation(None), can_gc),
             Ok(Some(error)) => {
                 let error = GPUError::from_error(&self.global(), error, can_gc);
                 promise.resolve_native(&error, can_gc);

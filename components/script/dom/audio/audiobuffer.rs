@@ -6,7 +6,8 @@ use std::cmp::min;
 
 use dom_struct::dom_struct;
 use js::rust::{CustomAutoRooterGuard, HandleObject};
-use js::typedarray::{Float32, Float32Array};
+use js::typedarray::{Float32, Float32Array, HeapFloat32Array};
+use script_bindings::trace::RootedTraceableBox;
 use servo_media::audio::buffer_source_node::AudioBuffer as ServoMediaAudioBuffer;
 
 use crate::dom::audio::audionode::MAX_CHANNEL_COUNT;
@@ -133,7 +134,7 @@ impl AudioBuffer {
 
     fn restore_js_channel_data(&self, cx: JSContext, can_gc: CanGc) -> bool {
         let _ac = enter_realm(self);
-        for (i, channel) in self.js_channels.borrow_mut().iter().enumerate() {
+        for (i, channel) in self.js_channels.borrow().iter().enumerate() {
             if channel.is_initialized() {
                 // Already have data in JS array.
                 continue;
@@ -158,7 +159,7 @@ impl AudioBuffer {
         true
     }
 
-    // https://webaudio.github.io/web-audio-api/#acquire-the-content
+    /// <https://webaudio.github.io/web-audio-api/#acquire-the-content>
     fn acquire_contents(&self) -> Option<ServoMediaAudioBuffer> {
         let mut result = ServoMediaAudioBuffer::new(
             self.number_of_channels as u8,
@@ -191,7 +192,7 @@ impl AudioBuffer {
 }
 
 impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-audiobuffer
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-audiobuffer>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -204,7 +205,7 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
             *options.sampleRate < MIN_SAMPLE_RATE ||
             *options.sampleRate > MAX_SAMPLE_RATE
         {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
         Ok(AudioBuffer::new_with_proto(
             window,
@@ -217,30 +218,35 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
         ))
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-samplerate
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-samplerate>
     fn SampleRate(&self) -> Finite<f32> {
         Finite::wrap(self.sample_rate)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-length
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-length>
     fn Length(&self) -> u32 {
         self.length
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-duration
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-duration>
     fn Duration(&self) -> Finite<f64> {
         Finite::wrap(self.duration)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-numberofchannels
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-numberofchannels>
     fn NumberOfChannels(&self) -> u32 {
         self.number_of_channels
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-getchanneldata
-    fn GetChannelData(&self, cx: JSContext, channel: u32, can_gc: CanGc) -> Fallible<Float32Array> {
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-getchanneldata>
+    fn GetChannelData(
+        &self,
+        cx: JSContext,
+        channel: u32,
+        can_gc: CanGc,
+    ) -> Fallible<RootedTraceableBox<HeapFloat32Array>> {
         if channel >= self.number_of_channels {
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         if !self.restore_js_channel_data(cx, can_gc) {
@@ -253,7 +259,6 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
     }
 
     // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-copyfromchannel
-    #[allow(unsafe_code)]
     fn CopyFromChannel(
         &self,
         mut destination: CustomAutoRooterGuard<Float32Array>,
@@ -265,7 +270,7 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
         }
 
         if channel_number >= self.number_of_channels || start_in_channel >= self.length {
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         let bytes_to_copy = min(self.length - start_in_channel, destination.len() as u32) as usize;
@@ -281,7 +286,7 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
                 .copy_data_to(cx, &mut dest, offset, offset + bytes_to_copy)
                 .is_err()
             {
-                return Err(Error::IndexSize);
+                return Err(Error::IndexSize(None));
             }
         } else if let Some(ref shared_channels) = *self.shared_channels.borrow() {
             if let Some(shared_channel) = shared_channels.buffers.get(channel_number) {
@@ -294,7 +299,7 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
         Ok(())
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiobuffer-copytochannel
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiobuffer-copytochannel>
     fn CopyToChannel(
         &self,
         source: CustomAutoRooterGuard<Float32Array>,
@@ -307,7 +312,7 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
         }
 
         if channel_number >= self.number_of_channels || start_in_channel > (source.len() as u32) {
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         let cx = GlobalScope::get_cx();
@@ -318,12 +323,12 @@ impl AudioBufferMethods<crate::DomTypeHolder> for AudioBuffer {
         let js_channel = &self.js_channels.borrow()[channel_number as usize];
         if !js_channel.is_initialized() {
             // The array buffer was detached.
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         let bytes_to_copy = min(self.length - start_in_channel, source.len() as u32) as usize;
         js_channel
             .copy_data_from(cx, source, start_in_channel as usize, bytes_to_copy)
-            .map_err(|_| Error::IndexSize)
+            .map_err(|_| Error::IndexSize(None))
     }
 }

@@ -47,7 +47,7 @@ impl GPU {
 }
 
 impl GPUMethods<crate::DomTypeHolder> for GPU {
-    // https://gpuweb.github.io/gpuweb/#dom-gpu-requestadapter
+    /// <https://gpuweb.github.io/gpuweb/#dom-gpu-requestadapter>
     fn RequestAdapter(
         &self,
         options: &GPURequestAdapterOptions,
@@ -79,7 +79,7 @@ impl GPUMethods<crate::DomTypeHolder> for GPU {
             ))
             .is_err()
         {
-            promise.reject_error(Error::Operation, can_gc);
+            promise.reject_error(Error::Operation(None), can_gc);
         }
         promise
     }

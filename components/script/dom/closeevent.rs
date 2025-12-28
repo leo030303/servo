@@ -26,7 +26,7 @@ pub(crate) struct CloseEvent {
     reason: DOMString,
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 impl CloseEvent {
     pub(crate) fn new_inherited(was_clean: bool, code: u16, reason: DOMString) -> CloseEvent {
         CloseEvent {
@@ -37,7 +37,7 @@ impl CloseEvent {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         global: &GlobalScope,
         type_: Atom,
@@ -53,7 +53,7 @@ impl CloseEvent {
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     fn new_with_proto(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -76,7 +76,7 @@ impl CloseEvent {
 }
 
 impl CloseEventMethods<crate::DomTypeHolder> for CloseEvent {
-    // https://websockets.spec.whatwg.org/#the-closeevent-interface
+    /// <https://websockets.spec.whatwg.org/#the-closeevent-interface>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -99,22 +99,22 @@ impl CloseEventMethods<crate::DomTypeHolder> for CloseEvent {
         ))
     }
 
-    // https://websockets.spec.whatwg.org/#dom-closeevent-wasclean
+    /// <https://websockets.spec.whatwg.org/#dom-closeevent-wasclean>
     fn WasClean(&self) -> bool {
         self.was_clean
     }
 
-    // https://websockets.spec.whatwg.org/#dom-closeevent-code
+    /// <https://websockets.spec.whatwg.org/#dom-closeevent-code>
     fn Code(&self) -> u16 {
         self.code
     }
 
-    // https://websockets.spec.whatwg.org/#dom-closeevent-reason
+    /// <https://websockets.spec.whatwg.org/#dom-closeevent-reason>
     fn Reason(&self) -> DOMString {
         self.reason.clone()
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

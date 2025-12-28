@@ -2,9 +2,9 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use base::generic_channel;
 use content_security_policy::Destination;
 use embedder_traits::{EmbedderMsg, EmbedderProxy, WebResourceRequest, WebResourceResponseMsg};
-use ipc_channel::ipc;
 use log::error;
 use net_traits::NetworkError;
 use net_traits::http_status::HttpStatus;
@@ -29,7 +29,7 @@ impl RequestInterceptor {
         response: &mut Option<Response>,
         context: &FetchContext,
     ) {
-        let (sender, receiver) = ipc::channel().unwrap();
+        let (sender, receiver) = generic_channel::channel().unwrap();
         let is_for_main_frame = matches!(request.destination, Destination::Document);
         let web_resource_request = WebResourceRequest {
             method: request.method.clone(),
@@ -50,7 +50,7 @@ impl RequestInterceptor {
         while let Ok(message) = receiver.recv() {
             match message {
                 WebResourceResponseMsg::Start(webresource_response) => {
-                    let timing = context.timing.lock().unwrap().clone();
+                    let timing = context.timing.lock().clone();
                     let mut response_override =
                         Response::new(webresource_response.url.into(), timing);
                     response_override.headers = webresource_response.headers;
@@ -71,7 +71,7 @@ impl RequestInterceptor {
                         error!("Received unexpected FinishLoad message");
                         break;
                     };
-                    *response.body.lock().unwrap() =
+                    *response.body.lock() =
                         ResponseBody::Done(accumulated_body.into_iter().flatten().collect());
                     break;
                 },

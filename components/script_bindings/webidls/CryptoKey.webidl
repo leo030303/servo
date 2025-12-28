@@ -6,7 +6,7 @@
 
 enum KeyType { "public", "private", "secret" };
 
-enum KeyUsage { "encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey" };
+// enum KeyUsage { "encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey" };
 
 [SecureContext, Exposed=(Window,Worker), /*Serializable,*/ Pref="dom_crypto_subtle_enabled"]
 interface CryptoKey {
@@ -15,3 +15,14 @@ interface CryptoKey {
   readonly attribute object algorithm;
   readonly attribute object usages;
 };
+
+// https://w3c.github.io/webcrypto/#keypair
+
+dictionary CryptoKeyPair {
+  CryptoKey publicKey;
+  CryptoKey privateKey;
+};
+
+// https://wicg.github.io/webcrypto-modern-algos/#subtlecrypto-interface-keyusage
+
+enum KeyUsage { "encrypt", "decrypt", "sign", "verify", "deriveKey", "deriveBits", "wrapKey", "unwrapKey", "encapsulateKey", "encapsulateBits", "decapsulateKey", "decapsulateBits" };

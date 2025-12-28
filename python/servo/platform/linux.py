@@ -7,11 +7,12 @@
 # option. This file may not be copied, modified, or distributed
 # except according to those terms.
 
-import distro
 import os
-import subprocess
 import shutil
-from typing import Optional, Any
+import subprocess
+from typing import Any, Optional
+
+import distro
 
 from .base import Base
 from .build_target import BuildTarget
@@ -67,7 +68,6 @@ APT_PKGS = [
     "xorg-dev",
     "libxkbcommon0",
     "libxkbcommon-x11-0",
-    "tshark",
 ]
 
 # https://packages.fedoraproject.org
@@ -114,7 +114,6 @@ DNF_PKGS = [
     "vulkan-loader",
     "libxkbcommon",
     "libxkbcommon-x11",
-    "wireshark-cli",
 ]
 
 # https://voidlinux.org/packages/
@@ -169,7 +168,7 @@ class Linux(Base):
         self.is_linux = True
         self.distro = distro.name()
 
-    def _platform_bootstrap(self, force: bool) -> bool:
+    def _platform_bootstrap(self, force: bool, yes: bool) -> bool:
         if self.distro.lower() == "nixos":
             print("NixOS does not need bootstrap, it will automatically enter a nix-shell")
             print("Just run ./mach build")
@@ -209,12 +208,26 @@ class Linux(Base):
             input("Press Enter to continue...")
             return False
 
-        installed_something = self.install_non_gstreamer_dependencies(force)
+        installed_something = self.install_non_gstreamer_dependencies(force, yes)
         return installed_something
 
-    def install_non_gstreamer_dependencies(self, force: bool) -> bool:
+    def install_non_gstreamer_dependencies(self, force: bool, yes: bool = False) -> bool:
+        def check_sudo() -> bool:
+            if os.geteuid() != 0:  # pyrefly: ignore[missing-attribute]
+                if shutil.which("sudo") is None:
+                    return False
+            return True
+
+        def run_as_root(command: list[str], force: bool = False, yes: bool = False) -> int:
+            if os.geteuid() != 0:  # pyrefly: ignore[missing-attribute]
+                command.insert(0, "sudo")
+            if force or yes:
+                command.append("-y")
+            return subprocess.call(command)
+
         install = False
         pkgs = []
+        command = []
         if self.distro in ["Ubuntu", "Debian GNU/Linux", "Raspbian GNU/Linux"]:
             command = ["apt-get", "install", "-m"]
             pkgs = APT_PKGS
@@ -226,10 +239,18 @@ class Linux(Base):
 
             # Try to filter out unknown packages from the list. This is important for Debian
             # as it does not ship all of the packages we want.
+            # We need to run 'apt-get update' first to make sure the package cache is populated.
+            run_as_root(["apt-get", "update"])
             installable = subprocess.check_output(["apt-cache", "--generate", "pkgnames"])
             if installable:
                 installable = installable.decode("ascii").splitlines()
+                missing_pkgs = list(filter(lambda pkg: pkg not in installable, pkgs))
                 pkgs = list(filter(lambda pkg: pkg in installable, pkgs))
+                if len(missing_pkgs) > 0:
+                    print(
+                        "Skipping the following required packages, as they don't exist in this OS version:",
+                        missing_pkgs,
+                    )
 
             if subprocess.call(["dpkg", "-s"] + pkgs, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE) != 0:
                 install = True
@@ -244,29 +265,16 @@ class Linux(Base):
                     install = True
                     break
         elif self.distro == "void":
+            command = ["xbps-install", "-A"]
             installed_pkgs = subprocess.check_output(["xbps-query", "-l"], text=True).splitlines()
             pkgs = XBPS_PKGS
             for pkg in pkgs:
-                command = ["xbps-install", "-A"]
                 if "ii {}-".format(pkg) not in installed_pkgs:
                     install = force = True
                     break
 
         if not install:
             return False
-
-        def check_sudo() -> bool:
-            if os.geteuid() != 0:  # pyrefly: ignore[missing-attribute]
-                if shutil.which("sudo") is None:
-                    return False
-            return True
-
-        def run_as_root(command: list[str], force: bool = False) -> int:
-            if os.geteuid() != 0:  # pyrefly: ignore[missing-attribute]
-                command.insert(0, "sudo")
-            if force:
-                command.append("-y")
-            return subprocess.call(command)
 
         print("Installing missing dependencies...")
         if not check_sudo():
@@ -278,7 +286,7 @@ class Linux(Base):
             input("Press Enter to continue...")
             return False
 
-        if run_as_root(command + pkgs, force) != 0:
+        if run_as_root(command + pkgs, force, yes) != 0:
             raise EnvironmentError("Installation of dependencies failed.")
         return True
 

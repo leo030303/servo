@@ -17,7 +17,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::characterdata::CharacterData;
 use crate::dom::document::Document;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlslotelement::{HTMLSlotElement, Slottable};
+use crate::dom::html::htmlslotelement::{HTMLSlotElement, Slottable};
 use crate::dom::node::Node;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
@@ -55,7 +55,7 @@ impl Text {
 }
 
 impl TextMethods<crate::DomTypeHolder> for Text {
-    // https://dom.spec.whatwg.org/#dom-text-text
+    /// <https://dom.spec.whatwg.org/#dom-text-text>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -67,14 +67,14 @@ impl TextMethods<crate::DomTypeHolder> for Text {
     }
 
     // https://dom.spec.whatwg.org/#dom-text-splittext
-    // https://dom.spec.whatwg.org/#concept-text-split
+    /// <https://dom.spec.whatwg.org/#concept-text-split>
     fn SplitText(&self, offset: u32, can_gc: CanGc) -> Fallible<DomRoot<Text>> {
         let cdata = self.upcast::<CharacterData>();
         // Step 1.
         let length = cdata.Length();
         if offset > length {
             // Step 2.
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
         // Step 3.
         let count = length - offset;
@@ -103,7 +103,7 @@ impl TextMethods<crate::DomTypeHolder> for Text {
         Ok(new_node)
     }
 
-    // https://dom.spec.whatwg.org/#dom-text-wholetext
+    /// <https://dom.spec.whatwg.org/#dom-text-wholetext>
     fn WholeText(&self) -> DOMString {
         let first = self
             .upcast::<Node>()

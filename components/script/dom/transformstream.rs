@@ -3,7 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::collections::HashMap;
 use std::ptr::{self};
 use std::rc::Rc;
 
@@ -12,7 +11,9 @@ use constellation_traits::TransformStreamData;
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, IsPromiseObject, JSObject};
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
+use js::realm::CurrentRealm;
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
+use rustc_hash::FxHashMap;
 use script_bindings::callback::ExceptionHandling;
 use script_bindings::realms::InRealm;
 
@@ -52,7 +53,7 @@ impl js::gc::Rootable for TransformBackPressureChangePromiseFulfillment {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct TransformBackPressureChangePromiseFulfillment {
     /// The result of reacting to backpressureChangePromise.
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     result_promise: Rc<Promise>,
 
     #[ignore_malloc_size_of = "mozjs"]
@@ -66,7 +67,9 @@ struct TransformBackPressureChangePromiseFulfillment {
 
 impl Callback for TransformBackPressureChangePromiseFulfillment {
     /// Reacting to backpressureChangePromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // Let writable be stream.[[writable]].
         // Let state be writable.[[state]].
         // If state is "erroring", throw writable.[[storedError]].
@@ -117,12 +120,13 @@ impl Callback for TransformBackPressureChangePromiseFulfillment {
 /// Reacting to fulfillment of performTransform as part of
 /// <https://streams.spec.whatwg.org/#transform-stream-default-sink-write-algorithm>
 struct PerformTransformFulfillment {
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     result_promise: Rc<Promise>,
 }
 
 impl Callback for PerformTransformFulfillment {
-    fn callback(&self, _cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         // Fulfilled: resolve the outer promise
         self.result_promise.resolve_native(&(), can_gc);
     }
@@ -133,14 +137,15 @@ impl Callback for PerformTransformFulfillment {
 /// Reacting to rejection of performTransform as part of
 /// <https://streams.spec.whatwg.org/#transform-stream-default-sink-write-algorithm>
 struct PerformTransformRejection {
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     result_promise: Rc<Promise>,
 }
 
 impl Callback for PerformTransformRejection {
-    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
         // Stream already errored in perform_transform, just reject result_promise
-        self.result_promise.reject(cx, v, can_gc);
+        self.result_promise.reject(cx.into(), v, can_gc);
     }
 }
 
@@ -149,13 +154,14 @@ impl Callback for PerformTransformRejection {
 /// Reacting to rejection of backpressureChangePromise as part of
 /// <https://streams.spec.whatwg.org/#transform-stream-default-sink-write-algorithm>
 struct BackpressureChangeRejection {
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     result_promise: Rc<Promise>,
 }
 
 impl Callback for BackpressureChangeRejection {
-    fn callback(&self, cx: SafeJSContext, reason: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
-        self.result_promise.reject(cx, reason, can_gc);
+    fn callback(&self, cx: &mut CurrentRealm, reason: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        self.result_promise.reject(cx.into(), reason, can_gc);
     }
 }
 
@@ -174,7 +180,9 @@ struct CancelPromiseFulfillment {
 
 impl Callback for CancelPromiseFulfillment {
     /// Reacting to backpressureChangePromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // If readable.[[state]] is "errored", reject controller.[[finishPromise]] with readable.[[storedError]].
         if self.readable.is_errored() {
             rooted!(in(*cx) let mut error = UndefinedValue());
@@ -214,7 +222,9 @@ struct CancelPromiseRejection {
 
 impl Callback for CancelPromiseRejection {
     /// Reacting to backpressureChangePromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // Perform ! ReadableStreamDefaultControllerError(readable.[[controller]], r).
         self.readable.get_default_controller().error(v, can_gc);
 
@@ -242,7 +252,9 @@ struct SourceCancelPromiseFulfillment {
 
 impl Callback for SourceCancelPromiseFulfillment {
     /// Reacting to backpressureChangePromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // If cancelPromise was fulfilled, then:
         let finish_promise = self
             .controller
@@ -290,7 +302,9 @@ struct SourceCancelPromiseRejection {
 
 impl Callback for SourceCancelPromiseRejection {
     /// Reacting to backpressureChangePromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // Perform ! WritableStreamDefaultControllerErrorIfNeeded(writable.[[controller]], r).
         let global = &self.writeable.global();
 
@@ -322,7 +336,9 @@ struct FlushPromiseFulfillment {
 
 impl Callback for FlushPromiseFulfillment {
     /// Reacting to flushpromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // If flushPromise was fulfilled, then:
         let finish_promise = self
             .controller
@@ -358,7 +374,9 @@ struct FlushPromiseRejection {
 
 impl Callback for FlushPromiseRejection {
     /// Reacting to flushpromise with the following fulfillment steps:
-    fn callback(&self, cx: SafeJSContext, v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // If flushPromise was rejected with reason r, then:
         // Perform ! ReadableStreamDefaultControllerError(readable.[[controller]], r).
         self.readable.get_default_controller().error(v, can_gc);
@@ -393,7 +411,7 @@ pub struct TransformStream {
     backpressure: Cell<bool>,
 
     /// <https://streams.spec.whatwg.org/#transformstream-backpressurechangepromise>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     backpressure_change_promise: DomRefCell<Option<Rc<Promise>>>,
 
     /// <https://streams.spec.whatwg.org/#transformstream-controller>
@@ -948,10 +966,9 @@ impl TransformStream {
     }
 }
 
-#[allow(non_snake_case)]
 impl TransformStreamMethods<crate::DomTypeHolder> for TransformStream {
     /// <https://streams.spec.whatwg.org/#ts-constructor>
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn Constructor(
         cx: SafeJSContext,
         global: &GlobalScope,
@@ -968,7 +985,7 @@ impl TransformStreamMethods<crate::DomTypeHolder> for TransformStream {
         // converted to an IDL value of type UnderlyingSink.
         let transformer_dict = if !transformer_obj.is_null() {
             rooted!(in(*cx) let obj_val = ObjectValue(transformer_obj.get()));
-            match Transformer::new(cx, obj_val.handle()) {
+            match Transformer::new(cx, obj_val.handle(), can_gc) {
                 Ok(ConversionResult::Success(val)) => val,
                 Ok(ConversionResult::Failure(error)) => return Err(Error::Type(error.to_string())),
                 _ => {
@@ -1193,7 +1210,7 @@ impl Transferable for TransformStream {
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<MessagePortId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<MessagePortId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.transform_streams_port_impls,
             StructuredData::Writer(w) => &mut w.transform_streams_port,

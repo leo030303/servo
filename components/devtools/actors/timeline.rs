@@ -2,8 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-// TODO: Is this actor still relevant?
-#![allow(dead_code)]
+#![expect(dead_code)]
 
 use std::cell::RefCell;
 use std::net::TcpStream;
@@ -12,10 +11,10 @@ use std::thread;
 use std::time::Duration;
 
 use base::cross_process_instant::CrossProcessInstant;
+use base::generic_channel::{self, GenericReceiver, GenericSender};
 use base::id::PipelineId;
 use devtools_traits::DevtoolScriptControlMsg::{DropTimelineMarkers, SetTimelineMarkers};
 use devtools_traits::{DevtoolScriptControlMsg, TimelineMarker, TimelineMarkerType};
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use serde::{Serialize, Serializer};
 use serde_json::{Map, Value};
 
@@ -27,7 +26,7 @@ use crate::protocol::{ClientRequest, JsonPacketStream};
 
 pub struct TimelineActor {
     name: String,
-    script_sender: IpcSender<DevtoolScriptControlMsg>,
+    script_sender: GenericSender<DevtoolScriptControlMsg>,
     marker_types: Vec<TimelineMarkerType>,
     pipeline_id: PipelineId,
     is_recording: Arc<Mutex<bool>>,
@@ -132,7 +131,7 @@ impl TimelineActor {
     pub fn new(
         name: String,
         pipeline_id: PipelineId,
-        script_sender: IpcSender<DevtoolScriptControlMsg>,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
     ) -> TimelineActor {
         let marker_types = vec![TimelineMarkerType::Reflow, TimelineMarkerType::DOMEvent];
 
@@ -151,7 +150,7 @@ impl TimelineActor {
 
     fn pull_timeline_data(
         &self,
-        receiver: IpcReceiver<Option<TimelineMarker>>,
+        receiver: GenericReceiver<Option<TimelineMarker>>,
         mut emitter: Emitter,
     ) {
         let is_recording = self.is_recording.clone();
@@ -200,7 +199,7 @@ impl Actor for TimelineActor {
             "start" => {
                 **self.is_recording.lock().as_mut().unwrap() = true;
 
-                let (tx, rx) = ipc::channel::<Option<TimelineMarker>>().unwrap();
+                let (tx, rx) = generic_channel::channel::<Option<TimelineMarker>>().unwrap();
                 self.script_sender
                     .send(SetTimelineMarkers(
                         self.pipeline_id,

@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::fmt::{Debug, Formatter};
+use std::sync::atomic::AtomicBool;
 
 use app_units::Au;
 use atomic_refcell::AtomicRefCell;
@@ -29,6 +30,7 @@ pub(crate) struct LayoutBoxBase {
     pub style: Arc<ComputedValues>,
     pub cached_inline_content_size:
         AtomicRefCell<Option<Box<(SizeConstraint, InlineContentSizesResult)>>>,
+    pub outer_inline_content_sizes_depend_on_content: AtomicBool,
     pub cached_layout_result: AtomicRefCell<Option<Box<CacheableLayoutResultAndInputs>>>,
     pub fragments: AtomicRefCell<Vec<Fragment>>,
 }
@@ -39,6 +41,7 @@ impl LayoutBoxBase {
             base_fragment_info,
             style,
             cached_inline_content_size: AtomicRefCell::default(),
+            outer_inline_content_sizes_depend_on_content: AtomicBool::new(true),
             cached_layout_result: AtomicRefCell::default(),
             fragments: AtomicRefCell::default(),
         }
@@ -69,14 +72,6 @@ impl LayoutBoxBase {
         result
     }
 
-    /// Clear cached data accumulated during fragment tree layout, either fragments and
-    /// the cached inline content size, or just fragments.
-    pub(crate) fn clear_fragment_layout_cache(&self) {
-        self.fragments.borrow_mut().clear();
-        *self.cached_layout_result.borrow_mut() = None;
-        *self.cached_inline_content_size.borrow_mut() = None;
-    }
-
     pub(crate) fn fragments(&self) -> Vec<Fragment> {
         self.fragments.borrow().clone()
     }
@@ -96,7 +91,9 @@ impl LayoutBoxBase {
     pub(crate) fn repair_style(&mut self, new_style: &Arc<ComputedValues>) {
         self.style = new_style.clone();
         for fragment in self.fragments.borrow_mut().iter_mut() {
-            fragment.repair_style(new_style);
+            if let Some(mut base) = fragment.base_mut() {
+                base.repair_style(new_style);
+            }
         }
     }
 }

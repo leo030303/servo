@@ -39,14 +39,15 @@ pub(crate) use js::gc::Traceable as JSTraceable;
 use js::glue::{CallScriptTracer, CallStringTracer, CallValueTracer};
 use js::jsapi::{GCTraceKindToAscii, Heap, JSScript, JSString, JSTracer, TraceKind};
 use js::jsval::JSVal;
-use malloc_size_of::{MallocSizeOf, MallocSizeOfOps};
+use malloc_size_of::{MallocConditionalSizeOf, MallocSizeOf, MallocSizeOfOps};
+use rustc_hash::FxBuildHasher;
 pub(crate) use script_bindings::trace::*;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::DomObject;
-use crate::dom::htmlimageelement::SourceSet;
-use crate::dom::htmlmediaelement::HTMLMediaElementFetchContext;
+use crate::dom::html::htmlimageelement::SourceSet;
+use crate::dom::html::htmlmediaelement::HTMLMediaElementFetchContext;
 use crate::dom::windowproxy::WindowProxyHandler;
 use crate::script_runtime::StreamConsumer;
 use crate::script_thread::IncompleteParserContexts;
@@ -77,7 +78,7 @@ impl<T> From<T> for NoTrace<T> {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl<T> JSTraceable for NoTrace<T> {
     #[inline]
     unsafe fn trace(&self, _: *mut ::js::jsapi::JSTracer) {}
@@ -92,6 +93,9 @@ impl<T: MallocSizeOf> MallocSizeOf for NoTrace<T> {
 /// HashMap wrapper, that has non-jsmanaged keys
 ///
 /// Not all methods are reexposed, but you can access inner type via .0
+/// If you need cryptographic secure hashs, or your keys are arbitrary large inputs
+/// stick with the default hasher. Otherwise, stronlgy think about using FxHashBuilder
+/// with `new_fx()`
 #[cfg_attr(crown, crown::trace_in_no_trace_lint::must_not_have_traceable(0))]
 #[derive(Clone, Debug)]
 pub(crate) struct HashMapTracedValues<K, V, S = RandomState>(pub(crate) HashMap<K, V, S>);
@@ -108,6 +112,14 @@ impl<K, V> HashMapTracedValues<K, V, RandomState> {
     #[must_use]
     pub(crate) fn new() -> HashMapTracedValues<K, V, RandomState> {
         Self(HashMap::new())
+    }
+}
+
+impl<K, V> HashMapTracedValues<K, V, FxBuildHasher> {
+    #[inline]
+    #[must_use]
+    pub(crate) fn new_fx() -> HashMapTracedValues<K, V, FxBuildHasher> {
+        Self(HashMap::with_hasher(FxBuildHasher))
     }
 }
 
@@ -188,7 +200,18 @@ where
     }
 }
 
-#[allow(unsafe_code)]
+impl<K, V, S> MallocConditionalSizeOf for HashMapTracedValues<K, V, S>
+where
+    K: Eq + Hash + MallocSizeOf,
+    V: MallocConditionalSizeOf,
+    S: BuildHasher,
+{
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.0.conditional_size_of(ops)
+    }
+}
+
+#[expect(unsafe_code)]
 unsafe impl<K, V: JSTraceable, S> JSTraceable for HashMapTracedValues<K, V, S> {
     #[inline]
     unsafe fn trace(&self, trc: *mut ::js::jsapi::JSTracer) {
@@ -202,7 +225,7 @@ unsafe_no_jsmanaged_fields!(Box<dyn TaskBox>);
 
 unsafe_no_jsmanaged_fields!(IncompleteParserContexts);
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 /// Trace a `JSScript`.
 pub(crate) fn trace_script(tracer: *mut JSTracer, description: &str, script: &Heap<*mut JSScript>) {
     unsafe {
@@ -215,7 +238,7 @@ pub(crate) fn trace_script(tracer: *mut JSTracer, description: &str, script: &He
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 /// Trace a `JSVal`.
 pub(crate) fn trace_jsval(tracer: *mut JSTracer, description: &str, val: &Heap<JSVal>) {
     unsafe {
@@ -232,7 +255,7 @@ pub(crate) fn trace_jsval(tracer: *mut JSTracer, description: &str, val: &Heap<J
     }
 }
 
-#[allow(dead_code)]
+#[expect(dead_code)]
 /// Trace a `JSString`.
 pub(crate) fn trace_string(tracer: *mut JSTracer, description: &str, s: &Heap<*mut JSString>) {
     unsafe {

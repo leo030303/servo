@@ -101,7 +101,7 @@ FILE_PATTERNS_TO_CHECK = [
 ]
 
 # File patterns that are ignored for all tidy and lint checks.
-FILE_PATTERNS_TO_IGNORE = ["*.#*", "*.pyc", "fake-ld.sh", "*.ogv", "*.webm"]
+FILE_PATTERNS_TO_IGNORE = ["*.#*", "*.pyc", "fake-ld.sh", "*.ogv", "*.webm", "license.html"]
 
 SPEC_BASE_PATH = "components/script/dom/"
 
@@ -114,6 +114,8 @@ WEBIDL_STANDARDS = [
     b"//dev.w3.org/fxtf",
     b"//dvcs.w3.org/hg",
     b"//www.w3.org/TR/trusted-types/",
+    b"//www.w3.org/TR/credential-management",
+    b"//www.w3.org/TR/geolocation",
     b"//dom.spec.whatwg.org",
     b"//drafts.csswg.org",
     b"//drafts.css-houdini.org",
@@ -139,6 +141,7 @@ WEBIDL_STANDARDS = [
     b"//notifications.spec.whatwg.org",
     b"//testutils.spec.whatwg.org/",
     b"//cookiestore.spec.whatwg.org/",
+    b"//compression.spec.whatwg.org/",
     # Not a URL
     b"// This interface is entirely internal to Servo, and should not be" + b" accessible to\n// web pages.",
 ]
@@ -311,6 +314,32 @@ def check_modeline(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, st
             yield (idx + 1, "vi modeline present")
         elif re.search(rb"-\*-.*-\*-", line, re.IGNORECASE):
             yield (idx + 1, "emacs file variables present")
+
+
+def check_feature_annotation(file_name: str, lines: list[bytes]) -> Iterator[tuple[int, str]]:
+    if not file_name.endswith("prefs.rs"):
+        return
+    for idx, raw_line in enumerate(lines):
+        line = raw_line.decode("utf8").strip()
+        if not line.startswith("// feature:"):
+            continue
+        parts = list(map(lambda part: part.strip(), line.removeprefix("// feature:").split("|")))
+        if len(parts) < 3:
+            yield (idx + 1, "Feature annotation has too few | separators")
+            continue
+        elif len(parts) > 3:
+            yield (idx + 1, "Feature annotation has too many | separators")
+
+        if not parts[0]:
+            yield (idx + 1, "Feature annotation name is missing")
+
+        if not parts[1].startswith("#"):
+            yield (idx + 1, "Feature annotation issue number must start with #")
+        elif not parts[1].removeprefix("#").isdigit():
+            yield (idx + 1, "Feature annotation issue number is not a number")
+
+        if not parts[2]:
+            yield (idx + 1, "Feature annotation URL path is missing")
 
 
 def contains_url(line: bytes) -> bool:
@@ -898,6 +927,7 @@ def scan(only_changed_files: bool = False, progress: bool = False, github_annota
         check_rust,
         check_spec,
         check_modeline,
+        check_feature_annotation,
     )
     file_errors = collect_errors_for_files(files_to_check, checking_functions, line_checking_functions)
 

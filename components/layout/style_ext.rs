@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use app_units::Au;
+use layout_api::AxesOverflow;
 use malloc_size_of_derive::MallocSizeOf;
 use style::Zero;
 use style::color::AbsoluteColor;
@@ -22,7 +23,9 @@ use style::servo::selector_parser::PseudoElement;
 use style::values::CSSFloat;
 use style::values::computed::basic_shape::ClipPath;
 use style::values::computed::image::Image as ComputedImageLayer;
-use style::values::computed::{AlignItems, BorderStyle, Color, Inset, LengthPercentage, Margin};
+use style::values::computed::{
+    BorderStyle, Color, Inset, ItemPlacement, LengthPercentage, Margin, SelfAlignment,
+};
 use style::values::generics::box_::Perspective;
 use style::values::generics::position::{GenericAspectRatio, PreferredRatio};
 use style::values::generics::transform::{GenericRotate, GenericScale, GenericTranslate};
@@ -32,7 +35,7 @@ use unicode_bidi::Level;
 use webrender_api as wr;
 use webrender_api::units::LayoutTransform;
 
-use crate::dom_traversal::{Contents, NonReplacedContents};
+use crate::dom_traversal::Contents;
 use crate::fragment_tree::FragmentFlags;
 use crate::geom::{
     AuOrAuto, LengthPercentageOrAuto, LogicalSides, LogicalSides1D, LogicalVec2, PhysicalSides,
@@ -58,12 +61,6 @@ pub(crate) enum DisplayGeneratingBox {
     /// <https://drafts.csswg.org/css-display-3/#layout-specific-display>
     LayoutInternal(DisplayLayoutInternal),
 }
-#[derive(Clone, Copy, Debug)]
-pub struct AxesOverflow {
-    pub x: Overflow,
-    pub y: Overflow,
-}
-
 impl DisplayGeneratingBox {
     pub(crate) fn display_inside(&self) -> DisplayInside {
         match *self {
@@ -86,12 +83,10 @@ impl DisplayGeneratingBox {
                     is_list_item: false,
                 },
             }
-        } else if matches!(
-            contents,
-            Contents::NonReplaced(NonReplacedContents::OfTextControl)
-        ) {
-            // If it's an input or textarea, make sure the display-inside is flow-root.
+        } else if matches!(contents, Contents::Widget(_)) {
+            // If it's a widget, make sure the display-inside is flow-root.
             // <https://html.spec.whatwg.org/multipage/#form-controls>
+            // TODO: Do we want flow-root, or just an independent formatting context?
             if let DisplayGeneratingBox::OutsideInside { outside, .. } = self {
                 DisplayGeneratingBox::OutsideInside {
                     outside: *outside,
@@ -126,7 +121,7 @@ pub(crate) enum DisplayInside {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 /// <https://drafts.csswg.org/css-display-3/#layout-specific-display>
 pub(crate) enum DisplayLayoutInternal {
     TableCaption,
@@ -358,9 +353,9 @@ pub(crate) trait ComputedValuesExt {
     fn bidi_control_chars(&self) -> (&'static str, &'static str);
     fn resolve_align_self(
         &self,
-        resolved_auto_value: AlignItems,
-        resolved_normal_value: AlignItems,
-    ) -> AlignItems;
+        resolved_auto_value: ItemPlacement,
+        resolved_normal_value: AlignFlags,
+    ) -> SelfAlignment;
     fn depends_on_block_constraints_due_to_relative_positioning(
         &self,
         writing_mode: WritingMode,
@@ -524,8 +519,7 @@ impl ComputedValuesExt for ComputedValues {
 
     fn is_inline_box(&self, fragment_flags: FragmentFlags) -> bool {
         self.get_box().display.is_inline_flow() &&
-            !fragment_flags
-                .intersects(FragmentFlags::IS_REPLACED | FragmentFlags::IS_TEXT_CONTROL)
+            !fragment_flags.intersects(FragmentFlags::IS_REPLACED | FragmentFlags::IS_WIDGET)
     }
 
     /// Returns true if this is a transformable element.
@@ -594,71 +588,60 @@ impl ComputedValuesExt for ComputedValues {
     /// flex containers, and grid containers. And some box types only accept a few values.
     /// <https://www.w3.org/TR/css-overflow-3/#overflow-control>
     fn effective_overflow(&self, fragment_flags: FragmentFlags) -> AxesOverflow {
-        let style_box = self.get_box();
-        let mut overflow_x = style_box.overflow_x;
-        let mut overflow_y = style_box.overflow_y;
-
         // https://www.w3.org/TR/css-overflow-3/#overflow-propagation
         // The element from which the value is propagated must then have a used overflow value of visible.
         if fragment_flags.contains(FragmentFlags::PROPAGATED_OVERFLOW_TO_VIEWPORT) {
-            return AxesOverflow {
-                x: Overflow::Visible,
-                y: Overflow::Visible,
-            };
+            return AxesOverflow::default();
         }
+
+        let mut overflow = AxesOverflow::from(self);
 
         // From <https://www.w3.org/TR/css-overflow-4/#overflow-control>:
         // "On replaced elements, the used values of all computed values other than visible is clip."
         if fragment_flags.contains(FragmentFlags::IS_REPLACED) {
-            if overflow_x != Overflow::Visible {
-                overflow_x = Overflow::Clip;
+            if overflow.x != Overflow::Visible {
+                overflow.x = Overflow::Clip;
             }
-            if overflow_y != Overflow::Visible {
-                overflow_y = Overflow::Clip;
+            if overflow.y != Overflow::Visible {
+                overflow.y = Overflow::Clip;
             }
-            return AxesOverflow {
-                x: overflow_x,
-                y: overflow_y,
-            };
+            return overflow;
         }
 
-        let ignores_overflow = match style_box.display.inside() {
+        let ignores_overflow = match self.get_box().display.inside() {
+            // <https://drafts.csswg.org/css-overflow-3/#overflow-control>
+            // `overflow` doesn't apply to inline boxes.
+            stylo::DisplayInside::Flow => self.is_inline_box(fragment_flags),
+
+            // According to <https://drafts.csswg.org/css-tables/#global-style-overrides>,
+            // - overflow applies to table-wrapper boxes and not to table grid boxes.
+            //   That's what Blink and WebKit do, however Firefox matches a CSSWG resolution that says
+            //   the opposite: <https://lists.w3.org/Archives/Public/www-style/2012Aug/0298.html>
+            //   Due to the way that we implement table-wrapper boxes, it's easier to align with Firefox.
+            // - Tables ignore overflow values different than visible, clip and hidden.
+            //   This affects both axes, to ensure they have the same scrollability.
             stylo::DisplayInside::Table => {
-                // According to <https://drafts.csswg.org/css-tables/#global-style-overrides>,
-                // - overflow applies to table-wrapper boxes and not to table grid boxes.
-                //   That's what Blink and WebKit do, however Firefox matches a CSSWG resolution that says
-                //   the opposite: <https://lists.w3.org/Archives/Public/www-style/2012Aug/0298.html>
-                //   Due to the way that we implement table-wrapper boxes, it's easier to align with Firefox.
-                // - Tables ignore overflow values different than visible, clip and hidden.
-                //   This affects both axes, to ensure they have the same scrollability.
                 !matches!(self.pseudo(), Some(PseudoElement::ServoTableGrid)) ||
-                    matches!(overflow_x, Overflow::Auto | Overflow::Scroll) ||
-                    matches!(overflow_y, Overflow::Auto | Overflow::Scroll)
+                    matches!(overflow.x, Overflow::Auto | Overflow::Scroll) ||
+                    matches!(overflow.y, Overflow::Auto | Overflow::Scroll)
             },
+
+            // <https://drafts.csswg.org/css-tables/#global-style-overrides>
+            // Table-track and table-track-group boxes ignore overflow.
             stylo::DisplayInside::TableColumn |
             stylo::DisplayInside::TableColumnGroup |
             stylo::DisplayInside::TableRow |
             stylo::DisplayInside::TableRowGroup |
             stylo::DisplayInside::TableHeaderGroup |
-            stylo::DisplayInside::TableFooterGroup => {
-                // <https://drafts.csswg.org/css-tables/#global-style-overrides>
-                // Table-track and table-track-group boxes ignore overflow.
-                true
-            },
+            stylo::DisplayInside::TableFooterGroup => true,
+
             _ => false,
         };
-
         if ignores_overflow {
-            AxesOverflow {
-                x: Overflow::Visible,
-                y: Overflow::Visible,
-            }
-        } else {
-            AxesOverflow {
-                x: overflow_x,
-                y: overflow_y,
-            }
+            return AxesOverflow::default();
         }
+
+        overflow
     }
 
     /// Return true if this style is a normal block and establishes
@@ -685,7 +668,7 @@ impl ComputedValuesExt for ComputedValues {
         // form an independent block formatting context. This should really only happen
         // for block containers, but we do not support subgrid containers yet which is the
         // only other case.
-        if self.get_position().align_content.0.primary() != AlignFlags::NORMAL {
+        if self.get_position().align_content.primary() != AlignFlags::NORMAL {
             return true;
         }
 
@@ -997,14 +980,14 @@ impl ComputedValuesExt for ComputedValues {
 
     fn resolve_align_self(
         &self,
-        resolved_auto_value: AlignItems,
-        resolved_normal_value: AlignItems,
-    ) -> AlignItems {
-        match self.clone_align_self().0.0 {
-            AlignFlags::AUTO => resolved_auto_value,
+        resolved_auto_value: ItemPlacement,
+        resolved_normal_value: AlignFlags,
+    ) -> SelfAlignment {
+        SelfAlignment(match self.clone_align_self().0 {
+            AlignFlags::AUTO => resolved_auto_value.0,
             AlignFlags::NORMAL => resolved_normal_value,
-            value => AlignItems(value),
-        }
+            value => value,
+        })
     }
 
     fn depends_on_block_constraints_due_to_relative_positioning(
@@ -1085,7 +1068,7 @@ impl LayoutStyle<'_> {
         // we instead resolve indefinite percentages against zero.
         let containing_block_size_or_zero =
             containing_block.size.map(|value| value.unwrap_or_default());
-        let writing_mode = containing_block.writing_mode;
+        let writing_mode = containing_block.style.writing_mode;
         let pbm = self.padding_border_margin_with_writing_mode_and_containing_block_inline_size(
             writing_mode,
             containing_block_size_or_zero.inline,

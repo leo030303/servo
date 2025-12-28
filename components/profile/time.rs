@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::thread;
 
-use ipc_channel::ipc::{self, IpcReceiver};
+use base::generic_channel::{self, GenericReceiver};
 use profile_traits::time::{
     ProfilerCategory, ProfilerChan, ProfilerData, ProfilerMsg, TimerMetadata,
     TimerMetadataFrameType, TimerMetadataReflowType,
@@ -73,7 +73,7 @@ type ProfilerBuckets = BTreeMap<(ProfilerCategory, Option<TimerMetadata>), Vec<D
 
 // back end of the profiler that handles data aggregation and performance metrics
 pub struct Profiler {
-    pub port: IpcReceiver<ProfilerMsg>,
+    pub port: GenericReceiver<ProfilerMsg>,
     buckets: ProfilerBuckets,
     output: Option<OutputOptions>,
     pub last_msg: Option<ProfilerMsg>,
@@ -83,9 +83,9 @@ pub struct Profiler {
 
 impl Profiler {
     pub fn create(output: &Option<OutputOptions>, file_path: Option<String>) -> ProfilerChan {
-        let (chan, port) = ipc::channel().unwrap();
         match *output {
             Some(ref option) => {
+                let (chan, port) = generic_channel::channel().unwrap();
                 // Spawn the time profiler thread
                 let outputoption = option.clone();
                 thread::Builder::new()
@@ -115,45 +115,33 @@ impl Profiler {
                             .expect("Thread spawning failed");
                     },
                 }
+
+                ProfilerChan(Some(chan))
             },
             None => {
-                // this is when the -p option hasn't been specified
-                if file_path.is_some() {
-                    // Spawn the time profiler
-                    thread::Builder::new()
-                        .name("TimeProfiler".to_owned())
-                        .spawn(move || {
-                            let trace = file_path.as_ref().and_then(|p| TraceDump::new(p).ok());
-                            let mut profiler = Profiler::new(port, trace, None);
-                            profiler.start();
-                        })
-                        .expect("Thread spawning failed");
-                } else {
-                    // No-op to handle messages when the time profiler is not printing:
-                    thread::Builder::new()
-                        .name("TimeProfiler".to_owned())
-                        .spawn(move || {
-                            loop {
-                                match port.recv() {
-                                    Err(_) => break,
-                                    Ok(ProfilerMsg::Exit(chan)) => {
-                                        let _ = chan.send(());
-                                        break;
-                                    },
-                                    _ => {},
-                                }
-                            }
-                        })
-                        .expect("Thread spawning failed");
+                match file_path {
+                    Some(path) => {
+                        let (chan, port) = generic_channel::channel().unwrap();
+                        // Spawn the time profiler
+                        thread::Builder::new()
+                            .name("TimeProfiler".to_owned())
+                            .spawn(move || {
+                                let trace = TraceDump::new(path).ok();
+                                let mut profiler = Profiler::new(port, trace, None);
+                                profiler.start();
+                            })
+                            .expect("Thread spawning failed");
+
+                        ProfilerChan(Some(chan))
+                    },
+                    None => ProfilerChan(None),
                 }
             },
         }
-
-        ProfilerChan(chan)
     }
 
     pub fn new(
-        port: IpcReceiver<ProfilerMsg>,
+        port: GenericReceiver<ProfilerMsg>,
         trace: Option<TraceDump>,
         output: Option<OutputOptions>,
     ) -> Profiler {

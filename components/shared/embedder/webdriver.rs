@@ -6,26 +6,24 @@
 
 use std::collections::HashMap;
 
-use base::generic_channel::GenericSender;
+use base::generic_channel::{GenericOneshotSender, GenericSender};
 use base::id::{BrowsingContextId, WebViewId};
 use cookie::Cookie;
+use crossbeam_channel::Sender;
 use euclid::default::Rect as UntypedRect;
 use euclid::{Rect, Size2D};
 use hyper_serde::Serde;
-use ipc_channel::ipc::IpcSender;
-use keyboard_types::{CompositionEvent, KeyboardEvent};
-use pixels::RasterImage;
+use image::RgbaImage;
+use malloc_size_of_derive::MallocSizeOf;
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_geometry::DeviceIndependentIntRect;
-use servo_url::ServoUrl;
 use style_traits::CSSPixel;
+use url::Url;
 use webdriver::error::ErrorStatus;
 use webrender_api::units::DevicePixel;
 
-use crate::{FocusId, JSValue, MouseButton, MouseButtonAction, TraversalId};
-
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
-pub struct WebDriverMessageId(pub usize);
+use crate::{InputEvent, JSValue, JavaScriptEvaluationError, ScreenshotCaptureError, TraversalId};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum WebDriverUserPrompt {
@@ -71,18 +69,32 @@ impl WebDriverUserPromptAction {
     }
 }
 
+/// <https://html.spec.whatwg.org/multipage/#registerprotocolhandler()-automation-mode>
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum CustomHandlersAutomationMode {
+    AutoAccept,
+    AutoReject,
+    #[default]
+    None,
+}
+
+/// <https://w3c.github.io/webdriver/#new-window>
+#[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
+pub enum NewWindowTypeHint {
+    Auto,
+    Tab,
+    Window,
+}
+
 /// Messages to the constellation originating from the WebDriver server.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug)]
 pub enum WebDriverCommandMsg {
-    /// Used in the initialization of the WebDriver server to set the sender for sending responses
-    /// back to the WebDriver client. It is set to constellation for now
-    SetWebDriverResponseSender(IpcSender<WebDriverCommandResponse>),
     /// Get the window rectangle.
-    GetWindowRect(WebViewId, IpcSender<DeviceIndependentIntRect>),
+    GetWindowRect(WebViewId, GenericOneshotSender<DeviceIndependentIntRect>),
     /// Get the viewport size.
-    GetViewportSize(WebViewId, IpcSender<Size2D<u32, DevicePixel>>),
+    GetViewportSize(WebViewId, GenericOneshotSender<Size2D<u32, DevicePixel>>),
     /// Load a URL in the top-level browsing context with the given ID.
-    LoadUrl(WebViewId, ServoUrl, GenericSender<WebDriverLoadStatus>),
+    LoadUrl(WebViewId, Url, GenericSender<WebDriverLoadStatus>),
     /// Refresh the top-level browsing context with the given ID.
     Refresh(WebViewId, GenericSender<WebDriverLoadStatus>),
     /// Navigate the webview with the given ID to the previous page in the browsing context's history.
@@ -92,87 +104,55 @@ pub enum WebDriverCommandMsg {
     /// Pass a webdriver command to the script thread of the current pipeline
     /// of a browsing context.
     ScriptCommand(BrowsingContextId, WebDriverScriptCommand),
-    /// Dispatch composition event from element send keys command.
-    DispatchComposition(WebViewId, CompositionEvent),
-    /// Act as if keys were pressed or release in the browsing context with the given ID.
-    KeyboardAction(
-        WebViewId,
-        KeyboardEvent,
-        // Should never be None.
-        Option<WebDriverMessageId>,
-    ),
-    /// Act as if the mouse was clicked in the browsing context with the given ID.
-    MouseButtonAction(
-        WebViewId,
-        MouseButtonAction,
-        MouseButton,
-        f32,
-        f32,
-        // Should never be None.
-        Option<WebDriverMessageId>,
-    ),
-    /// Act as if the mouse was moved in the browsing context with the given ID.
-    MouseMoveAction(
-        WebViewId,
-        f32,
-        f32,
-        // None if it's not the last `perform_pointer_move` since we only
-        // expect one response from constellation for each tick actions.
-        Option<WebDriverMessageId>,
-    ),
-    /// Act as if the mouse wheel is scrolled in the browsing context given the given ID.
-    WheelScrollAction(
-        WebViewId,
-        f64,
-        f64,
-        f64,
-        f64,
-        // None if it's not the last `perform_wheel_scroll` since we only
-        // expect one response from constellation for each tick actions.
-        Option<WebDriverMessageId>,
-    ),
+    /// Dispatch an input event to the given [`WebView`]. Once the event has been handled in the
+    /// page DOM a single message should be sent through the [`Sender`], if provided, informing the
+    /// WebDriver server that the inpute event has been handled.
+    InputEvent(WebViewId, InputEvent, Option<Sender<()>>),
     /// Set the outer window rectangle.
     SetWindowRect(
         WebViewId,
         DeviceIndependentIntRect,
-        IpcSender<DeviceIndependentIntRect>,
+        GenericOneshotSender<DeviceIndependentIntRect>,
     ),
     /// Maximize the window. Send back result window rectangle.
-    MaximizeWebView(WebViewId, IpcSender<DeviceIndependentIntRect>),
+    MaximizeWebView(WebViewId, GenericOneshotSender<DeviceIndependentIntRect>),
     /// Take a screenshot of the viewport.
     TakeScreenshot(
         WebViewId,
         Option<Rect<f32, CSSPixel>>,
-        IpcSender<Option<RasterImage>>,
+        Sender<Result<RgbaImage, ScreenshotCaptureError>>,
     ),
     /// Create a new webview that loads about:blank. The embedder will use
     /// the provided channels to return the top level browsing context id
     /// associated with the new webview, and sets a "load status sender" if provided.
-    NewWebView(
-        IpcSender<WebViewId>,
+    NewWindow(
+        NewWindowTypeHint,
+        GenericOneshotSender<WebViewId>,
         Option<GenericSender<WebDriverLoadStatus>>,
     ),
     /// Close the webview associated with the provided id.
-    CloseWebView(WebViewId, IpcSender<()>),
+    CloseWebView(WebViewId, GenericOneshotSender<()>),
     /// Focus the webview associated with the provided id.
-    /// Sends back a bool indicating whether the focus was successfully set.
-    FocusWebView(WebViewId, IpcSender<bool>),
+    FocusWebView(WebViewId),
     /// Get focused webview. For now, this is only used when start new session.
-    GetFocusedWebView(IpcSender<Option<WebViewId>>),
+    GetFocusedWebView(GenericOneshotSender<Option<WebViewId>>),
     /// Get webviews state
-    GetAllWebViews(IpcSender<Vec<WebViewId>>),
+    GetAllWebViews(GenericOneshotSender<Vec<WebViewId>>),
     /// Check whether top-level browsing context is open.
-    IsWebViewOpen(WebViewId, IpcSender<bool>),
+    IsWebViewOpen(WebViewId, GenericOneshotSender<bool>),
     /// Check whether browsing context is open.
-    IsBrowsingContextOpen(BrowsingContextId, IpcSender<bool>),
-    CurrentUserPrompt(WebViewId, IpcSender<Option<WebDriverUserPrompt>>),
+    IsBrowsingContextOpen(BrowsingContextId, GenericOneshotSender<bool>),
+    CurrentUserPrompt(WebViewId, GenericOneshotSender<Option<WebDriverUserPrompt>>),
     HandleUserPrompt(
         WebViewId,
         WebDriverUserPromptAction,
-        IpcSender<Result<Option<String>, ()>>,
+        GenericOneshotSender<Result<String, ()>>,
     ),
-    GetAlertText(WebViewId, IpcSender<Result<String, ()>>),
+    GetAlertText(WebViewId, GenericOneshotSender<Result<String, ()>>),
     SendAlertText(WebViewId, String),
+    FocusBrowsingContext(BrowsingContextId),
+    Shutdown,
+    ResetAllCookies(Sender<()>),
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -183,97 +163,118 @@ pub enum WebDriverScriptCommand {
             serialize_with = "::hyper_serde::serialize"
         )]
         Cookie<'static>,
-        IpcSender<Result<(), ErrorStatus>>,
+        GenericSender<Result<(), ErrorStatus>>,
     ),
-    DeleteCookies(IpcSender<Result<(), ErrorStatus>>),
-    DeleteCookie(String, IpcSender<Result<(), ErrorStatus>>),
-    ElementClear(String, IpcSender<Result<(), ErrorStatus>>),
-    ExecuteScript(String, IpcSender<WebDriverJSResult>),
-    ExecuteAsyncScript(String, IpcSender<WebDriverJSResult>),
-    FindElementsCSSSelector(String, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    FindElementsLinkText(String, bool, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    FindElementsTagName(String, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    FindElementsXpathSelector(String, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    FindElementElementsCSSSelector(String, String, IpcSender<Result<Vec<String>, ErrorStatus>>),
+    DeleteCookies(GenericSender<Result<(), ErrorStatus>>),
+    DeleteCookie(String, GenericSender<Result<(), ErrorStatus>>),
+    ElementClear(String, GenericSender<Result<(), ErrorStatus>>),
+    ExecuteScript(String, GenericSender<WebDriverJSResult>),
+    ExecuteAsyncScript(String, GenericSender<WebDriverJSResult>),
+    FindElementsCSSSelector(String, GenericSender<Result<Vec<String>, ErrorStatus>>),
+    FindElementsLinkText(
+        String,
+        bool,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
+    ),
+    FindElementsTagName(String, GenericSender<Result<Vec<String>, ErrorStatus>>),
+    FindElementsXpathSelector(String, GenericSender<Result<Vec<String>, ErrorStatus>>),
+    FindElementElementsCSSSelector(
+        String,
+        String,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
+    ),
     FindElementElementsLinkText(
         String,
         String,
         bool,
-        IpcSender<Result<Vec<String>, ErrorStatus>>,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
     ),
-    FindElementElementsTagName(String, String, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    FindElementElementsXPathSelector(String, String, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    FindShadowElementsCSSSelector(String, String, IpcSender<Result<Vec<String>, ErrorStatus>>),
+    FindElementElementsTagName(
+        String,
+        String,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
+    ),
+    FindElementElementsXPathSelector(
+        String,
+        String,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
+    ),
+    FindShadowElementsCSSSelector(
+        String,
+        String,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
+    ),
     FindShadowElementsLinkText(
         String,
         String,
         bool,
-        IpcSender<Result<Vec<String>, ErrorStatus>>,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
     ),
-    FindShadowElementsTagName(String, String, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    FindShadowElementsXPathSelector(String, String, IpcSender<Result<Vec<String>, ErrorStatus>>),
-    GetElementShadowRoot(String, IpcSender<Result<Option<String>, ErrorStatus>>),
-    ElementClick(String, IpcSender<Result<Option<String>, ErrorStatus>>),
-    GetKnownElement(String, IpcSender<Result<(), ErrorStatus>>),
-    GetKnownShadowRoot(String, IpcSender<Result<(), ErrorStatus>>),
-    GetActiveElement(IpcSender<Option<String>>),
-    GetComputedRole(String, IpcSender<Result<Option<String>, ErrorStatus>>),
+    FindShadowElementsTagName(
+        String,
+        String,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
+    ),
+    FindShadowElementsXPathSelector(
+        String,
+        String,
+        GenericSender<Result<Vec<String>, ErrorStatus>>,
+    ),
+    GetElementShadowRoot(String, GenericSender<Result<Option<String>, ErrorStatus>>),
+    ElementClick(String, GenericSender<Result<Option<String>, ErrorStatus>>),
+    GetKnownElement(String, GenericSender<Result<(), ErrorStatus>>),
+    GetKnownShadowRoot(String, GenericSender<Result<(), ErrorStatus>>),
+    GetKnownWindow(String, GenericSender<Result<(), ErrorStatus>>),
+    GetActiveElement(GenericSender<Option<String>>),
+    GetComputedRole(String, GenericSender<Result<Option<String>, ErrorStatus>>),
     GetCookie(
         String,
-        IpcSender<Result<Vec<Serde<Cookie<'static>>>, ErrorStatus>>,
+        GenericSender<Result<Vec<Serde<Cookie<'static>>>, ErrorStatus>>,
     ),
-    GetCookies(IpcSender<Result<Vec<Serde<Cookie<'static>>>, ErrorStatus>>),
+    GetCookies(GenericSender<Result<Vec<Serde<Cookie<'static>>>, ErrorStatus>>),
     GetElementAttribute(
         String,
         String,
-        IpcSender<Result<Option<String>, ErrorStatus>>,
+        GenericSender<Result<Option<String>, ErrorStatus>>,
     ),
-    GetElementProperty(String, String, IpcSender<Result<JSValue, ErrorStatus>>),
-    GetElementCSS(String, String, IpcSender<Result<String, ErrorStatus>>),
-    GetElementRect(String, IpcSender<Result<UntypedRect<f64>, ErrorStatus>>),
-    GetElementTagName(String, IpcSender<Result<String, ErrorStatus>>),
-    GetElementText(String, IpcSender<Result<String, ErrorStatus>>),
-    GetElementInViewCenterPoint(String, IpcSender<Result<Option<(i64, i64)>, ErrorStatus>>),
-    GetBoundingClientRect(String, IpcSender<Result<UntypedRect<f32>, ErrorStatus>>),
+    GetElementProperty(String, String, GenericSender<Result<JSValue, ErrorStatus>>),
+    GetElementCSS(String, String, GenericSender<Result<String, ErrorStatus>>),
+    GetElementRect(String, GenericSender<Result<UntypedRect<f64>, ErrorStatus>>),
+    GetElementTagName(String, GenericSender<Result<String, ErrorStatus>>),
+    GetElementText(String, GenericSender<Result<String, ErrorStatus>>),
+    GetElementInViewCenterPoint(
+        String,
+        GenericOneshotSender<Result<Option<(i64, i64)>, ErrorStatus>>,
+    ),
+    ScrollAndGetBoundingClientRect(String, GenericSender<Result<UntypedRect<f32>, ErrorStatus>>),
     GetBrowsingContextId(
         WebDriverFrameId,
-        IpcSender<Result<BrowsingContextId, ErrorStatus>>,
+        GenericSender<Result<BrowsingContextId, ErrorStatus>>,
     ),
-    GetParentFrameId(IpcSender<Result<BrowsingContextId, ErrorStatus>>),
-    GetUrl(IpcSender<ServoUrl>),
-    GetPageSource(IpcSender<Result<String, ErrorStatus>>),
-    IsEnabled(String, IpcSender<Result<bool, ErrorStatus>>),
-    IsSelected(String, IpcSender<Result<bool, ErrorStatus>>),
-    GetTitle(IpcSender<String>),
+    GetParentFrameId(GenericSender<Result<BrowsingContextId, ErrorStatus>>),
+    GetUrl(GenericSender<String>),
+    GetPageSource(GenericSender<Result<String, ErrorStatus>>),
+    IsEnabled(String, GenericSender<Result<bool, ErrorStatus>>),
+    IsSelected(String, GenericSender<Result<bool, ErrorStatus>>),
+    GetTitle(GenericSender<String>),
     /// Deal with the case of input element for Element Send Keys, which does not send keys.
-    WillSendKeys(String, String, bool, IpcSender<Result<bool, ErrorStatus>>),
+    WillSendKeys(
+        String,
+        String,
+        bool,
+        GenericSender<Result<bool, ErrorStatus>>,
+    ),
     AddLoadStatusSender(WebViewId, GenericSender<WebDriverLoadStatus>),
     RemoveLoadStatusSender(WebViewId),
+    SetProtocolHandlerAutomationMode(CustomHandlersAutomationMode),
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-pub enum WebDriverJSError {
-    /// Occurs when handler received an event message for a layout channel that is not
-    /// associated with the current script thread
-    BrowsingContextNotFound,
-    JSException(JSValue),
-    JSError,
-    StaleElementReference,
-    Timeout,
-    UnknownType,
-}
-
-pub type WebDriverJSResult = Result<JSValue, WebDriverJSError>;
+pub type WebDriverJSResult = Result<JSValue, JavaScriptEvaluationError>;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum WebDriverFrameId {
     Short(u16),
     Element(String),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct WebDriverCommandResponse {
-    pub id: WebDriverMessageId,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -289,12 +290,11 @@ pub enum WebDriverLoadStatus {
     Blocked,
 }
 
-/// A collection of [`IpcSender`]s that are used to asynchronously communicate
+/// A collection of [`GenericSender`]s that are used to asynchronously communicate
 /// to a WebDriver server with information about application state.
 #[derive(Clone, Default)]
 pub struct WebDriverSenders {
-    pub load_status_senders: HashMap<WebViewId, GenericSender<WebDriverLoadStatus>>,
-    pub script_evaluation_interrupt_sender: Option<IpcSender<WebDriverJSResult>>,
+    pub load_status_senders: FxHashMap<WebViewId, GenericSender<WebDriverLoadStatus>>,
+    pub script_evaluation_interrupt_sender: Option<GenericSender<WebDriverJSResult>>,
     pub pending_traversals: HashMap<TraversalId, GenericSender<WebDriverLoadStatus>>,
-    pub pending_focus: HashMap<FocusId, IpcSender<bool>>,
 }

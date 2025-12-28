@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 
 use std::cell::UnsafeCell;
 use std::{io, mem, process, thread};
@@ -116,15 +116,14 @@ impl Drop for PosixSemaphore {
     }
 }
 
-#[allow(dead_code)]
 pub struct LinuxSampler {
     thread_id: MonitoredThreadId,
-    old_handler: SigAction,
+    old_handler: Box<SigAction>,
 }
 
-impl LinuxSampler {
-    #[allow(unsafe_code, dead_code)]
-    pub fn new_boxed() -> Box<dyn Sampler> {
+impl Default for LinuxSampler {
+    #[expect(unsafe_code)]
+    fn default() -> Self {
         let thread_id = unsafe { libc::syscall(libc::SYS_gettid) as libc::pid_t };
         let handler = SigHandler::SigAction(sigprof_handler);
         let action = SigAction::new(
@@ -133,16 +132,16 @@ impl LinuxSampler {
             SigSet::empty(),
         );
         let old_handler =
-            unsafe { sigaction(Signal::SIGPROF, &action).expect("signal handler set") };
-        Box::new(LinuxSampler {
+            Box::new(unsafe { sigaction(Signal::SIGPROF, &action).expect("signal handler set") });
+        Self {
             thread_id,
             old_handler,
-        })
+        }
     }
 }
 
 impl Sampler for LinuxSampler {
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn suspend_and_sample_thread(&self) -> Result<NativeStack, ()> {
         // Warning: The "critical section" begins here.
         // In the critical section:
@@ -167,7 +166,7 @@ impl Sampler for LinuxSampler {
                 .wait_through_intr()
                 .expect("msg2 failed");
 
-            let mut native_stack = NativeStack::new();
+            let mut native_stack = NativeStack::default();
             unsafe {
                 backtrace::trace_unsynchronized(|frame| {
                     let ip = frame.ip();

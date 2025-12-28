@@ -15,14 +15,17 @@ path = "lib.rs"
 # bakes default resources into the library.
 # This feature is mainly intended for testing purposes.
 baked-default-resources = []
+gamepad = []
 
 [dependencies]
 base = { workspace = true }
+bitflags = { workspace = true }
 cookie = { workspace = true }
 crossbeam-channel = { workspace = true }
 euclid = { workspace = true }
 http = { workspace = true }
 hyper_serde = { workspace = true }
+image = { workspace = true }
 ipc-channel = { workspace = true }
 keyboard-types = { workspace = true }
 log = { workspace = true }
@@ -30,13 +33,14 @@ malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
 num-derive = "0.4"
 pixels = { path = "../../pixels" }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
+servo_geometry = { path = "../../geometry" }
 servo_url = { path = "../../url" }
-strum_macros = { workspace = true }
-stylo_traits = { workspace = true }
+strum = { workspace = true }
 stylo = { workspace = true }
+stylo_traits = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 webdriver = { workspace = true }
 webrender_api = { workspace = true }
-servo_geometry = { path = "../../geometry" }

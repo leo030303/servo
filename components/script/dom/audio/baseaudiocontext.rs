@@ -68,16 +68,18 @@ use crate::dom::promise::Promise;
 use crate::realms::InRealm;
 use crate::script_runtime::CanGc;
 
-#[allow(dead_code)]
 pub(crate) enum BaseAudioContextOptions {
     AudioContext(RealTimeAudioContextOptions),
     OfflineAudioContext(OfflineAudioContextOptions),
 }
 
-#[derive(JSTraceable)]
+#[derive(JSTraceable, MallocSizeOf)]
 struct DecodeResolver {
+    #[conditional_malloc_size_of]
     pub(crate) promise: Rc<Promise>,
+    #[conditional_malloc_size_of]
     pub(crate) success_callback: Option<Rc<DecodeSuccessCallback>>,
+    #[conditional_malloc_size_of]
     pub(crate) error_callback: Option<Rc<DecodeErrorCallback>>,
 }
 
@@ -93,12 +95,11 @@ pub(crate) struct BaseAudioContext {
     destination: MutNullableDom<AudioDestinationNode>,
     listener: MutNullableDom<AudioListener>,
     /// Resume promises which are soon to be fulfilled by a queued task.
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     in_flight_resume_promises_queue: DomRefCell<VecDeque<(BoxedSliceOfPromises, ErrorResult)>>,
     /// <https://webaudio.github.io/web-audio-api/#pendingresumepromises>
-    #[ignore_malloc_size_of = "promises are hard"]
+    #[conditional_malloc_size_of]
     pending_resume_promises: DomRefCell<Vec<Rc<Promise>>>,
-    #[ignore_malloc_size_of = "promises are hard"]
     decode_resolvers: DomRefCell<HashMap<String, DecodeResolver>>,
     /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-samplerate>
     sample_rate: f32,
@@ -128,7 +129,7 @@ impl BaseAudioContext {
             ClientContextId::build(pipeline_id.namespace_id.0, pipeline_id.index.0.get());
         let audio_context_impl = ServoMedia::get()
             .create_audio_context(&client_context_id, options.convert())
-            .map_err(|_| Error::NotSupported)?;
+            .map_err(|_| Error::NotSupported(None))?;
 
         Ok(BaseAudioContext {
             eventtarget: EventTarget::new_inherited(),
@@ -292,7 +293,7 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
 
         // Step 2.
         if self.audio_context_impl.lock().unwrap().state() == ProcessingState::Closed {
-            promise.reject_error(Error::InvalidState, can_gc);
+            promise.reject_error(Error::InvalidState(None), can_gc);
             return promise;
         }
 
@@ -444,7 +445,7 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
             length == 0 ||
             *sample_rate <= 0.
         {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
         Ok(AudioBuffer::new(
             self.global().as_window(),
@@ -456,7 +457,7 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
         ))
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createbuffersource
+    /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-createbuffersource>
     fn CreateBufferSource(&self, can_gc: CanGc) -> Fallible<DomRoot<AudioBufferSourceNode>> {
         AudioBufferSourceNode::new(
             self.global().as_window(),
@@ -466,7 +467,7 @@ impl BaseAudioContextMethods<crate::DomTypeHolder> for BaseAudioContext {
         )
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-decodeaudiodata
+    /// <https://webaudio.github.io/web-audio-api/#dom-baseaudiocontext-decodeaudiodata>
     fn DecodeAudioData(
         &self,
         audio_data: CustomAutoRooterGuard<ArrayBuffer>,

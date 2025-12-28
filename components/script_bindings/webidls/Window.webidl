@@ -15,7 +15,6 @@
   [PutForwards=href, LegacyUnforgeable, CrossOriginReadable, CrossOriginWritable]
     readonly attribute Location location;
   readonly attribute History history;
-  [Pref="dom_customelements_enabled"]
   readonly attribute CustomElementRegistry customElements;
   //[Replaceable] readonly attribute BarProp locationbar;
   //[Replaceable] readonly attribute BarProp menubar;
@@ -49,6 +48,7 @@
 
   // the user agent
   readonly attribute Navigator navigator;
+  [Replaceable] readonly attribute Navigator clientInformation;
   //[Replaceable] readonly attribute External external;
   //readonly attribute ApplicationCache applicationCache;
 
@@ -103,6 +103,7 @@ dictionary ScrollToOptions : ScrollOptions {
 partial interface Window {
   [Exposed=(Window), NewObject] MediaQueryList matchMedia(DOMString query);
   [SameObject, Replaceable] readonly attribute Screen screen;
+  [Pref="dom_visual_viewport_enabled", SameObject, Replaceable] readonly attribute VisualViewport? visualViewport;
 
   // browsing context
   undefined moveTo(long x, long y);
@@ -149,10 +150,9 @@ partial interface Window {
   // Shouldn't be public, but just to make things work for now
   undefined webdriverCallback(optional any result);
   undefined webdriverException(optional any result);
-  undefined webdriverTimeout();
   Element? webdriverElement(DOMString id);
-  Element? webdriverFrame(DOMString id);
-  WindowProxy? webdriverWindow(DOMString id);
+  WindowProxy? webdriverFrame(DOMString id);
+  WindowProxy webdriverWindow(DOMString id);
   ShadowRoot? webdriverShadowRoot(DOMString id);
 };
 
@@ -188,4 +188,13 @@ partial interface Window {
 
 dictionary WindowPostMessageOptions : StructuredSerializeOptions {
    USVString targetOrigin = "/";
+};
+
+// https://fetch.spec.whatwg.org/#fetch-method
+dictionary DeferredRequestInit : RequestInit {
+  DOMHighResTimeStamp activateAfter;
+};
+
+partial interface Window {
+  [NewObject, SecureContext, Throws] FetchLaterResult fetchLater(RequestInfo input, optional DeferredRequestInit init = {});
 };

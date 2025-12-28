@@ -17,7 +17,7 @@ use style::stylesheets::DocumentStyleSheet;
 use style::values::computed::{FontStyle, FontWeight};
 
 #[derive(Default, MallocSizeOf)]
-pub struct FontStore {
+pub(crate) struct FontStore {
     pub(crate) families: HashMap<LowercaseFontFamilyName, FontTemplates>,
     web_fonts_loading_for_stylesheets: Vec<(DocumentStyleSheet, usize)>,
     web_fonts_loading_for_script: usize,
@@ -166,10 +166,7 @@ impl SimpleFamily {
             (false, true) => [&self.italic, &self.bold_italic, &self.regular, &self.bold],
             (false, false) => [&self.regular, &self.bold, &self.italic, &self.bold_italic],
         };
-        preference
-            .iter()
-            .filter_map(|template| (*template).clone())
-            .next()
+        preference.iter().find_map(|template| (*template).clone())
     }
 
     fn remove_templates_for_stylesheet(&mut self, stylesheet: &DocumentStyleSheet) {

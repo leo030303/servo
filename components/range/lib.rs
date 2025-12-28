@@ -261,7 +261,7 @@ impl<I: RangeIndex> Range<I> {
         self.begin + self.length
     }
 
-    /// `true` if the index is between the beginning and the end of the range.
+    /// `true` if the index is between the beginning and the end (exclusive) of the range.
     ///
     /// ~~~ignore
     ///        false        true      false
@@ -271,6 +271,18 @@ impl<I: RangeIndex> Range<I> {
     #[inline]
     pub fn contains(&self, i: I) -> bool {
         i >= self.begin() && i < self.end()
+    }
+
+    /// `true` if the index is between the beginning and the end (inclusive) of the range.
+    ///
+    /// ~~~ignore
+    ///        false        true      false
+    ///          |           |          |
+    /// <- o - - + - - +=====+======+ - + - ->
+    /// ~~~
+    #[inline]
+    pub fn contains_inclusive(&self, i: I) -> bool {
+        i >= self.begin() && i <= self.end()
     }
 
     /// `true` if the offset from the beginning to the end of the range is zero.
@@ -350,7 +362,7 @@ impl<I: RangeIndex> Range<I> {
 
 /// Methods for `Range`s with indices based on integer values
 impl<I: RangeIndex> Range<I> {
-    /// Returns an iterater that increments over `[begin, end)`.
+    /// Returns an iterator that increments over `[begin, end)`.
     #[inline]
     pub fn each_index(&self) -> EachIndex<I> {
         each_index(self.begin(), self.end())

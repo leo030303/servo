@@ -3,12 +3,12 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::Cell;
-use std::collections::HashMap;
 
 use base::id::{DomPointId, DomPointIndex};
 use constellation_traits::DomPoint;
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use rustc_hash::FxHashMap;
 
 use crate::dom::bindings::codegen::Bindings::DOMMatrixBinding::DOMMatrixInit;
 use crate::dom::bindings::codegen::Bindings::DOMPointBinding::DOMPointInit;
@@ -33,7 +33,6 @@ pub(crate) struct DOMPointReadOnly {
     w: Cell<f64>,
 }
 
-#[allow(non_snake_case)]
 impl DOMPointReadOnly {
     pub(crate) fn new_inherited(x: f64, y: f64, z: f64, w: f64) -> DOMPointReadOnly {
         DOMPointReadOnly {
@@ -74,7 +73,6 @@ impl DOMPointReadOnly {
     }
 }
 
-#[allow(non_snake_case)]
 impl DOMPointReadOnlyMethods<crate::DomTypeHolder> for DOMPointReadOnly {
     /// <https://drafts.fxtf.org/geometry/#dom-dompoint-dompoint>
     fn Constructor(
@@ -153,7 +151,7 @@ impl DOMPointReadOnlyMethods<crate::DomTypeHolder> for DOMPointReadOnly {
     }
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 pub(crate) trait DOMPointWriteMethods {
     fn SetX(&self, value: f64);
     fn SetY(&self, value: f64);
@@ -213,7 +211,7 @@ impl Serializable for DOMPointReadOnly {
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<DomPointId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<DomPointId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.points,
             StructuredData::Writer(w) => &mut w.points,

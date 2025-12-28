@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Ref;
+
 use dom_struct::dom_struct;
 use indexmap::IndexSet;
 use script_bindings::codegen::GenericBindings::ElementInternalsBinding::CustomStateSetMethods;
@@ -15,7 +17,7 @@ use style::values::AtomIdent;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
-use crate::dom::htmlelement::HTMLElement;
+use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::{Node, NodeDamage};
 use crate::dom::window::Window;
 
@@ -46,8 +48,12 @@ impl CustomStateSet {
     {
         // FIXME: This creates new atoms whenever it is called, which is not optimal.
         for state in self.internal.borrow().iter() {
-            callback(&AtomIdent::from(state.str()));
+            callback(&AtomIdent::from(&*state.str()));
         }
+    }
+
+    pub(crate) fn set<'a>(&'a self) -> Ref<'a, IndexSet<DOMString>> {
+        self.internal.borrow()
     }
 
     fn states_did_change(&self) {

@@ -24,7 +24,6 @@ use crate::script_runtime::CanGc;
 
 /// <https://encoding.spec.whatwg.org/#textdecoder>
 #[dom_struct]
-#[allow(non_snake_case)]
 pub(crate) struct TextDecoder {
     reflector_: Reflector,
 
@@ -35,7 +34,7 @@ pub(crate) struct TextDecoder {
     do_not_flush: Cell<bool>,
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 impl TextDecoder {
     fn new_inherited(encoding: &'static Encoding, fatal: bool, ignoreBOM: bool) -> TextDecoder {
         let decoder = TextDecoderCommon::new_inherited(encoding, fatal, ignoreBOM);
@@ -69,7 +68,6 @@ impl TextDecoder {
     }
 }
 
-#[allow(non_snake_case)]
 impl TextDecoderMethods<crate::DomTypeHolder> for TextDecoder {
     /// <https://encoding.spec.whatwg.org/#dom-textdecoder>
     fn Constructor(
@@ -79,7 +77,7 @@ impl TextDecoderMethods<crate::DomTypeHolder> for TextDecoder {
         label: DOMString,
         options: &TextDecoderBinding::TextDecoderOptions,
     ) -> Fallible<DomRoot<TextDecoder>> {
-        let encoding = match Encoding::for_label_no_replacement(label.as_bytes()) {
+        let encoding = match Encoding::for_label_no_replacement(&label.as_bytes()) {
             None => return TextDecoder::make_range_error(),
             Some(enc) => enc,
         };

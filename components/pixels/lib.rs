@@ -7,6 +7,7 @@ mod snapshot;
 use std::borrow::Cow;
 use std::io::Cursor;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{cmp, fmt, vec};
 
@@ -23,7 +24,10 @@ use log::debug;
 use malloc_size_of_derive::MallocSizeOf;
 use serde::{Deserialize, Serialize};
 pub use snapshot::*;
-use webrender_api::ImageKey;
+use webrender_api::units::DeviceIntSize;
+use webrender_api::{
+    ImageDescriptor, ImageDescriptorFlags, ImageFormat as WebRenderImageFormat, ImageKey,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, MallocSizeOf, PartialEq, Serialize)]
 pub enum FilterQuality {
@@ -277,17 +281,47 @@ pub enum CorsStatus {
     Unsafe,
 }
 
-#[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
+/// A version of [`RasterImage`] that can be sent across IPC channels.
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+pub struct SharedRasterImage {
+    pub metadata: ImageMetadata,
+    pub format: PixelFormat,
+    pub id: Option<ImageKey>,
+    pub cors_status: CorsStatus,
+    #[conditional_malloc_size_of]
+    pub bytes: Arc<IpcSharedMemory>,
+    pub frames: Vec<ImageFrame>,
+    /// Whether or not all of the frames of this image are opaque.
+    pub is_opaque: bool,
+}
+
+#[derive(Clone, MallocSizeOf)]
 pub struct RasterImage {
     pub metadata: ImageMetadata,
     pub format: PixelFormat,
     pub id: Option<ImageKey>,
     pub cors_status: CorsStatus,
-    pub bytes: IpcSharedMemory,
+    #[conditional_malloc_size_of]
+    pub bytes: Arc<Vec<u8>>,
     pub frames: Vec<ImageFrame>,
+    /// Whether or not all of the frames of this image are opaque.
+    pub is_opaque: bool,
 }
 
-#[derive(Clone, Deserialize, MallocSizeOf, Serialize)]
+fn sensible_delay(delay: Duration) -> Duration {
+    // Very small timeout values are problematic for two reasons: we don't want
+    // to burn energy redrawing animated images extremely fast, and broken tools
+    // generate these values when they actually want a "default" value, so such
+    // images won't play back right without normalization.
+    // https://searchfox.org/firefox-main/rev/c79acad610ddbb31bd92e837e056b53716f5ccf2/image/FrameTimeout.h#35
+    if delay <= Duration::from_millis(10) {
+        Duration::from_millis(100)
+    } else {
+        delay
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ImageFrame {
     pub delay: Option<Duration>,
     /// References a range of the `bytes` field from the image that this
@@ -297,12 +331,24 @@ pub struct ImageFrame {
     pub height: u32,
 }
 
+impl ImageFrame {
+    pub fn delay(&self) -> Option<Duration> {
+        self.delay.map(sensible_delay)
+    }
+}
+
 /// A non-owning reference to the data of an [ImageFrame]
 pub struct ImageFrameView<'a> {
     pub delay: Option<Duration>,
     pub bytes: &'a [u8],
     pub width: u32,
     pub height: u32,
+}
+
+impl ImageFrameView<'_> {
+    pub fn delay(&self) -> Option<Duration> {
+        self.delay.map(sensible_delay)
+    }
 }
 
 impl RasterImage {
@@ -326,6 +372,79 @@ impl RasterImage {
     pub fn first_frame(&self) -> ImageFrameView<'_> {
         self.frame(0)
             .expect("All images should have at least one frame")
+    }
+
+    pub fn as_snapshot(&self) -> Snapshot {
+        let size = Size2D::new(self.metadata.width, self.metadata.height);
+        let format = match self.format {
+            PixelFormat::BGRA8 => SnapshotPixelFormat::BGRA,
+            PixelFormat::RGBA8 => SnapshotPixelFormat::RGBA,
+            pixel_format => {
+                unimplemented!("unsupported pixel format ({pixel_format:?})");
+            },
+        };
+
+        let alpha_mode = SnapshotAlphaMode::Transparent {
+            premultiplied: true,
+        };
+
+        Snapshot::from_arc_vec(
+            size.cast(),
+            format,
+            alpha_mode,
+            self.bytes.clone(),
+            self.frames[0].byte_range.clone(),
+        )
+    }
+
+    pub fn webrender_image_descriptor_and_data_for_frame(
+        &self,
+        frame_index: usize,
+    ) -> (ImageDescriptor, IpcSharedMemory) {
+        let frame = self
+            .frames
+            .get(frame_index)
+            .expect("Asked for a frame that did not exist: {frame_index:?}");
+
+        let (format, data) = match self.format {
+            PixelFormat::BGRA8 => (WebRenderImageFormat::BGRA8, (*self.bytes).clone()),
+            PixelFormat::RGBA8 => (WebRenderImageFormat::RGBA8, (*self.bytes).clone()),
+            PixelFormat::RGB8 => {
+                let frame_bytes = &self.bytes[frame.byte_range.clone()];
+                let mut bytes = Vec::with_capacity(frame_bytes.len() / 3 * 4);
+                for rgb in frame_bytes.chunks(3) {
+                    bytes.extend_from_slice(&[rgb[2], rgb[1], rgb[0], 0xff]);
+                }
+                (WebRenderImageFormat::BGRA8, bytes)
+            },
+            PixelFormat::K8 | PixelFormat::KA8 => {
+                panic!("Not support by webrender yet");
+            },
+        };
+        let mut flags = ImageDescriptorFlags::ALLOW_MIPMAPS;
+        flags.set(ImageDescriptorFlags::IS_OPAQUE, self.is_opaque);
+
+        let size = DeviceIntSize::new(self.metadata.width as i32, self.metadata.height as i32);
+        let descriptor = ImageDescriptor {
+            size,
+            stride: None,
+            format,
+            offset: frame.byte_range.start as i32,
+            flags,
+        };
+        (descriptor, IpcSharedMemory::from_bytes(&data))
+    }
+
+    pub fn to_shared(&self) -> Arc<SharedRasterImage> {
+        Arc::new(SharedRasterImage {
+            metadata: self.metadata,
+            format: self.format,
+            id: self.id,
+            cors_status: self.cors_status,
+            bytes: Arc::new(IpcSharedMemory::from_bytes(&self.bytes)),
+            frames: self.frames.clone(),
+            is_opaque: self.is_opaque,
+        })
     }
 }
 
@@ -582,7 +701,12 @@ fn decode_static_image(
         return None;
     };
     let mut rgba = dynamic_image.into_rgba8();
-    rgba8_byte_swap_colors_inplace(&mut rgba);
+
+    // Store pre-multiplied data as that prevents having to do conversions of the data at later
+    // times. This does cause an issue with some canvas APIs. See:
+    // https://github.com/servo/servo/issues/40257
+    let is_opaque = rgba8_premultiply_inplace(&mut rgba);
+
     let frame = ImageFrame {
         delay: None,
         byte_range: 0..rgba.len(),
@@ -594,11 +718,12 @@ fn decode_static_image(
             width: rgba.width(),
             height: rgba.height(),
         },
-        format: PixelFormat::BGRA8,
+        format: PixelFormat::RGBA8,
         frames: vec![frame],
-        bytes: IpcSharedMemory::from_bytes(&rgba),
+        bytes: Arc::new(rgba.to_vec()),
         id: None,
         cors_status,
+        is_opaque,
     })
 }
 
@@ -617,6 +742,7 @@ where
     // <https://github.com/image-rs/image/issues/2442>.
     let mut frame_data = vec![];
     let mut total_number_of_bytes = 0;
+    let mut is_opaque = true;
     let frames: Vec<ImageFrame> = animated_image_decoder
         .into_frames()
         .map_while(|decoded_frame| {
@@ -627,7 +753,12 @@ where
                     return None;
                 },
             };
-            rgba8_byte_swap_colors_inplace(animated_frame.buffer_mut());
+
+            // Store pre-multiplied data as that prevents having to do conversions of the data at later
+            // times. This does cause an issue with some canvas APIs. See:
+            // https://github.com/servo/servo/issues/40257
+            is_opaque = rgba8_premultiply_inplace(animated_frame.buffer_mut()) && is_opaque;
+
             let frame_start = total_number_of_bytes;
             total_number_of_bytes += animated_frame.buffer().len();
 
@@ -666,8 +797,9 @@ where
         cors_status,
         frames,
         id: None,
-        format: PixelFormat::BGRA8,
-        bytes: IpcSharedMemory::from_bytes(&bytes),
+        format: PixelFormat::RGBA8,
+        bytes: Arc::new(bytes),
+        is_opaque,
     })
 }
 

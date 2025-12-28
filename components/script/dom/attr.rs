@@ -11,7 +11,6 @@ use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, Prefix, local_name, ns};
 use style::attr::{AttrIdentifier, AttrValue};
 use style::values::GenericAtomIdent;
-use stylo_atoms::Atom;
 
 use crate::dom::bindings::cell::{DomRefCell, Ref};
 use crate::dom::bindings::codegen::Bindings::AttrBinding::AttrMethods;
@@ -60,7 +59,7 @@ impl Attr {
             owner: MutNullableDom::new(owner),
         }
     }
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub(crate) fn new(
         document: &Document,
         local_name: LocalName,
@@ -97,13 +96,13 @@ impl Attr {
 }
 
 impl AttrMethods<crate::DomTypeHolder> for Attr {
-    // https://dom.spec.whatwg.org/#dom-attr-localname
+    /// <https://dom.spec.whatwg.org/#dom-attr-localname>
     fn LocalName(&self) -> DOMString {
         // FIXME(ajeffrey): convert directly from LocalName to DOMString
         DOMString::from(&**self.local_name())
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-value
+    /// <https://dom.spec.whatwg.org/#dom-attr-value>
     fn Value(&self) -> DOMString {
         // FIXME(ajeffrey): convert directly from AttrValue to DOMString
         DOMString::from(&**self.value())
@@ -113,11 +112,10 @@ impl AttrMethods<crate::DomTypeHolder> for Attr {
     fn SetValue(&self, value: DOMString, can_gc: CanGc) -> Fallible<()> {
         // Step 2. Otherwise:
         if let Some(owner) = self.owner() {
-            // Step 2.1. Let originalElement be attribute’s element.
-            let original_element = owner.clone();
+            // Step 2.1. Let element be attribute’s element.
             // Step 2.2. Let verifiedValue be the result of calling
-            // get Trusted Types-compliant attribute value with attribute’s local name,
-            // attribute’s namespace, this, and value. [TRUSTED-TYPES]
+            // get trusted type compliant attribute value with attribute’s local name,
+            // attribute’s namespace, element, and value. [TRUSTED-TYPES]
             let value = TrustedTypePolicyFactory::get_trusted_types_compliant_attribute_value(
                 owner.namespace(),
                 owner.local_name(),
@@ -128,11 +126,7 @@ impl AttrMethods<crate::DomTypeHolder> for Attr {
                 can_gc,
             )?;
             if let Some(owner) = self.owner() {
-                // Step 2.4. If attribute’s element is not originalElement, then return.
-                if owner != original_element {
-                    return Ok(());
-                }
-                // Step 2.5. Change attribute to verifiedValue.
+                // Step 2.4. Change attribute to verifiedValue.
                 let value = owner.parse_attribute(self.namespace(), self.local_name(), value);
                 owner.change_attribute(self, value, can_gc);
             } else {
@@ -146,13 +140,13 @@ impl AttrMethods<crate::DomTypeHolder> for Attr {
         Ok(())
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-name
+    /// <https://dom.spec.whatwg.org/#dom-attr-name>
     fn Name(&self) -> DOMString {
         // FIXME(ajeffrey): convert directly from LocalName to DOMString
         DOMString::from(&**self.name())
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-namespaceuri
+    /// <https://dom.spec.whatwg.org/#dom-attr-namespaceuri>
     fn GetNamespaceURI(&self) -> Option<DOMString> {
         match *self.namespace() {
             ns!() => None,
@@ -160,18 +154,18 @@ impl AttrMethods<crate::DomTypeHolder> for Attr {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-prefix
+    /// <https://dom.spec.whatwg.org/#dom-attr-prefix>
     fn GetPrefix(&self) -> Option<DOMString> {
         // FIXME(ajeffrey): convert directly from LocalName to DOMString
         self.prefix().map(|p| DOMString::from(&**p))
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-ownerelement
+    /// <https://dom.spec.whatwg.org/#dom-attr-ownerelement>
     fn GetOwnerElement(&self) -> Option<DomRoot<Element>> {
         self.owner()
     }
 
-    // https://dom.spec.whatwg.org/#dom-attr-specified
+    /// <https://dom.spec.whatwg.org/#dom-attr-specified>
     fn Specified(&self) -> bool {
         true // Always returns true
     }
@@ -225,8 +219,8 @@ impl Attr {
     pub(crate) fn summarize(&self) -> AttrInfo {
         AttrInfo {
             namespace: (**self.namespace()).to_owned(),
-            name: String::from(self.Name()),
-            value: String::from(self.Value()),
+            name: (**self.name()).to_owned(),
+            value: (**self.value()).to_owned(),
         }
     }
 
@@ -238,33 +232,17 @@ impl Attr {
     }
 }
 
-#[allow(unsafe_code)]
 pub(crate) trait AttrHelpersForLayout<'dom> {
     fn value(self) -> &'dom AttrValue;
-    fn as_str(&self) -> &'dom str;
-    fn to_tokens(self) -> Option<&'dom [Atom]>;
     fn local_name(self) -> &'dom LocalName;
     fn namespace(self) -> &'dom Namespace;
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 impl<'dom> AttrHelpersForLayout<'dom> for LayoutDom<'dom, Attr> {
     #[inline]
     fn value(self) -> &'dom AttrValue {
         unsafe { self.unsafe_get().value.borrow_for_layout() }
-    }
-
-    #[inline]
-    fn as_str(&self) -> &'dom str {
-        self.value()
-    }
-
-    #[inline]
-    fn to_tokens(self) -> Option<&'dom [Atom]> {
-        match *self.value() {
-            AttrValue::TokenList(_, ref tokens) => Some(tokens),
-            _ => None,
-        }
     }
 
     #[inline]

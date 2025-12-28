@@ -6,8 +6,8 @@ use std::time::SystemTime;
 
 use constellation_traits::BlobImpl;
 use dom_struct::dom_struct;
+use embedder_traits::SelectedFile;
 use js::rust::HandleObject;
-use net_traits::filemanager_thread::SelectedFile;
 use time::{Duration, OffsetDateTime};
 
 use crate::dom::bindings::codegen::Bindings::FileBinding;
@@ -116,7 +116,7 @@ impl File {
 
 impl FileMethods<crate::DomTypeHolder> for File {
     // https://w3c.github.io/FileAPI/#file-constructor
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -127,7 +127,7 @@ impl FileMethods<crate::DomTypeHolder> for File {
     ) -> Fallible<DomRoot<File>> {
         let bytes: Vec<u8> = match blob_parts_to_bytes(fileBits) {
             Ok(bytes) => bytes,
-            Err(_) => return Err(Error::InvalidCharacter),
+            Err(_) => return Err(Error::InvalidCharacter(None)),
         };
 
         let blobPropertyBag = &filePropertyBag.parent;
@@ -136,7 +136,7 @@ impl FileMethods<crate::DomTypeHolder> for File {
             .map(|modified| OffsetDateTime::UNIX_EPOCH + Duration::milliseconds(modified))
             .map(Into::into);
 
-        let type_string = normalize_type_string(blobPropertyBag.type_.as_ref());
+        let type_string = normalize_type_string(&blobPropertyBag.type_.str());
         Ok(File::new_with_proto(
             global,
             proto,
@@ -147,12 +147,12 @@ impl FileMethods<crate::DomTypeHolder> for File {
         ))
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-name
+    /// <https://w3c.github.io/FileAPI/#dfn-name>
     fn Name(&self) -> DOMString {
         self.name.clone()
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-lastModified
+    /// <https://w3c.github.io/FileAPI/#dfn-lastModified>
     fn LastModified(&self) -> i64 {
         // This is first converted to a `time::OffsetDateTime` because it might be from before the
         // Unix epoch in which case we will need to return a negative duration to script.

@@ -49,10 +49,9 @@ use crate::dom::create::create_native_html_element;
 use crate::dom::customelementregistry::{ConstructionStackEntry, CustomElementState};
 use crate::dom::element::{Element, ElementCreator};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlelement::HTMLElement;
+use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::window::Window;
 use crate::script_runtime::{CanGc, JSContext, JSContext as SafeJSContext};
-use crate::script_thread::ScriptThread;
 
 /// <https://html.spec.whatwg.org/multipage/#htmlconstructor>
 fn html_constructor(
@@ -118,7 +117,7 @@ fn html_constructor(
 
     rooted!(in(*cx) let callee = unsafe { UnwrapObjectStatic(call_args.callee()) });
     if callee.is_null() {
-        throw_dom_exception(cx, global, Error::Security, can_gc);
+        throw_dom_exception(cx, global, Error::Security(None), can_gc);
         return Err(());
     }
 
@@ -200,7 +199,7 @@ fn html_constructor(
             }
 
             if !check_type(&element) {
-                throw_dom_exception(cx, global, Error::InvalidState, can_gc);
+                throw_dom_exception(cx, global, Error::InvalidState(None), can_gc);
                 return Err(());
             } else {
                 // Step 7.9 Return element.
@@ -218,7 +217,7 @@ fn html_constructor(
 
             // Step 13
             if !check_type(&element) {
-                throw_dom_exception(cx, global, Error::InvalidState, can_gc);
+                throw_dom_exception(cx, global, Error::InvalidState(None), can_gc);
                 return Err(());
             } else {
                 element
@@ -242,7 +241,7 @@ fn html_constructor(
 
         JS_SetPrototype(*cx, element.handle(), prototype.handle());
 
-        result.safe_to_jsval(cx, MutableHandleValue::from_raw(call_args.rval()));
+        result.safe_to_jsval(cx, MutableHandleValue::from_raw(call_args.rval()), can_gc);
     }
     Ok(())
 }
@@ -389,14 +388,6 @@ fn get_constructor_object_from_local_name(
     };
     constructor_fn(cx, global, rval);
     true
-}
-
-pub(crate) fn pop_current_element_queue(can_gc: CanGc) {
-    ScriptThread::pop_current_element_queue(can_gc);
-}
-
-pub(crate) fn push_new_element_queue() {
-    ScriptThread::push_new_element_queue();
 }
 
 pub(crate) fn call_html_constructor<T: DerivedFrom<Element> + DomObject>(

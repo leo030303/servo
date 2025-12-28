@@ -17,7 +17,7 @@ use crate::dom::bindings::codegen::Bindings::MediaElementAudioSourceNodeBinding:
 use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::reflector::reflect_dom_object_with_proto;
 use crate::dom::bindings::root::{Dom, DomRoot};
-use crate::dom::htmlmediaelement::HTMLMediaElement;
+use crate::dom::html::htmlmediaelement::HTMLMediaElement;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
@@ -45,8 +45,8 @@ impl MediaElementAudioSourceNode {
         node.message(AudioNodeMessage::MediaElementSourceNode(
             MediaElementSourceNodeMessage::GetAudioRenderer(sender),
         ));
-        let audio_renderer = receiver.recv().unwrap();
-        media_element.set_audio_renderer(audio_renderer, can_gc);
+        let audio_renderer = receiver.recv();
+        media_element.set_audio_renderer(audio_renderer.ok(), can_gc);
         let media_element = Dom::from_ref(media_element);
         Ok(MediaElementAudioSourceNode {
             node,

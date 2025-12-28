@@ -4,9 +4,8 @@
 
 use std::sync::Arc;
 
-use base::id::PipelineId;
-use compositing_traits::CrossProcessCompositorApi;
-use ipc_channel::ipc::IpcSender;
+use base::id::{PipelineId, WebViewId};
+use compositing_traits::CrossProcessPaintApi;
 use log::debug;
 use malloc_size_of::MallocSizeOfOps;
 use malloc_size_of_derive::MallocSizeOf;
@@ -29,7 +28,7 @@ pub type VectorImageId = PendingImageId;
 // Represents either a raster image for which the pixel data is available
 // or a vector image for which only the natural dimensions are available
 // and thus requires a further rasterization step to render.
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub enum Image {
     Raster(#[conditional_malloc_size_of] Arc<RasterImage>),
     Vector(VectorImage),
@@ -66,75 +65,67 @@ impl Image {
 }
 
 /// Indicating either entire image or just metadata availability
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub enum ImageOrMetadataAvailable {
-    ImageAvailable {
-        image: Image,
-        url: ServoUrl,
-        is_placeholder: bool,
-    },
+    ImageAvailable { image: Image, url: ServoUrl },
     MetadataAvailable(ImageMetadata, PendingImageId),
 }
+
+pub type ImageCacheResponseCallback = Box<dyn Fn(ImageCacheResponseMessage) + Send + 'static>;
 
 /// This is optionally passed to the image cache when requesting
 /// and image, and returned to the specified event loop when the
 /// image load completes. It is typically used to trigger a reflow
 /// and/or repaint.
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(MallocSizeOf)]
 pub struct ImageLoadListener {
     pipeline_id: PipelineId,
     pub id: PendingImageId,
-    sender: IpcSender<ImageCacheResponseMessage>,
+    #[ignore_malloc_size_of = "Difficult to measure FnOnce"]
+    callback: ImageCacheResponseCallback,
 }
 
 impl ImageLoadListener {
     pub fn new(
-        sender: IpcSender<ImageCacheResponseMessage>,
+        callback: ImageCacheResponseCallback,
         pipeline_id: PipelineId,
         id: PendingImageId,
     ) -> ImageLoadListener {
         ImageLoadListener {
             pipeline_id,
-            sender,
+            callback,
             id,
         }
     }
 
     pub fn respond(&self, response: ImageResponse) {
         debug!("Notifying listener");
-        // This send can fail if thread waiting for this notification has panicked.
-        // That's not a case that's worth warning about.
-        // TODO(#15501): are there cases in which we should perform cleanup?
-        let _ = self
-            .sender
-            .send(ImageCacheResponseMessage::NotifyPendingImageLoadStatus(
-                PendingImageResponse {
-                    pipeline_id: self.pipeline_id,
-                    response,
-                    id: self.id,
-                },
-            ));
+        (self.callback)(ImageCacheResponseMessage::NotifyPendingImageLoadStatus(
+            PendingImageResponse {
+                pipeline_id: self.pipeline_id,
+                response,
+                id: self.id,
+            },
+        ));
     }
 }
 
 /// The returned image.
-#[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
+#[derive(Clone, Debug, MallocSizeOf)]
 pub enum ImageResponse {
     /// The requested image was loaded.
     Loaded(Image, ServoUrl),
     /// The request image metadata was loaded.
     MetadataLoaded(ImageMetadata),
-    /// The requested image failed to load, so a placeholder was loaded instead.
-    PlaceholderLoaded(#[conditional_malloc_size_of] Arc<RasterImage>, ServoUrl),
-    /// Neither the requested image nor the placeholder could be loaded.
-    None,
+    /// The requested image failed to load or decode.
+    FailedToLoadOrDecode,
 }
 
 /// The unique id for an image that has previously been requested.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, MallocSizeOf, PartialEq, Serialize)]
 pub struct PendingImageId(pub u64);
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 pub struct PendingImageResponse {
     pub pipeline_id: PipelineId,
     pub response: ImageResponse,
@@ -148,16 +139,10 @@ pub struct RasterizationCompleteResponse {
     pub requested_size: DeviceIntSize,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug)]
 pub enum ImageCacheResponseMessage {
     NotifyPendingImageLoadStatus(PendingImageResponse),
     VectorImageRasterizationComplete(RasterizationCompleteResponse),
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub enum UsePlaceholder {
-    No,
-    Yes,
 }
 
 // ======================================================================
@@ -166,17 +151,32 @@ pub enum UsePlaceholder {
 
 pub enum ImageCacheResult {
     Available(ImageOrMetadataAvailable),
-    LoadError,
+    FailedToLoadOrDecode,
     Pending(PendingImageId),
     ReadyForRequest(PendingImageId),
 }
 
-pub trait ImageCache: Sync + Send {
-    fn new(compositor_api: CrossProcessCompositorApi, rippy_data: Vec<u8>) -> Self
-    where
-        Self: Sized;
+/// A shared [`ImageCacheFactory`] is a per-process data structure used to create an [`ImageCache`]
+/// inside that process in any `ScriptThread`. This allows sharing the same font database (for
+/// SVGs) and also decoding thread pool among all [`ImageCache`]s in the same process.
+pub trait ImageCacheFactory: Sync + Send {
+    fn create(
+        &self,
+        webview_id: WebViewId,
+        pipeline_id: PipelineId,
+        paint_api: &CrossProcessPaintApi,
+    ) -> Arc<dyn ImageCache>;
+}
 
-    fn memory_report(&self, prefix: &str, ops: &mut MallocSizeOfOps) -> Report;
+/// An [`ImageCache`] manages fetching and decoding images for a single `Pipeline` for its
+/// `Document` and all of its associated `Worker`s.
+pub trait ImageCache: Sync + Send {
+    fn memory_reports(&self, prefix: &str, ops: &mut MallocSizeOfOps) -> Vec<Report>;
+
+    /// Get an [`ImageKey`] to be used for external WebRender image management for
+    /// things like canvas rendering. Returns `None` when an [`ImageKey`] cannot
+    /// be generated properly.
+    fn get_image_key(&self) -> Option<ImageKey>;
 
     /// Definitively check whether there is a cached, fully loaded image available.
     fn get_image(
@@ -191,7 +191,6 @@ pub trait ImageCache: Sync + Send {
         url: ServoUrl,
         origin: ImmutableOrigin,
         cors_setting: Option<CorsSettings>,
-        use_placeholder: UsePlaceholder,
     ) -> ImageCacheResult;
 
     /// Returns `Some` if the given `image_id` has already been rasterized at the given `size`.
@@ -213,8 +212,12 @@ pub trait ImageCache: Sync + Send {
         pipeline_id: PipelineId,
         image_id: VectorImageId,
         size: DeviceIntSize,
-        sender: IpcSender<ImageCacheResponseMessage>,
+        callback: ImageCacheResponseCallback,
     );
+
+    /// Synchronously get the broken image icon for this [`ImageCache`]. This will
+    /// allocate space for this icon and upload it to WebRender.
+    fn get_broken_image_icon(&self) -> Option<Arc<RasterImage>>;
 
     /// Add a new listener for the given pending image id. If the image is already present,
     /// the responder will still receive the expected response.
@@ -222,13 +225,6 @@ pub trait ImageCache: Sync + Send {
 
     /// Inform the image cache about a response for a pending request.
     fn notify_pending_response(&self, id: PendingImageId, action: FetchResponseMsg);
-
-    /// Create new image cache based on this one, while reusing the existing thread_pool.
-    fn create_new_image_cache(
-        &self,
-        pipeline_id: Option<PipelineId>,
-        compositor_api: CrossProcessCompositorApi,
-    ) -> Arc<dyn ImageCache>;
 
     /// Fills the image cache with a batch of keys.
     fn fill_key_cache_with_batch_of_keys(&self, image_keys: Vec<ImageKey>);

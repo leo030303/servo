@@ -2,12 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
-
 use base::id::{DomQuadId, DomQuadIndex};
 use constellation_traits::{DomPoint, DomQuad};
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use rustc_hash::FxHashMap;
 
 use crate::dom::bindings::codegen::Bindings::DOMPointBinding::{DOMPointInit, DOMPointMethods};
 use crate::dom::bindings::codegen::Bindings::DOMQuadBinding::{DOMQuadInit, DOMQuadMethods};
@@ -73,7 +72,7 @@ impl DOMQuad {
 }
 
 impl DOMQuadMethods<crate::DomTypeHolder> for DOMQuad {
-    // https://drafts.fxtf.org/geometry/#dom-domquad-domquad
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-domquad>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -94,7 +93,7 @@ impl DOMQuadMethods<crate::DomTypeHolder> for DOMQuad {
         ))
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domquad-fromrect
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-fromrect>
     fn FromRect(global: &GlobalScope, other: &DOMRectInit, can_gc: CanGc) -> DomRoot<DOMQuad> {
         DOMQuad::new(
             global,
@@ -113,7 +112,7 @@ impl DOMQuadMethods<crate::DomTypeHolder> for DOMQuad {
         )
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domquad-fromquad
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-fromquad>
     fn FromQuad(global: &GlobalScope, other: &DOMQuadInit, can_gc: CanGc) -> DomRoot<DOMQuad> {
         DOMQuad::new(
             global,
@@ -125,27 +124,27 @@ impl DOMQuadMethods<crate::DomTypeHolder> for DOMQuad {
         )
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domquad-p1
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-p1>
     fn P1(&self) -> DomRoot<DOMPoint> {
         DomRoot::from_ref(&self.p1)
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domquad-p2
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-p2>
     fn P2(&self) -> DomRoot<DOMPoint> {
         DomRoot::from_ref(&self.p2)
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domquad-p3
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-p3>
     fn P3(&self) -> DomRoot<DOMPoint> {
         DomRoot::from_ref(&self.p3)
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domquad-p4
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-p4>
     fn P4(&self) -> DomRoot<DOMPoint> {
         DomRoot::from_ref(&self.p4)
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-domquad-getbounds
+    /// <https://drafts.fxtf.org/geometry/#dom-domquad-getbounds>
     fn GetBounds(&self, can_gc: CanGc) -> DomRoot<DOMRect> {
         // https://drafts.fxtf.org/geometry/#nan-safe-minimum
         let nan_safe_minimum = |a: f64, b: f64| {
@@ -255,7 +254,7 @@ impl Serializable for DOMQuad {
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<DomQuadId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<DomQuadId, Self::Data>> {
         match data {
             StructuredData::Reader(reader) => &mut reader.quads,
             StructuredData::Writer(writer) => &mut writer.quads,

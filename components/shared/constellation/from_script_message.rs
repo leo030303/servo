@@ -4,59 +4,67 @@
 
 //! Messages send from the ScriptThread to the Constellation.
 
-use std::collections::HashMap;
 use std::fmt;
 
 use base::Epoch;
+use base::generic_channel::{GenericCallback, GenericReceiver, GenericSender, SendResult};
 use base::id::{
     BroadcastChannelRouterId, BrowsingContextId, HistoryStateId, MessagePortId,
-    MessagePortRouterId, PipelineId, ServiceWorkerId, ServiceWorkerRegistrationId, WebViewId,
+    MessagePortRouterId, PipelineId, ScriptEventLoopId, ServiceWorkerId,
+    ServiceWorkerRegistrationId, WebViewId,
 };
 use canvas_traits::canvas::{CanvasId, CanvasMsg};
-use compositing_traits::CrossProcessCompositorApi;
+use compositing_traits::CrossProcessPaintApi;
+use content_security_policy::sandboxing_directive::SandboxingFlagSet;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, WorkerId};
+use embedder_traits::user_contents::UserContentManagerId;
 use embedder_traits::{
-    AnimationState, EmbedderMsg, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
-    JavaScriptEvaluationId, MediaSessionEvent, Theme, TouchEventResult, ViewportDetails,
-    WebDriverMessageId,
+    AnimationState, FocusSequenceNumber, JSValue, JavaScriptEvaluationError,
+    JavaScriptEvaluationId, MediaSessionEvent, ScriptToEmbedderChan, Theme, ViewportDetails,
 };
+use encoding_rs::Encoding;
 use euclid::default::Size2D as UntypedSize2D;
 use fonts_traits::SystemFontServiceProxySender;
 use http::{HeaderMap, Method};
-use ipc_channel::Error as IpcError;
-use ipc_channel::ipc::{IpcReceiver, IpcSender};
+use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
 use net_traits::policy_container::PolicyContainer;
 use net_traits::request::{Destination, InsecureRequestsPolicy, Referrer, RequestBody};
-use net_traits::storage_thread::StorageType;
 use net_traits::{ReferrerPolicy, ResourceThreads};
 use profile_traits::mem::MemoryReportResult;
 use profile_traits::{mem, time as profile_time};
+use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use servo_url::{ImmutableOrigin, ServoUrl};
-use strum_macros::IntoStaticStr;
+use storage_traits::StorageThreads;
+use storage_traits::webstorage_thread::WebStorageType;
+use strum::IntoStaticStr;
 #[cfg(feature = "webgpu")]
 use webgpu_traits::{WebGPU, WebGPUAdapterResponse};
-use webrender_api::ImageKey;
 
 use crate::structured_data::{BroadcastChannelMsg, StructuredSerializedData};
 use crate::{
     LogEntry, MessagePortMsg, PortMessageTask, PortTransferInfo, TraversalDirection, WindowSizeType,
 };
 
+pub type ScriptToConstellationSender =
+    GenericSender<(WebViewId, PipelineId, ScriptToConstellationMessage)>;
+
 /// A Script to Constellation channel.
 #[derive(Clone, Debug, Deserialize, MallocSizeOf, Serialize)]
 pub struct ScriptToConstellationChan {
     /// Sender for communicating with constellation thread.
-    pub sender: IpcSender<(PipelineId, ScriptToConstellationMessage)>,
-    /// Used to identify the origin of the message.
+    pub sender: ScriptToConstellationSender,
+    /// Used to identify the origin `WebView` of the message.
+    pub webview_id: WebViewId,
+    /// Used to identify the origin `Pipeline` of the message.
     pub pipeline_id: PipelineId,
 }
 
 impl ScriptToConstellationChan {
     /// Send ScriptMsg and attach the pipeline_id to the message.
-    pub fn send(&self, msg: ScriptToConstellationMessage) -> Result<(), IpcError> {
-        self.sender.send((self.pipeline_id, msg))
+    pub fn send(&self, msg: ScriptToConstellationMessage) -> SendResult {
+        self.sender.send((self.webview_id, self.pipeline_id, msg))
     }
 }
 
@@ -117,6 +125,12 @@ pub struct LoadData {
     pub crash: Option<String>,
     /// Destination, used for CSP checks
     pub destination: Destination,
+    /// The "creation sandboxing flag set" that this Pipeline should use when it is created.
+    /// See <https://html.spec.whatwg.org/multipage/#determining-the-creation-sandboxing-flags>.
+    pub creation_sandboxing_flag_set: SandboxingFlagSet,
+    /// If this is a load operation for an `<iframe>` whose origin is same-origin with its
+    /// container documents origin then this is the encoding of the container document.
+    pub container_document_encoding: Option<&'static Encoding>,
 }
 
 /// The result of evaluating a javascript scheme url.
@@ -141,8 +155,9 @@ impl LoadData {
         inherited_secure_context: Option<bool>,
         inherited_insecure_requests_policy: Option<InsecureRequestsPolicy>,
         has_trustworthy_ancestor_origin: bool,
-    ) -> LoadData {
-        LoadData {
+        creation_sandboxing_flag_set: SandboxingFlagSet,
+    ) -> Self {
+        Self {
             load_origin,
             url,
             creator_pipeline_id,
@@ -159,7 +174,25 @@ impl LoadData {
             inherited_insecure_requests_policy,
             has_trustworthy_ancestor_origin,
             destination: Destination::Document,
+            creation_sandboxing_flag_set,
+            container_document_encoding: None,
         }
+    }
+
+    /// Create a new [`LoadData`] for a completely new top-level `WebView` that isn't created
+    /// via APIs like `window.open`. This is for `WebView`s completely unrelated to others.
+    pub fn new_for_new_unrelated_webview(url: ServoUrl) -> Self {
+        Self::new(
+            LoadOrigin::Constellation,
+            url,
+            None,
+            Referrer::NoReferrer,
+            ReferrerPolicy::EmptyString,
+            None,
+            None,
+            false,
+            SandboxingFlagSet::empty(),
+        )
     }
 }
 
@@ -188,7 +221,7 @@ pub struct ScopeThings {
     /// base resources required to create worker global scopes
     pub init: WorkerGlobalScopeInit,
     /// the port to receive devtools message from
-    pub devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
+    pub devtools_chan: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// service worker id
     pub worker_id: WorkerId,
 }
@@ -206,22 +239,21 @@ pub struct DOMMessage {
 #[derive(Deserialize, Serialize)]
 pub struct SWManagerSenders {
     /// Sender of messages to the constellation.
-    pub swmanager_sender: IpcSender<SWManagerMsg>,
+    pub swmanager_sender: GenericSender<SWManagerMsg>,
     /// [`ResourceThreads`] for initating fetches or using i/o.
     pub resource_threads: ResourceThreads,
-    /// [`CrossProcessCompositorApi`] for communicating with the compositor.
-    pub compositor_api: CrossProcessCompositorApi,
+    /// [`CrossProcessPaintApi`] for communicating with `Paint`.
+    pub paint_api: CrossProcessPaintApi,
     /// The [`SystemFontServiceProxy`] used to communicate with the `SystemFontService`.
     pub system_font_service_sender: SystemFontServiceProxySender,
     /// Sender of messages to the manager.
-    pub own_sender: IpcSender<ServiceWorkerMsg>,
+    pub own_sender: GenericSender<ServiceWorkerMsg>,
     /// Receiver of messages from the constellation.
-    pub receiver: IpcReceiver<ServiceWorkerMsg>,
+    pub receiver: GenericReceiver<ServiceWorkerMsg>,
 }
 
 /// Messages sent to Service Worker Manager thread
 #[derive(Debug, Deserialize, Serialize)]
-#[allow(clippy::large_enum_variant)]
 pub enum ServiceWorkerMsg {
     /// Timeout message sent by active service workers
     Timeout(ServoUrl),
@@ -254,7 +286,7 @@ pub enum JobError {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 /// Messages sent from Job algorithms steps running in the SW manager,
 /// in order to resolve or reject the job promise.
 pub enum JobResult {
@@ -290,7 +322,7 @@ pub struct Job {
     /// <https://w3c.github.io/ServiceWorker/#dfn-job-script-url>
     pub script_url: ServoUrl,
     /// <https://w3c.github.io/ServiceWorker/#dfn-job-client>
-    pub client: IpcSender<JobResult>,
+    pub client: GenericCallback<JobResult>,
     /// <https://w3c.github.io/ServiceWorker/#job-referrer>
     pub referrer: ServoUrl,
     /// Various data needed to process job.
@@ -303,7 +335,7 @@ impl Job {
         job_type: JobType,
         scope_url: ServoUrl,
         script_url: ServoUrl,
-        client: IpcSender<JobResult>,
+        client: GenericCallback<JobResult>,
         referrer: ServoUrl,
         scope_things: Option<ScopeThings>,
     ) -> Job {
@@ -361,15 +393,6 @@ pub trait ServiceWorkerManagerFactory {
     fn create(sw_senders: SWManagerSenders, origin: ImmutableOrigin);
 }
 
-/// Whether the sandbox attribute is present for an iframe element
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub enum IFrameSandboxState {
-    /// Sandbox attribute is present
-    IFrameSandboxed,
-    /// Sandbox attribute is not present
-    IFrameUnsandboxed,
-}
-
 /// Specifies the information required to load an auxiliary browsing context.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AuxiliaryWebViewCreationRequest {
@@ -390,6 +413,8 @@ pub struct AuxiliaryWebViewCreationResponse {
     pub new_webview_id: WebViewId,
     /// The new pipeline ID.
     pub new_pipeline_id: PipelineId,
+    /// The [`UserContentManagerId`] for this new auxiliary browsing context.
+    pub user_content_manager_id: Option<UserContentManagerId>,
 }
 
 /// Specifies the information required to load an iframe.
@@ -421,8 +446,6 @@ pub struct IFrameLoadInfoWithData {
     pub load_data: LoadData,
     /// The old pipeline ID for this iframe, if a page was previously loaded.
     pub old_pipeline_id: Option<PipelineId>,
-    /// Sandbox type of this iframe
-    pub sandbox: IFrameSandboxState,
     /// The initial viewport size for this iframe.
     pub viewport_details: ViewportDetails,
     /// The [`Theme`] to use within this iframe.
@@ -434,16 +457,20 @@ pub struct IFrameLoadInfoWithData {
 pub struct WorkerGlobalScopeInit {
     /// Chan to a resource thread
     pub resource_threads: ResourceThreads,
+    /// Chan to a storage thread
+    pub storage_threads: StorageThreads,
     /// Chan to the memory profiler
     pub mem_profiler_chan: mem::ProfilerChan,
     /// Chan to the time profiler
     pub time_profiler_chan: profile_time::ProfilerChan,
     /// To devtools sender
-    pub to_devtools_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
+    pub to_devtools_sender: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// From devtools sender
-    pub from_devtools_sender: Option<IpcSender<DevtoolScriptControlMsg>>,
+    pub from_devtools_sender: Option<GenericSender<DevtoolScriptControlMsg>>,
     /// Messages to send to constellation
     pub script_to_constellation_chan: ScriptToConstellationChan,
+    /// Messages to send to the Embedder
+    pub script_to_embedder_chan: ScriptToEmbedderChan,
     /// The worker id
     pub worker_id: WorkerId,
     /// The pipeline id
@@ -454,6 +481,8 @@ pub struct WorkerGlobalScopeInit {
     pub creation_url: ServoUrl,
     /// True if secure context
     pub inherited_secure_context: Option<bool>,
+    /// Unminify Javascript.
+    pub unminify_js: bool,
 }
 
 /// Common entities representing a network load origin
@@ -478,6 +507,37 @@ pub struct IFrameSizeMsg {
     pub type_: WindowSizeType,
 }
 
+/// An enum that describe a type of keyboard scroll.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub enum KeyboardScroll {
+    /// Scroll the container one line up.
+    Up,
+    /// Scroll the container one line down.
+    Down,
+    /// Scroll the container one "line" left.
+    Left,
+    /// Scroll the container one "line" right.
+    Right,
+    /// Scroll the container one page up.
+    PageUp,
+    /// Scroll the container one page down.
+    PageDown,
+    /// Scroll the container to the vertical start.
+    Home,
+    /// Scroll the container to the vertical end.
+    End,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ScreenshotReadinessResponse {
+    /// The Pipeline associated with this response, is ready for a screenshot at the
+    /// provided [`Epoch`].
+    Ready(Epoch),
+    /// The Pipeline associated with this response is no longer active and should be
+    /// ignored for the purposes of the screenshot.
+    NoLongerActive,
+}
+
 /// Messages from the script to the constellation.
 #[derive(Deserialize, IntoStaticStr, Serialize)]
 pub enum ScriptToConstellationMessage {
@@ -490,7 +550,7 @@ pub enum ScriptToConstellationMessage {
         /* The ids of ports transferred successfully */
         Vec<MessagePortId>,
         /* The ids, and buffers, of ports whose transfer failed */
-        HashMap<MessagePortId, PortTransferInfo>,
+        FxHashMap<MessagePortId, PortTransferInfo>,
     ),
     /// A new message-port was created or transferred, with corresponding control-sender.
     NewMessagePort(MessagePortRouterId, MessagePortId),
@@ -525,12 +585,10 @@ pub enum ScriptToConstellationMessage {
     /// Broadcast a message to all same-origin broadcast channels,
     /// excluding the source of the broadcast.
     ScheduleBroadcast(BroadcastChannelRouterId, BroadcastChannelMsg),
-    /// Forward a message to the embedder.
-    ForwardToEmbedder(EmbedderMsg),
     /// Broadcast a storage event to every same-origin pipeline.
     /// The strings are key, old value and new value.
     BroadcastStorageEvent(
-        StorageType,
+        WebStorageType,
         ServoUrl,
         Option<String>,
         Option<String>,
@@ -542,7 +600,7 @@ pub enum ScriptToConstellationMessage {
     /// 2D canvases may use the GPU and we don't want to give untrusted content access to the GPU.)
     CreateCanvasPaintThread(
         UntypedSize2D<u64>,
-        IpcSender<Option<(IpcSender<CanvasMsg>, CanvasId, ImageKey)>>,
+        IpcSender<Option<(GenericSender<CanvasMsg>, CanvasId)>>,
     ),
     /// Notifies the constellation that this pipeline is requesting focus.
     ///
@@ -620,14 +678,10 @@ pub enum ScriptToConstellationMessage {
     ActivateDocument,
     /// Set the document state for a pipeline (used by screenshot / reftests)
     SetDocumentState(DocumentState),
-    /// Update the layout epoch in the constellation (used by screenshot / reftests).
-    SetLayoutEpoch(Epoch, IpcSender<bool>),
     /// Update the pipeline Url, which can change after redirections.
     SetFinalUrl(ServoUrl),
-    /// Script has handled a touch event, and either prevented or allowed default actions.
-    TouchEventProcessed(TouchEventResult),
     /// A log entry, with the top-level browsing context id and thread name
-    LogEntry(Option<String>, LogEntry),
+    LogEntry(Option<ScriptEventLoopId>, Option<String>, LogEntry),
     /// Discard the document.
     DiscardDocument,
     /// Discard the browsing context.
@@ -663,8 +717,10 @@ pub enum ScriptToConstellationMessage {
         JavaScriptEvaluationId,
         Result<JSValue, JavaScriptEvaluationError>,
     ),
-    /// Notify the completion of a webdriver command.
-    WebDriverInputComplete(WebDriverMessageId),
+    /// Forward a keyboard scroll operation from an `<iframe>` to a parent pipeline.
+    ForwardKeyboardScroll(PipelineId, KeyboardScroll),
+    /// Notify the Constellation of the screenshot readiness of a given pipeline.
+    RespondToScreenshotReadinessRequest(ScreenshotReadinessResponse),
 }
 
 impl fmt::Debug for ScriptToConstellationMessage {

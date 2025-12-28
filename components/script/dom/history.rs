@@ -5,6 +5,7 @@
 use std::cell::Cell;
 use std::cmp::Ordering;
 
+use base::IpcSend;
 use base::id::HistoryStateId;
 use constellation_traits::{
     ScriptToConstellationMessage, StructuredSerializedData, TraversalDirection,
@@ -13,7 +14,7 @@ use dom_struct::dom_struct;
 use js::jsapi::Heap;
 use js::jsval::{JSVal, NullValue, UndefinedValue};
 use js::rust::{HandleValue, MutableHandleValue};
-use net_traits::{CoreResourceMsg, IpcSend};
+use net_traits::CoreResourceMsg;
 use profile_traits::ipc;
 use profile_traits::ipc::channel;
 use servo_url::ServoUrl;
@@ -71,7 +72,7 @@ impl History {
 impl History {
     fn traverse_history(&self, direction: TraversalDirection) -> ErrorResult {
         if !self.window.Document().is_fully_active() {
-            return Err(Error::Security);
+            return Err(Error::Security(None));
         }
         let msg = ScriptToConstellationMessage::TraverseHistory(direction);
         let _ = self
@@ -126,8 +127,13 @@ impl History {
                     ..Default::default()
                 };
                 rooted!(in(*GlobalScope::get_cx()) let mut state = UndefinedValue());
-                if structuredclone::read(self.window.as_global_scope(), data, state.handle_mut())
-                    .is_err()
+                if structuredclone::read(
+                    self.window.as_global_scope(),
+                    data,
+                    state.handle_mut(),
+                    can_gc,
+                )
+                .is_err()
                 {
                     warn!("Error reading structuredclone data");
                 }
@@ -183,13 +189,14 @@ impl History {
         _title: DOMString,
         url: Option<USVString>,
         push_or_replace: PushOrReplace,
+        can_gc: CanGc,
     ) -> ErrorResult {
         // Step 1
         let document = self.window.Document();
 
         // Step 2
         if !document.is_fully_active() {
-            return Err(Error::Security);
+            return Err(Error::Security(None));
         }
 
         // TODO: Step 3 Optionally abort these steps
@@ -208,13 +215,13 @@ impl History {
                 // relative to the relevant settings object of history.
                 let Ok(url) = ServoUrl::parse_with_base(Some(&document_url), &urlstring.0) else {
                     // Step 6.2 If newURL is failure, then throw a "SecurityError" DOMException.
-                    return Err(Error::Security);
+                    return Err(Error::Security(None));
                 };
 
                 // Step 6.3 If document cannot have its URL rewritten to newURL,
                 // then throw a "SecurityError" DOMException.
                 if !Self::can_have_url_rewritten(&document_url, &url) {
-                    return Err(Error::Security);
+                    return Err(Error::Security(None));
                 }
 
                 url
@@ -271,6 +278,7 @@ impl History {
             self.window.as_global_scope(),
             serialized_data,
             state.handle_mut(),
+            can_gc,
         )
         .is_err()
         {
@@ -327,7 +335,7 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
     /// <https://html.spec.whatwg.org/multipage/#dom-history-state>
     fn GetState(&self, _cx: JSContext, mut retval: MutableHandleValue) -> Fallible<()> {
         if !self.window.Document().is_fully_active() {
-            return Err(Error::Security);
+            return Err(Error::Security(None));
         }
         retval.set(self.state.get());
         Ok(())
@@ -336,7 +344,7 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
     /// <https://html.spec.whatwg.org/multipage/#dom-history-length>
     fn GetLength(&self) -> Fallible<u32> {
         if !self.window.Document().is_fully_active() {
-            return Err(Error::Security);
+            return Err(Error::Security(None));
         }
         let (sender, recv) = channel(self.global().time_profiler_chan().clone())
             .expect("Failed to create channel to send jsh length.");
@@ -377,8 +385,9 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
         data: HandleValue,
         title: DOMString,
         url: Option<USVString>,
+        can_gc: CanGc,
     ) -> ErrorResult {
-        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Push)
+        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Push, can_gc)
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-history-replacestate>
@@ -388,7 +397,8 @@ impl HistoryMethods<crate::DomTypeHolder> for History {
         data: HandleValue,
         title: DOMString,
         url: Option<USVString>,
+        can_gc: CanGc,
     ) -> ErrorResult {
-        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Replace)
+        self.push_or_replace_state(cx, data, title, url, PushOrReplace::Replace, can_gc)
     }
 }

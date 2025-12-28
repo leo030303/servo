@@ -2,15 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
-use base::id::PipelineId;
+use base::generic_channel::{GenericCallback, GenericSender};
+use base::id::{PipelineId, WebViewId};
 use constellation_traits::{ScriptToConstellationChan, ScriptToConstellationMessage};
 use crossbeam_channel::Sender;
 use devtools_traits::ScriptToDevtoolsControlMsg;
 use dom_struct::dom_struct;
-use embedder_traits::JavaScriptEvaluationError;
-use ipc_channel::ipc::IpcSender;
+use embedder_traits::{JavaScriptEvaluationError, ScriptToEmbedderChan};
 use js::jsval::UndefinedValue;
 use net_traits::ResourceThreads;
 use net_traits::image_cache::ImageCache;
@@ -18,6 +19,7 @@ use profile_traits::{mem, time};
 use script_bindings::realms::InRealm;
 use script_traits::Painter;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
 use stylo_atoms::Atom;
 
 use crate::dom::bindings::inheritance::Castable;
@@ -33,7 +35,6 @@ use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::dom::worklet::WorkletExecutor;
 use crate::messaging::MainThreadScriptMsg;
 use crate::realms::enter_realm;
-use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::{CanGc, IntroductionType, JSContext};
 
 #[dom_struct]
@@ -54,22 +55,28 @@ impl WorkletGlobalScope {
     /// Create a new heap-allocated `WorkletGlobalScope`.
     pub(crate) fn new(
         scope_type: WorkletGlobalScopeType,
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         base_url: ServoUrl,
+        inherited_secure_context: Option<bool>,
         executor: WorkletExecutor,
         init: &WorkletGlobalScopeInit,
     ) -> DomRoot<WorkletGlobalScope> {
         let scope: DomRoot<WorkletGlobalScope> = match scope_type {
             #[cfg(feature = "testbinding")]
             WorkletGlobalScopeType::Test => DomRoot::upcast(TestWorkletGlobalScope::new(
+                webview_id,
                 pipeline_id,
                 base_url,
+                inherited_secure_context,
                 executor,
                 init,
             )),
             WorkletGlobalScopeType::Paint => DomRoot::upcast(PaintWorkletGlobalScope::new(
+                webview_id,
                 pipeline_id,
                 base_url,
+                inherited_secure_context,
                 executor,
                 init,
             )),
@@ -83,13 +90,16 @@ impl WorkletGlobalScope {
 
     /// Create a new stack-allocated `WorkletGlobalScope`.
     pub(crate) fn new_inherited(
+        webview_id: WebViewId,
         pipeline_id: PipelineId,
         base_url: ServoUrl,
+        inherited_secure_context: Option<bool>,
         executor: WorkletExecutor,
         init: &WorkletGlobalScopeInit,
     ) -> Self {
         let script_to_constellation_chan = ScriptToConstellationChan {
             sender: init.to_constellation_sender.clone(),
+            webview_id,
             pipeline_id,
         };
         Self {
@@ -99,14 +109,15 @@ impl WorkletGlobalScope {
                 init.mem_profiler_chan.clone(),
                 init.time_profiler_chan.clone(),
                 script_to_constellation_chan,
+                init.to_embedder_sender.clone(),
                 init.resource_threads.clone(),
+                init.storage_threads.clone(),
                 MutableOrigin::new(ImmutableOrigin::new_opaque()),
                 base_url.clone(),
                 None,
-                Default::default(),
                 #[cfg(feature = "webgpu")]
                 init.gpu_id_hub.clone(),
-                init.inherited_secure_context,
+                inherited_secure_context,
                 false,
                 None, // font_context
             ),
@@ -124,18 +135,17 @@ impl WorkletGlobalScope {
     /// Evaluate a JS script in this global.
     pub(crate) fn evaluate_js(
         &self,
-        script: &str,
+        script: Cow<'_, str>,
         can_gc: CanGc,
     ) -> Result<(), JavaScriptEvaluationError> {
         debug!("Evaluating Dom in a worklet.");
         rooted!(in (*GlobalScope::get_cx()) let mut rval = UndefinedValue());
-        self.globalscope.evaluate_js_on_global_with_result(
+        self.globalscope.evaluate_js_on_global(
             script,
-            rval.handle_mut(),
-            ScriptFetchOptions::default_classic_script(&self.globalscope),
-            self.globalscope.api_base_url(),
-            can_gc,
+            "",
             Some(IntroductionType::WORKLET),
+            rval.handle_mut(),
+            can_gc,
         )
     }
 
@@ -189,21 +199,24 @@ pub(crate) struct WorkletGlobalScopeInit {
     pub(crate) to_script_thread_sender: Sender<MainThreadScriptMsg>,
     /// Channel to a resource thread
     pub(crate) resource_threads: ResourceThreads,
+    /// Channels to the [`StorageThreads`].
+    pub(crate) storage_threads: StorageThreads,
     /// Channel to the memory profiler
     pub(crate) mem_profiler_chan: mem::ProfilerChan,
     /// Channel to the time profiler
     pub(crate) time_profiler_chan: time::ProfilerChan,
     /// Channel to devtools
-    pub(crate) devtools_chan: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
+    pub(crate) devtools_chan: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
     /// Messages to send to constellation
-    pub(crate) to_constellation_sender: IpcSender<(PipelineId, ScriptToConstellationMessage)>,
+    pub(crate) to_constellation_sender:
+        GenericSender<(WebViewId, PipelineId, ScriptToConstellationMessage)>,
+    /// Messages to send to the Embedder
+    pub(crate) to_embedder_sender: ScriptToEmbedderChan,
     /// The image cache
     pub(crate) image_cache: Arc<dyn ImageCache>,
     /// Identity manager for WebGPU resources
     #[cfg(feature = "webgpu")]
     pub(crate) gpu_id_hub: Arc<IdentityHub>,
-    /// Is considered secure
-    pub(crate) inherited_secure_context: Option<bool>,
 }
 
 /// <https://drafts.css-houdini.org/worklets/#worklet-global-scope-type>

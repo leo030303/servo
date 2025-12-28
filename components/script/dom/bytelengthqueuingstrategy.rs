@@ -5,9 +5,10 @@
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
+use js::error::throw_type_error;
 use js::gc::{HandleValue, MutableHandleValue};
 use js::jsapi::{CallArgs, JSContext};
-use js::jsval::JSVal;
+use js::jsval::{JSVal, UndefinedValue};
 use js::rust::HandleObject;
 
 use super::bindings::codegen::Bindings::FunctionBinding::Function;
@@ -85,31 +86,54 @@ impl ByteLengthQueuingStrategyMethods<crate::DomTypeHolder> for ByteLengthQueuin
 }
 
 /// <https://streams.spec.whatwg.org/#byte-length-queuing-strategy-size-function>
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) unsafe fn byte_length_queuing_strategy_size(
     cx: *mut JSContext,
     argc: u32,
     vp: *mut JSVal,
 ) -> bool {
-    let args = CallArgs::from_vp(vp, argc);
+    let args = unsafe { CallArgs::from_vp(vp, argc) };
 
-    // Step 1.1: Return ? GetV(chunk, "byteLength").
-    let val = HandleValue::from_raw(args.get(0));
+    // Step 1. Let steps be the following steps, given chunk:
+    // Step 1.1. Return ? GetV(chunk, "byteLength").
+    let chunk = unsafe { HandleValue::from_raw(args.get(0)) };
 
-    // https://tc39.es/ecma262/multipage/abstract-operations.html#sec-getv
-    // Let O be ? ToObject(V).
-    if !val.is_object() {
+    // https://tc39.es/ecma262/#sec-getv
+    // Let O be ? ToObject(V).
+    if chunk.is_undefined() || chunk.is_null() {
+        unsafe {
+            throw_type_error(
+                cx,
+                "ByteLengthQueuingStrategy size called with undefined or nulll",
+            )
+        };
         return false;
     }
-    rooted!(in(cx) let object = val.to_object());
+
+    if !chunk.is_object() {
+        // Return ? O.[[Get]]("byteLength", V).
+        // undefined for primitives without the property.
+        args.rval().set(UndefinedValue());
+        return true;
+    }
+
+    rooted!(in(cx) let object = chunk.to_object());
 
     // Return ? O.[[Get]](P, V).
-    get_dictionary_property(
-        cx,
-        object.handle(),
-        "byteLength",
-        MutableHandleValue::from_raw(args.rval()),
-        CanGc::note(),
-    )
-    .unwrap_or(false)
+    match unsafe {
+        get_dictionary_property(
+            cx,
+            object.handle(),
+            "byteLength",
+            MutableHandleValue::from_raw(args.rval()),
+            CanGc::note(),
+        )
+    } {
+        Ok(true) => true,
+        Ok(false) => {
+            args.rval().set(UndefinedValue());
+            true
+        },
+        Err(()) => false,
+    }
 }

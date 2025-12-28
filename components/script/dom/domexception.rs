@@ -2,12 +2,12 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
-
 use base::id::{DomExceptionId, DomExceptionIndex};
 use constellation_traits::DomException;
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use rustc_hash::FxHashMap;
+use script_bindings::match_domstring_ascii;
 
 use crate::dom::bindings::codegen::Bindings::DOMExceptionBinding::{
     DOMExceptionConstants, DOMExceptionMethods,
@@ -24,7 +24,7 @@ use crate::dom::globalscope::GlobalScope;
 use crate::script_runtime::CanGc;
 
 #[repr(u16)]
-#[allow(clippy::enum_variant_names)]
+#[expect(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, Eq, JSTraceable, MallocSizeOf, Ord, PartialEq, PartialOrd)]
 pub(crate) enum DOMErrorName {
     IndexSizeError = DOMExceptionConstants::INDEX_SIZE_ERR,
@@ -62,7 +62,7 @@ pub(crate) enum DOMErrorName {
 
 impl DOMErrorName {
     pub(crate) fn from(s: &DOMString) -> Option<DOMErrorName> {
-        match s.as_ref() {
+        match_domstring_ascii!(s,
             "IndexSizeError" => Some(DOMErrorName::IndexSizeError),
             "HierarchyRequestError" => Some(DOMErrorName::HierarchyRequestError),
             "WrongDocumentError" => Some(DOMErrorName::WrongDocumentError),
@@ -95,7 +95,7 @@ impl DOMErrorName {
             "NotAllowedError" => Some(DOMErrorName::NotAllowedError),
             "ConstraintError" => Some(DOMErrorName::ConstraintError),
             _ => None,
-        }
+        )
     }
 }
 
@@ -122,7 +122,7 @@ impl DOMException {
             DOMErrorName::InvalidStateError => "The object is in an invalid state.",
             DOMErrorName::SyntaxError => "The string did not match the expected pattern.",
             DOMErrorName::InvalidModificationError => "The object can not be modified in this way.",
-            DOMErrorName::NamespaceError => "The operation is not allowed by Namespaces in XML.",
+            DOMErrorName::NamespaceError => "The operation is incorrect with regard to namespaces.",
             DOMErrorName::InvalidAccessError => {
                 "The object does not support the operation or argument."
             },
@@ -213,7 +213,7 @@ impl DOMException {
 }
 
 impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
-    // https://webidl.spec.whatwg.org/#dom-domexception-domexception
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-domexception>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -229,7 +229,7 @@ impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
         ))
     }
 
-    // https://webidl.spec.whatwg.org/#dom-domexception-code
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-code>
     fn Code(&self) -> u16 {
         match DOMErrorName::from(&self.name) {
             Some(code) if code <= DOMErrorName::DataCloneError => code as u16,
@@ -237,12 +237,12 @@ impl DOMExceptionMethods<crate::DomTypeHolder> for DOMException {
         }
     }
 
-    // https://webidl.spec.whatwg.org/#dom-domexception-name
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-name>
     fn Name(&self) -> DOMString {
         self.name.clone()
     }
 
-    // https://webidl.spec.whatwg.org/#dom-domexception-message
+    /// <https://webidl.spec.whatwg.org/#dom-domexception-message>
     fn Message(&self) -> DOMString {
         self.message.clone()
     }
@@ -252,7 +252,7 @@ impl Serializable for DOMException {
     type Index = DomExceptionIndex;
     type Data = DomException;
 
-    // https://webidl.spec.whatwg.org/#idl-DOMException
+    /// <https://webidl.spec.whatwg.org/#idl-DOMException>
     fn serialize(&self) -> Result<(DomExceptionId, Self::Data), ()> {
         let serialized = DomException {
             message: self.message.to_string(),
@@ -261,7 +261,7 @@ impl Serializable for DOMException {
         Ok((DomExceptionId::new(), serialized))
     }
 
-    // https://webidl.spec.whatwg.org/#idl-DOMException
+    /// <https://webidl.spec.whatwg.org/#idl-DOMException>
     fn deserialize(
         owner: &GlobalScope,
         serialized: Self::Data,
@@ -280,7 +280,7 @@ impl Serializable for DOMException {
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<DomExceptionId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<DomExceptionId, Self::Data>> {
         match data {
             StructuredData::Reader(reader) => &mut reader.exceptions,
             StructuredData::Writer(writer) => &mut writer.exceptions,

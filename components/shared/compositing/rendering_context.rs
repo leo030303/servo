@@ -10,6 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use dpi::PhysicalSize;
+use embedder_traits::RefreshDriver;
 use euclid::default::{Rect, Size2D as UntypedSize2D};
 use euclid::{Point2D, Size2D};
 use gleam::gl::{self, Gl};
@@ -78,6 +79,11 @@ pub trait RenderingContext {
     fn connection(&self) -> Option<Connection> {
         None
     }
+    /// Return the [`RefreshDriver`] for this [`RenderingContext`]. If `None` is returned,
+    /// then the default timer-based [`RefreshDriver`] will be used.
+    fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
+        None
+    }
 }
 
 /// A rendering context that uses the Surfman library to create and manage
@@ -93,6 +99,7 @@ struct SurfmanRenderingContext {
     glow_gl: Arc<glow::Context>,
     device: RefCell<Device>,
     context: RefCell<Context>,
+    refresh_driver: Option<Rc<dyn RefreshDriver>>,
 }
 
 impl Drop for SurfmanRenderingContext {
@@ -104,8 +111,12 @@ impl Drop for SurfmanRenderingContext {
 }
 
 impl SurfmanRenderingContext {
-    fn new(connection: &Connection, adapter: &Adapter) -> Result<Self, Error> {
-        let mut device = connection.create_device(adapter)?;
+    fn new(
+        connection: &Connection,
+        adapter: &Adapter,
+        refresh_driver: Option<Rc<dyn RefreshDriver>>,
+    ) -> Result<Self, Error> {
+        let device = connection.create_device(adapter)?;
 
         let flags = ContextAttributeFlags::ALPHA |
             ContextAttributeFlags::DEPTH |
@@ -119,7 +130,7 @@ impl SurfmanRenderingContext {
             device.create_context_descriptor(&ContextAttributes { flags, version })?;
         let context = device.create_context(&context_descriptor, None)?;
 
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code)]
         let gleam_gl = {
             match gl_api {
                 GLApi::GL => unsafe {
@@ -131,7 +142,7 @@ impl SurfmanRenderingContext {
             }
         };
 
-        #[allow(unsafe_code)]
+        #[expect(unsafe_code)]
         let glow_gl = unsafe {
             glow::Context::from_loader_function(|function_name| {
                 device.get_proc_address(&context, function_name)
@@ -143,6 +154,7 @@ impl SurfmanRenderingContext {
             glow_gl: Arc::new(glow_gl),
             device: RefCell::new(device),
             context: RefCell::new(context),
+            refresh_driver,
         })
     }
 
@@ -189,7 +201,11 @@ impl SurfmanRenderingContext {
         let device = &self.device.borrow();
         let context = &mut self.context.borrow_mut();
 
-        let mut surface = device.unbind_surface_from_context(context)?.unwrap();
+        let mut surface = device
+            .unbind_surface_from_context(context)?
+            // todo: proper error type. This probably should be done in surfman.
+            .ok_or(Error::Failed)
+            .inspect_err(|_| log::error!("Unable to present bound surface: no surface bound"))?;
         device.present_surface(context, &mut surface)?;
         device
             .bind_surface_to_context(context, surface)
@@ -199,7 +215,7 @@ impl SurfmanRenderingContext {
             })
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     fn native_context(&self) -> NativeContext {
         let device = &self.device.borrow();
         let context = &self.context.borrow();
@@ -268,6 +284,10 @@ impl SurfmanRenderingContext {
     fn connection(&self) -> Option<Connection> {
         Some(self.device.borrow().connection())
     }
+
+    fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
+        self.refresh_driver.clone()
+    }
 }
 
 /// A software rendering context that uses a software OpenGL implementation to render
@@ -285,7 +305,7 @@ impl SoftwareRenderingContext {
     pub fn new(size: PhysicalSize<u32>) -> Result<Self, Error> {
         let connection = Connection::new()?;
         let adapter = connection.create_software_adapter()?;
-        let surfman_rendering_info = SurfmanRenderingContext::new(&connection, &adapter)?;
+        let surfman_rendering_info = SurfmanRenderingContext::new(&connection, &adapter, None)?;
 
         let surfman_size = Size2D::new(size.width as i32, size.height as i32);
         let surface =
@@ -392,9 +412,32 @@ impl WindowRenderingContext {
         window_handle: WindowHandle,
         size: PhysicalSize<u32>,
     ) -> Result<Self, Error> {
+        Self::new_with_optional_refresh_driver(display_handle, window_handle, size, None)
+    }
+
+    pub fn new_with_refresh_driver(
+        display_handle: DisplayHandle,
+        window_handle: WindowHandle,
+        size: PhysicalSize<u32>,
+        refresh_driver: Rc<dyn RefreshDriver>,
+    ) -> Result<Self, Error> {
+        Self::new_with_optional_refresh_driver(
+            display_handle,
+            window_handle,
+            size,
+            Some(refresh_driver),
+        )
+    }
+
+    fn new_with_optional_refresh_driver(
+        display_handle: DisplayHandle,
+        window_handle: WindowHandle,
+        size: PhysicalSize<u32>,
+        refresh_driver: Option<Rc<dyn RefreshDriver>>,
+    ) -> Result<Self, Error> {
         let connection = Connection::from_display_handle(display_handle)?;
         let adapter = connection.create_adapter()?;
-        let surfman_context = SurfmanRenderingContext::new(&connection, &adapter)?;
+        let surfman_context = SurfmanRenderingContext::new(&connection, &adapter, refresh_driver)?;
 
         let native_widget = connection
             .create_native_widget_from_window_handle(
@@ -441,7 +484,7 @@ impl WindowRenderingContext {
         window_handle: WindowHandle,
         size: PhysicalSize<u32>,
     ) -> Result<(), Error> {
-        let mut device = self.surfman_context.device.borrow_mut();
+        let device = self.surfman_context.device.borrow_mut();
         let mut context = self.surfman_context.context.borrow_mut();
 
         let native_widget = device
@@ -525,6 +568,10 @@ impl RenderingContext for WindowRenderingContext {
 
     fn connection(&self) -> Option<Connection> {
         self.surfman_context.connection()
+    }
+
+    fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
+        self.surfman_context.refresh_driver()
     }
 }
 
@@ -710,7 +757,7 @@ impl OffscreenRenderingContext {
         }))
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn blit_framebuffer(
         gl: &glow::Context,
         source_rect: Rect<i32>,
@@ -828,6 +875,10 @@ impl RenderingContext for OffscreenRenderingContext {
     fn read_to_image(&self, source_rectangle: DeviceIntRect) -> Option<RgbaImage> {
         self.framebuffer.borrow().read_to_image(source_rectangle)
     }
+
+    fn refresh_driver(&self) -> Option<Rc<dyn RefreshDriver>> {
+        self.parent_context().refresh_driver()
+    }
 }
 
 #[cfg(test)]
@@ -841,11 +892,11 @@ mod test {
     use super::Framebuffer;
 
     #[test]
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn test_read_pixels() -> Result<(), Error> {
         let connection = Connection::new()?;
         let adapter = connection.create_software_adapter()?;
-        let mut device = connection.create_device(&adapter)?;
+        let device = connection.create_device(&adapter)?;
         let context_descriptor = device.create_context_descriptor(&ContextAttributes {
             version: GLVersion::new(3, 0),
             flags: ContextAttributeFlags::empty(),

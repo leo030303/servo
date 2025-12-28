@@ -390,29 +390,12 @@ pub(crate) struct TableLayoutStyle<'a> {
 pub(crate) enum TableLevelBox {
     Caption(ArcRefCell<TableCaption>),
     Cell(ArcRefCell<TableSlotCell>),
-    #[allow(dead_code)]
     TrackGroup(ArcRefCell<TableTrackGroup>),
-    #[allow(dead_code)]
     Track(ArcRefCell<TableTrack>),
 }
 
 impl TableLevelBox {
-    pub(crate) fn clear_fragment_layout_cache(&self) {
-        match self {
-            TableLevelBox::Caption(caption) => {
-                caption.borrow().context.base.clear_fragment_layout_cache();
-            },
-            TableLevelBox::Cell(cell) => {
-                cell.borrow().base.clear_fragment_layout_cache();
-            },
-            TableLevelBox::TrackGroup(track_group) => {
-                track_group.borrow().base.clear_fragment_layout_cache()
-            },
-            TableLevelBox::Track(track) => track.borrow().base.clear_fragment_layout_cache(),
-        }
-    }
-
-    pub(crate) fn with_base<T>(&self, callback: impl Fn(&LayoutBoxBase) -> T) -> T {
+    pub(crate) fn with_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> T {
         match self {
             TableLevelBox::Caption(caption) => callback(&caption.borrow().context.base),
             TableLevelBox::Cell(cell) => callback(&cell.borrow().base),
@@ -421,7 +404,7 @@ impl TableLevelBox {
         }
     }
 
-    pub(crate) fn with_base_mut<T>(&mut self, callback: impl Fn(&mut LayoutBoxBase) -> T) -> T {
+    pub(crate) fn with_base_mut<T>(&mut self, callback: impl FnOnce(&mut LayoutBoxBase) -> T) -> T {
         match self {
             TableLevelBox::Caption(caption) => callback(&mut caption.borrow_mut().context.base),
             TableLevelBox::Cell(cell) => callback(&mut cell.borrow_mut().base),

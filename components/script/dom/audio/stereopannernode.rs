@@ -38,6 +38,7 @@ impl StereoPannerNode {
         window: &Window,
         context: &BaseAudioContext,
         options: &StereoPannerOptions,
+        can_gc: CanGc,
     ) -> Fallible<StereoPannerNode> {
         let node_options = options.parent.unwrap_or(
             2,
@@ -45,10 +46,10 @@ impl StereoPannerNode {
             ChannelInterpretation::Speakers,
         );
         if node_options.mode == ChannelCountMode::Max {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
         if node_options.count > 2 || node_options.count == 0 {
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
         let pan = *options.pan;
         let source_node = AudioScheduledSourceNode::new_inherited(
@@ -69,7 +70,7 @@ impl StereoPannerNode {
             pan,
             -1.,
             1.,
-            CanGc::note(),
+            can_gc,
         );
 
         Ok(StereoPannerNode {
@@ -95,7 +96,7 @@ impl StereoPannerNode {
         options: &StereoPannerOptions,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<StereoPannerNode>> {
-        let node = StereoPannerNode::new_inherited(window, context, options)?;
+        let node = StereoPannerNode::new_inherited(window, context, options, can_gc)?;
         Ok(reflect_dom_object_with_proto(
             Box::new(node),
             window,
@@ -106,7 +107,7 @@ impl StereoPannerNode {
 }
 
 impl StereoPannerNodeMethods<crate::DomTypeHolder> for StereoPannerNode {
-    // https://webaudio.github.io/web-audio-api/#dom-stereopannernode-stereopannernode
+    /// <https://webaudio.github.io/web-audio-api/#dom-stereopannernode-stereopannernode>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -117,7 +118,7 @@ impl StereoPannerNodeMethods<crate::DomTypeHolder> for StereoPannerNode {
         StereoPannerNode::new_with_proto(window, proto, context, options, can_gc)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-stereopannernode-pan
+    /// <https://webaudio.github.io/web-audio-api/#dom-stereopannernode-pan>
     fn Pan(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.pan)
     }

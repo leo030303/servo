@@ -4,10 +4,10 @@
 
 use std::rc::Rc;
 
+use base::generic_channel::GenericSender;
 use bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
 use bluetooth_traits::{BluetoothRequest, BluetoothResponse};
 use dom_struct::dom_struct;
-use ipc_channel::ipc::IpcSender;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::BluetoothRemoteGATTCharacteristicBinding::BluetoothRemoteGATTCharacteristicMethods;
@@ -71,7 +71,7 @@ impl BluetoothRemoteGATTDescriptor {
         )
     }
 
-    fn get_bluetooth_thread(&self) -> IpcSender<BluetoothRequest> {
+    fn get_bluetooth_thread(&self) -> GenericSender<BluetoothRequest> {
         self.global().as_window().bluetooth_thread()
     }
 
@@ -81,28 +81,28 @@ impl BluetoothRemoteGATTDescriptor {
 }
 
 impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRemoteGATTDescriptor {
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-characteristic
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-characteristic>
     fn Characteristic(&self) -> DomRoot<BluetoothRemoteGATTCharacteristic> {
         DomRoot::from_ref(&self.characteristic)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-uuid
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-uuid>
     fn Uuid(&self) -> DOMString {
         self.uuid.clone()
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-value
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-value>
     fn GetValue(&self) -> Option<ByteString> {
         self.value.borrow().clone()
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-readvalue
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-readvalue>
     fn ReadValue(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let p = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 1.
-        if uuid_is_blocklisted(self.uuid.as_ref(), Blocklist::Reads) {
-            p.reject_error(Security, can_gc);
+        if uuid_is_blocklisted(&self.uuid.str(), Blocklist::Reads) {
+            p.reject_error(Security(None), can_gc);
             return p;
         }
 
@@ -111,10 +111,10 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
             .Characteristic()
             .Service()
             .Device()
-            .get_gatt()
+            .get_gatt(can_gc)
             .Connected()
         {
-            p.reject_error(Network, can_gc);
+            p.reject_error(Network(None), can_gc);
             return p;
         }
 
@@ -128,7 +128,7 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
         p
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-writevalue
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-writevalue>
     fn WriteValue(
         &self,
         value: ArrayBufferViewOrArrayBuffer,
@@ -138,8 +138,8 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
         let p = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 1.
-        if uuid_is_blocklisted(self.uuid.as_ref(), Blocklist::Writes) {
-            p.reject_error(Security, can_gc);
+        if uuid_is_blocklisted(&self.uuid.str(), Blocklist::Writes) {
+            p.reject_error(Security(None), can_gc);
             return p;
         }
 
@@ -149,7 +149,7 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
             ArrayBufferViewOrArrayBuffer::ArrayBuffer(ab) => ab.to_vec(),
         };
         if vec.len() > MAXIMUM_ATTRIBUTE_LENGTH {
-            p.reject_error(InvalidModification, can_gc);
+            p.reject_error(InvalidModification(None), can_gc);
             return p;
         }
 
@@ -158,10 +158,10 @@ impl BluetoothRemoteGATTDescriptorMethods<crate::DomTypeHolder> for BluetoothRem
             .Characteristic()
             .Service()
             .Device()
-            .get_gatt()
+            .get_gatt(can_gc)
             .Connected()
         {
-            p.reject_error(Network, can_gc);
+            p.reject_error(Network(None), can_gc);
             return p;
         }
 

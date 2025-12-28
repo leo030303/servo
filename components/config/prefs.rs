@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::env::consts::ARCH;
 use std::sync::{RwLock, RwLockReadGuard};
 
 use serde::{Deserialize, Serialize};
@@ -11,11 +12,11 @@ pub use crate::pref_util::PrefValue;
 
 static PREFERENCES: RwLock<Preferences> = RwLock::new(Preferences::const_default());
 
-pub trait Observer: Send + Sync {
+pub trait PreferencesObserver: Send + Sync {
     fn prefs_changed(&self, _changes: &[(&'static str, PrefValue)]) {}
 }
 
-static OBSERVERS: RwLock<Vec<Box<dyn Observer>>> = RwLock::new(Vec::new());
+static OBSERVERS: RwLock<Vec<Box<dyn PreferencesObserver>>> = RwLock::new(Vec::new());
 
 #[inline]
 /// Get the current set of global preferences for Servo.
@@ -23,7 +24,7 @@ pub fn get() -> RwLockReadGuard<'static, Preferences> {
     PREFERENCES.read().unwrap()
 }
 
-pub fn add_observer(observer: Box<dyn Observer>) {
+pub fn add_observer(observer: Box<dyn PreferencesObserver>) {
     OBSERVERS.write().unwrap().push(observer);
 }
 
@@ -85,15 +86,20 @@ pub struct Preferences {
     /// Port number to start a server to listen to remote Firefox devtools connections.
     /// 0 for random port.
     pub devtools_server_port: i64,
+    // feature: WebGPU | #24706 | Web/API/WebGPU_API
     pub dom_webgpu_enabled: bool,
     /// List of comma-separated backends to be used by wgpu.
     pub dom_webgpu_wgpu_backend: String,
+    // feature: AbortController | #34866 | Web/API/AbortController
     pub dom_abort_controller_enabled: bool,
+    // feature: Adopted Stylesheet | #38132 | Web/API/Document/adoptedStyleSheets
     pub dom_adoptedstylesheet_enabled: bool,
+    // feature: Clipboard API | #36084 | Web/API/Clipboard_API
     pub dom_async_clipboard_enabled: bool,
     pub dom_bluetooth_enabled: bool,
     pub dom_bluetooth_testing_enabled: bool,
     pub dom_allow_scripts_to_close_windows: bool,
+    // feature: Media Capture and Streams API | #26861 | Web/API/Media_Capture_and_Streams_API
     pub dom_canvas_capture_enabled: bool,
     pub dom_canvas_text_enabled: bool,
     /// Selects canvas backend
@@ -104,27 +110,47 @@ pub struct Preferences {
     /// - vello_cpu
     pub dom_canvas_backend: String,
     pub dom_clipboardevent_enabled: bool,
+    pub dom_command_invokers_enabled: bool,
     pub dom_composition_event_enabled: bool,
+    // feature: CookieStore | #37674 | Web/API/CookieStore
     pub dom_cookiestore_enabled: bool,
+    // feature: Credential Management API | #38788 | Web/API/Credential_Management_API
+    pub dom_credential_management_enabled: bool,
+    // feature: WebCrypto API | #40687 | Web/API/Web_Crypto_API
     pub dom_crypto_subtle_enabled: bool,
-    pub dom_customelements_enabled: bool,
     pub dom_document_dblclick_timeout: i64,
     pub dom_document_dblclick_dist: i64,
+    // feature: CSS Font Loading API | #29376 | Web/API/CSS_Font_Loading_API
     pub dom_fontface_enabled: bool,
     pub dom_fullscreen_test: bool,
+    // feature: Gamepad API | #10977 | Web/API/Gamepad_API
     pub dom_gamepad_enabled: bool,
+    // feature: Geolocation API | #38903 | Web/API/Geolocation_API
+    pub dom_geolocation_enabled: bool,
+    // feature: IndexedDB | #6963 | Web/API/IndexedDB_API
     pub dom_indexeddb_enabled: bool,
+    // feature: IntersectionObserver | #35767 | Web/API/Intersection_Observer_API
     pub dom_intersection_observer_enabled: bool,
     pub dom_microdata_testing_enabled: bool,
-    pub dom_mouse_event_which_enabled: bool,
+    pub dom_uievent_which_enabled: bool,
+    // feature: MutationObserver | #6633 | Web/API/MutationObserver
     pub dom_mutation_observer_enabled: bool,
+    // feature: Navigator.registerProtocolHandler() | #40615 | Web/API/Navigator/registerProtocolHandler
+    pub dom_navigator_protocol_handlers_enabled: bool,
+    // feature: Navigator.sendBeacon() | #38302 | Web/API/Navigator/sendBeacon
     pub dom_navigator_sendbeacon_enabled: bool,
+    // feature: Notification API | #34841 | Web/API/Notifications_API
     pub dom_notification_enabled: bool,
+    // feature: OffscreenCanvas | #34111 | Web/API/OffscreenCanvas
     pub dom_offscreen_canvas_enabled: bool,
+    pub dom_parallel_css_parsing_enabled: bool,
+    // feature: Permissions API | #31235 | Web/API/Permissions_API
     pub dom_permissions_enabled: bool,
     pub dom_permissions_testing_allowed_in_nonsecure_contexts: bool,
+    // feature: ResizeObserver | #39790 | Web/API/ResizeObserver
     pub dom_resize_observer_enabled: bool,
     pub dom_script_asynch: bool,
+    // feature: ServiceWorker | #36538 | Web/API/Service_Worker_API
     pub dom_serviceworker_enabled: bool,
     pub dom_serviceworker_timeout_seconds: i64,
     pub dom_servo_helpers_enabled: bool,
@@ -144,12 +170,14 @@ pub struct Preferences {
     pub dom_testperf_enabled: bool,
     // https://testutils.spec.whatwg.org#availability
     pub dom_testutils_enabled: bool,
-    pub dom_trusted_types_enabled: bool,
-    pub dom_xpath_enabled: bool,
     /// Enable WebGL2 APIs.
+    // feature: WebGL2 | #41394 | Web/API/WebGL2RenderingContext
     pub dom_webgl2_enabled: bool,
+    // feature: WebRTC | #41396 | Web/API/WebRTC_API
     pub dom_webrtc_enabled: bool,
+    // feature: WebRTC Transceiver | #41396 | Web/API/RTCRtpTransceiver
     pub dom_webrtc_transceiver_enabled: bool,
+    // feature: WebVTT | #22312 | Web/API/WebVTT_API
     pub dom_webvtt_enabled: bool,
     pub dom_webxr_enabled: bool,
     pub dom_webxr_test: bool,
@@ -160,6 +188,7 @@ pub struct Preferences {
     pub dom_webxr_glwindow_spherical: bool,
     pub dom_webxr_glwindow_cubemap: bool,
     pub dom_webxr_hands_enabled: bool,
+    // feature: WebXR Layers | #27468 | Web/API/XRCompositionLayer
     pub dom_webxr_layers_enabled: bool,
     pub dom_webxr_openxr_enabled: bool,
     pub dom_webxr_sessionavailable: bool,
@@ -168,6 +197,9 @@ pub struct Preferences {
     pub dom_worklet_blockingsleep: bool,
     pub dom_worklet_testing_enabled: bool,
     pub dom_worklet_timeout_ms: i64,
+    /// <https://drafts.csswg.org/cssom-view/#the-visualviewport-interface>
+    // feature: VisualViewport | #41341 | Web/API/VisualViewport
+    pub dom_visual_viewport_enabled: bool,
     /// True to compile all WebRender shaders when Servo initializes. This is mostly
     /// useful when modifying the shaders, to ensure they all compile after each change is
     /// made.
@@ -223,15 +255,22 @@ pub struct Preferences {
     pub js_wasm_enabled: bool,
     pub js_wasm_ion_enabled: bool,
     pub js_werror_enabled: bool,
+    pub largest_contentful_paint_enabled: bool,
     pub layout_animations_test_enabled: bool,
+    // feature: CSS Multicol | #22397 | Web/CSS/Guides/Multicol_layout
     pub layout_columns_enabled: bool,
+    // feature: CSS Grid | #34479 | Web/CSS/Guides/Grid_layout
     pub layout_grid_enabled: bool,
     pub layout_container_queries_enabled: bool,
     pub layout_css_transition_behavior_enabled: bool,
+    // feature: CSS Flexbox | #12453 | Web/CSS/Guides/Flexible_box_layout
     pub layout_flexbox_enabled: bool,
+    pub layout_style_sharing_cache_enabled: bool,
     pub layout_threads: i64,
     pub layout_unimplemented: bool,
+    // feature: Variable fonts | #38800 | Web/CSS/Guides/Fonts/Variable_fonts
     pub layout_variable_fonts_enabled: bool,
+    // feature: CSS writing modes | #2560 | Web/CSS/Guides/Writing_modes
     pub layout_writing_mode_enabled: bool,
     /// Enable hardware acceleration for video playback.
     pub media_glvideo_enabled: bool,
@@ -241,8 +280,17 @@ pub struct Preferences {
     pub network_enforce_tls_localhost: bool,
     pub network_enforce_tls_onion: bool,
     pub network_http_cache_disabled: bool,
+    /// A url for a http proxy. We treat an empty string as no proxy.
+    pub network_http_proxy_uri: String,
+    /// The weight of the http memory cache
+    /// Notice that this is not equal to the number of different urls in the cache.
+    pub network_http_cache_size: u64,
     pub network_local_directory_listing_enabled: bool,
     pub network_mime_sniff: bool,
+    /// Force the use of `rust-webpki` verification for CA roots. If this is false (the
+    /// default), then `rustls-platform-verifier` will be used, except on Android where
+    /// `rust-webpki` is always used.
+    pub network_use_webpki_roots: bool,
     pub session_history_max_length: i64,
     /// The background color of shell's viewport. This will be used by OpenGL's `glClearColor`.
     pub shell_background_color_rgba: [f64; 4],
@@ -254,6 +302,8 @@ pub struct Preferences {
     pub threadpools_image_cache_workers_max: i64,
     /// Maximum number of workers for the IndexedDB thread pool
     pub threadpools_indexeddb_workers_max: i64,
+    /// Maximum number of workers for the Web Storage thread pool
+    pub threadpools_webstorage_workers_max: i64,
     /// Maximum number of workers for the Networking async runtime thread pool
     pub threadpools_async_runtime_workers_max: i64,
     /// Maximum number of workers for the Core Resource Manager
@@ -263,7 +313,8 @@ pub struct Preferences {
     /// The user-agent to use for Servo. This can also be set via [`UserAgentPlatform`] in
     /// order to set the value to the default value for the given platform.
     pub user_agent: String,
-
+    /// Whether or not the viewport meta tag is enabled.
+    pub viewport_meta_enabled: bool,
     pub log_filter: String,
 }
 
@@ -273,7 +324,7 @@ impl Preferences {
             css_animations_testing_enabled: false,
             devtools_server_enabled: false,
             devtools_server_port: 0,
-            dom_abort_controller_enabled: false,
+            dom_abort_controller_enabled: true,
             dom_adoptedstylesheet_enabled: false,
             dom_allow_scripts_to_close_windows: false,
             dom_async_clipboard_enabled: false,
@@ -283,26 +334,30 @@ impl Preferences {
             dom_canvas_text_enabled: true,
             dom_canvas_backend: String::new(),
             dom_clipboardevent_enabled: true,
+            dom_command_invokers_enabled: false,
             dom_composition_event_enabled: false,
             dom_cookiestore_enabled: false,
+            dom_credential_management_enabled: false,
             dom_crypto_subtle_enabled: true,
-            dom_customelements_enabled: true,
             dom_document_dblclick_dist: 1,
             dom_document_dblclick_timeout: 300,
             dom_fontface_enabled: false,
             dom_fullscreen_test: false,
             dom_gamepad_enabled: true,
+            dom_geolocation_enabled: false,
             dom_indexeddb_enabled: false,
             dom_intersection_observer_enabled: false,
             dom_microdata_testing_enabled: false,
-            dom_mouse_event_which_enabled: false,
+            dom_uievent_which_enabled: true,
             dom_mutation_observer_enabled: true,
+            dom_navigator_protocol_handlers_enabled: false,
             dom_navigator_sendbeacon_enabled: false,
             dom_notification_enabled: false,
+            dom_parallel_css_parsing_enabled: true,
             dom_offscreen_canvas_enabled: false,
             dom_permissions_enabled: false,
             dom_permissions_testing_allowed_in_nonsecure_contexts: false,
-            dom_resize_observer_enabled: false,
+            dom_resize_observer_enabled: true,
             dom_script_asynch: true,
             dom_serviceworker_enabled: false,
             dom_serviceworker_timeout_seconds: 60,
@@ -322,7 +377,6 @@ impl Preferences {
             dom_testing_html_input_element_select_files_enabled: false,
             dom_testperf_enabled: false,
             dom_testutils_enabled: false,
-            dom_trusted_types_enabled: false,
             dom_webgl2_enabled: false,
             dom_webgpu_enabled: false,
             dom_webgpu_wgpu_backend: String::new(),
@@ -346,7 +400,7 @@ impl Preferences {
             dom_worklet_enabled: false,
             dom_worklet_testing_enabled: false,
             dom_worklet_timeout_ms: 10,
-            dom_xpath_enabled: false,
+            dom_visual_viewport_enabled: false,
             fonts_default: String::new(),
             fonts_default_monospace_size: 13,
             fonts_default_size: 16,
@@ -400,12 +454,14 @@ impl Preferences {
             js_wasm_enabled: true,
             js_wasm_ion_enabled: true,
             js_werror_enabled: false,
+            largest_contentful_paint_enabled: false,
             layout_animations_test_enabled: false,
             layout_columns_enabled: false,
             layout_container_queries_enabled: false,
             layout_css_transition_behavior_enabled: true,
             layout_flexbox_enabled: true,
             layout_grid_enabled: false,
+            layout_style_sharing_cache_enabled: true,
             // TODO(mrobinson): This should likely be based on the number of processors.
             layout_threads: 3,
             layout_unimplemented: false,
@@ -417,18 +473,23 @@ impl Preferences {
             network_enforce_tls_localhost: false,
             network_enforce_tls_onion: false,
             network_http_cache_disabled: false,
+            network_http_proxy_uri: String::new(),
+            network_http_cache_size: 5000,
             network_local_directory_listing_enabled: true,
             network_mime_sniff: false,
+            network_use_webpki_roots: false,
             session_history_max_length: 20,
             shell_background_color_rgba: [1.0, 1.0, 1.0, 1.0],
             threadpools_async_runtime_workers_max: 6,
             threadpools_fallback_worker_num: 3,
             threadpools_image_cache_workers_max: 4,
             threadpools_indexeddb_workers_max: 4,
+            threadpools_webstorage_workers_max: 4,
             threadpools_resource_workers_max: 4,
             threadpools_webrender_workers_max: 4,
             webgl_testing_context_creation_error: false,
             user_agent: String::new(),
+            viewport_meta_enabled: false,
             log_filter: String::new(),
         }
     }
@@ -438,6 +499,11 @@ impl Default for Preferences {
     fn default() -> Self {
         let mut preferences = Self::const_default();
         preferences.user_agent = UserAgentPlatform::default().to_user_agent_string();
+        if let Ok(proxy_uri) = std::env::var("http_proxy") {
+            preferences.network_http_proxy_uri = proxy_uri;
+        } else if let Ok(proxy_uri) = std::env::var("HTTP_PROXY") {
+            preferences.network_http_proxy_uri = proxy_uri;
+        }
         preferences
     }
 }
@@ -452,7 +518,7 @@ pub enum UserAgentPlatform {
 impl UserAgentPlatform {
     /// Return the default `UserAgentPlatform` for this platform. This is
     /// not an implementation of `Default` so that it can be `const`.
-    const fn default() -> Self {
+    pub const fn default() -> Self {
         if cfg!(target_os = "android") {
             Self::Android
         } else if cfg!(target_env = "ohos") {
@@ -474,13 +540,8 @@ impl UserAgentPlatform {
             UserAgentPlatform::Desktop
                 if cfg!(all(target_os = "windows", target_arch = "x86_64")) =>
             {
-                #[cfg(target_arch = "x86_64")]
-                const ARCHITECTURE: &str = "x86; ";
-                #[cfg(not(target_arch = "x86_64"))]
-                const ARCHITECTURE: &str = "";
-
                 format!(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCHITECTURE}rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; {ARCH}rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::Desktop if cfg!(target_os = "macos") => {
@@ -489,14 +550,8 @@ impl UserAgentPlatform {
                 )
             },
             UserAgentPlatform::Desktop => {
-                #[cfg(target_arch = "x86_64")]
-                const ARCHITECTURE: &str = "x86_64";
-                // TODO: This is clearly wrong for other platforms.
-                #[cfg(not(target_arch = "x86_64"))]
-                const ARCHITECTURE: &str = "i686";
-
                 format!(
-                    "Mozilla/5.0 (X11; Linux {ARCHITECTURE}; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
+                    "Mozilla/5.0 (X11; Linux {ARCH}; rv:140.0) Servo/{SERVO_VERSION} Firefox/140.0"
                 )
             },
             UserAgentPlatform::Android => {

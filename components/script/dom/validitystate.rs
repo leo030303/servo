@@ -18,8 +18,8 @@ use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::Element;
-use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
-use crate::dom::htmlformelement::FormControlElementHelpers;
+use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
+use crate::dom::html::htmlformelement::FormControlElementHelpers;
 use crate::dom::node::Node;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
@@ -167,8 +167,7 @@ impl ValidityState {
             .element
             .upcast::<Node>()
             .ancestors()
-            .filter_map(DomRoot::downcast::<HTMLFieldSetElement>)
-            .next()
+            .find_map(DomRoot::downcast::<HTMLFieldSetElement>)
         {
             fieldset.update_validity(can_gc);
         }
@@ -176,63 +175,63 @@ impl ValidityState {
 }
 
 impl ValidityStateMethods<crate::DomTypeHolder> for ValidityState {
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-valuemissing
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-valuemissing>
     fn ValueMissing(&self) -> bool {
         self.invalid_flags()
             .contains(ValidationFlags::VALUE_MISSING)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-typemismatch
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-typemismatch>
     fn TypeMismatch(&self) -> bool {
         self.invalid_flags()
             .contains(ValidationFlags::TYPE_MISMATCH)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-patternmismatch
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-patternmismatch>
     fn PatternMismatch(&self) -> bool {
         self.invalid_flags()
             .contains(ValidationFlags::PATTERN_MISMATCH)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-toolong
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-toolong>
     fn TooLong(&self) -> bool {
         self.invalid_flags().contains(ValidationFlags::TOO_LONG)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-tooshort
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-tooshort>
     fn TooShort(&self) -> bool {
         self.invalid_flags().contains(ValidationFlags::TOO_SHORT)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-rangeunderflow
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-rangeunderflow>
     fn RangeUnderflow(&self) -> bool {
         self.invalid_flags()
             .contains(ValidationFlags::RANGE_UNDERFLOW)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-rangeoverflow
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-rangeoverflow>
     fn RangeOverflow(&self) -> bool {
         self.invalid_flags()
             .contains(ValidationFlags::RANGE_OVERFLOW)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-stepmismatch
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-stepmismatch>
     fn StepMismatch(&self) -> bool {
         self.invalid_flags()
             .contains(ValidationFlags::STEP_MISMATCH)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-badinput
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-badinput>
     fn BadInput(&self) -> bool {
         self.invalid_flags().contains(ValidationFlags::BAD_INPUT)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-customerror
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-customerror>
     fn CustomError(&self) -> bool {
         self.invalid_flags().contains(ValidationFlags::CUSTOM_ERROR)
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-validitystate-valid
+    /// <https://html.spec.whatwg.org/multipage/#dom-validitystate-valid>
     fn Valid(&self) -> bool {
         self.invalid_flags().is_empty()
     }

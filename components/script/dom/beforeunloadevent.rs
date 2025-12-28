@@ -2,8 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(dead_code)]
-
 use dom_struct::dom_struct;
 use stylo_atoms::Atom;
 
@@ -54,17 +52,17 @@ impl BeforeUnloadEvent {
 }
 
 impl BeforeUnloadEventMethods<crate::DomTypeHolder> for BeforeUnloadEvent {
-    // https://html.spec.whatwg.org/multipage/#dom-beforeunloadevent-returnvalue
+    /// <https://html.spec.whatwg.org/multipage/#dom-beforeunloadevent-returnvalue>
     fn ReturnValue(&self) -> DOMString {
         self.return_value.borrow().clone()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-beforeunloadevent-returnvalue
+    /// <https://html.spec.whatwg.org/multipage/#dom-beforeunloadevent-returnvalue>
     fn SetReturnValue(&self, value: DOMString) {
         *self.return_value.borrow_mut() = value;
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

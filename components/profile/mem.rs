@@ -6,10 +6,10 @@
 
 use std::borrow::ToOwned;
 use std::collections::HashMap;
+use std::fs::File;
 use std::thread;
 
-use ipc_channel::ipc::{self, IpcReceiver};
-use ipc_channel::router::ROUTER;
+use base::generic_channel::{self, GenericCallback, GenericReceiver};
 use log::debug;
 use profile_traits::mem::{
     MemoryReport, MemoryReportResult, ProfilerChan, ProfilerMsg, Report, Reporter, ReporterRequest,
@@ -18,9 +18,11 @@ use profile_traits::mem::{
 
 use crate::system_reporter;
 
+const LOG_FILE_VAR: &str = "UNTRACKED_LOG_FILE";
+
 pub struct Profiler {
     /// The port through which messages are received.
-    pub port: IpcReceiver<ProfilerMsg>,
+    pub port: GenericReceiver<ProfilerMsg>,
 
     /// Registered memory reporters.
     reporters: HashMap<String, Reporter>,
@@ -28,7 +30,11 @@ pub struct Profiler {
 
 impl Profiler {
     pub fn create() -> ProfilerChan {
-        let (chan, port) = ipc::channel().unwrap();
+        let (chan, port) = generic_channel::channel().unwrap();
+
+        if servo_allocator::is_tracking_unmeasured() && std::env::var(LOG_FILE_VAR).is_err() {
+            eprintln!("Allocation tracking is enabled but {LOG_FILE_VAR} is unset.");
+        }
 
         // Always spawn the memory profiler. If there is no timer thread it won't receive regular
         // `Print` events, but it will still receive the other events.
@@ -45,23 +51,20 @@ impl Profiler {
         // Register the system memory reporter, which will run on its own thread. It never needs to
         // be unregistered, because as long as the memory profiler is running the system memory
         // reporter can make measurements.
-        let (system_reporter_sender, system_reporter_receiver) = ipc::channel().unwrap();
-        ROUTER.add_typed_route(
-            system_reporter_receiver,
-            Box::new(|message| {
-                let request: ReporterRequest = message.unwrap();
-                system_reporter::collect_reports(request)
-            }),
-        );
+        let callback = GenericCallback::new(|message| {
+            let request: ReporterRequest = message.unwrap();
+            system_reporter::collect_reports(request)
+        })
+        .expect("Could not create system reporter callback");
         mem_profiler_chan.send(ProfilerMsg::RegisterReporter(
             "system-main".to_owned(),
-            Reporter(system_reporter_sender),
+            Reporter(callback),
         ));
 
         mem_profiler_chan
     }
 
-    pub fn new(port: IpcReceiver<ProfilerMsg>) -> Profiler {
+    pub fn new(port: GenericReceiver<ProfilerMsg>) -> Profiler {
         Profiler {
             port,
             reporters: HashMap::new(),
@@ -112,7 +115,17 @@ impl Profiler {
                     })
                     .collect();
                 let _ = sender.send(MemoryReportResult { results });
-                servo_allocator::dump_unmeasured();
+
+                if let Ok(value) = std::env::var(LOG_FILE_VAR) {
+                    match File::create(&value) {
+                        Ok(file) => {
+                            servo_allocator::dump_unmeasured(file);
+                        },
+                        Err(error) => {
+                            log::error!("Error creating log file: {error:?}");
+                        },
+                    }
+                }
                 true
             },
             ProfilerMsg::Exit => false,
@@ -124,7 +137,7 @@ impl Profiler {
         let mut result = HashMap::new();
 
         for reporter in self.reporters.values() {
-            let (chan, port) = ipc::channel().unwrap();
+            let (chan, port) = generic_channel::channel().unwrap();
             reporter.collect_reports(ReportsChan(chan));
             if let Ok(mut reports) = port.recv() {
                 result

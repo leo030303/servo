@@ -7,6 +7,8 @@
 //!
 //! <https://html.spec.whatwg.org/multipage/#textFieldSelection>
 
+use base::text::Utf8CodeUnitLength;
+
 use crate::clipboard_provider::EmbedderClipboardProvider;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HTMLFormElementBinding::SelectionMode;
@@ -16,12 +18,14 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::event::{EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::node::{Node, NodeDamage, NodeTraits};
-use crate::textinput::{SelectionDirection, SelectionState, TextInput, UTF8Bytes};
+use crate::textinput::{SelectionDirection, SelectionState, TextInput};
 
 pub(crate) trait TextControlElement: DerivedFrom<EventTarget> + DerivedFrom<Node> {
     fn selection_api_applies(&self) -> bool;
     fn has_selectable_text(&self) -> bool;
+    fn has_selection(&self) -> bool;
     fn set_dirty_value_flag(&self, value: bool);
+    fn select_all(&self);
 }
 
 pub(crate) struct TextControlSelection<'a, E: TextControlElement> {
@@ -37,9 +41,10 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
         TextControlSelection { element, textinput }
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-textarea/input-select
+    /// <https://html.spec.whatwg.org/multipage/#dom-textarea/input-select>
     pub(crate) fn dom_select(&self) {
-        // Step 1
+        // Step 1: If this element is an input element, and either select() does not apply
+        // to this element or the corresponding control has no selectable text, return.
         if !self.element.has_selectable_text() {
             return;
         }
@@ -63,7 +68,7 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
     pub(crate) fn set_dom_start(&self, start: Option<u32>) -> ErrorResult {
         // Step 1
         if !self.element.selection_api_applies() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2
@@ -96,7 +101,7 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
     pub(crate) fn set_dom_end(&self, end: Option<u32>) -> ErrorResult {
         // Step 1
         if !self.element.selection_api_applies() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2
@@ -118,7 +123,7 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
     pub(crate) fn set_dom_direction(&self, direction: Option<DOMString>) -> ErrorResult {
         // Step 1
         if !self.element.selection_api_applies() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2
@@ -140,7 +145,7 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
     ) -> ErrorResult {
         // Step 1
         if !self.element.selection_api_applies() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2
@@ -163,7 +168,7 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
     ) -> ErrorResult {
         // Step 1
         if !self.element.selection_api_applies() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2
@@ -175,14 +180,14 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
 
         // Step 4
         if start > end {
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         // Save the original selection state to later pass to set_selection_range, because we will
         // change the selection state in order to replace the text in the range.
         let original_selection_state = self.textinput.borrow().selection_state();
 
-        let UTF8Bytes(content_length) = self.textinput.borrow().len_utf8();
+        let Utf8CodeUnitLength(content_length) = self.textinput.borrow().len_utf8();
         let content_length = content_length as u32;
 
         // Step 5
@@ -268,12 +273,12 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
     }
 
     fn start(&self) -> u32 {
-        let UTF8Bytes(offset) = self.textinput.borrow().selection_start_offset();
+        let Utf8CodeUnitLength(offset) = self.textinput.borrow().selection_start_offset();
         offset as u32
     }
 
     fn end(&self) -> u32 {
-        let UTF8Bytes(offset) = self.textinput.borrow().selection_end_offset();
+        let Utf8CodeUnitLength(offset) = self.textinput.borrow().selection_end_offset();
         offset as u32
     }
 
@@ -281,7 +286,7 @@ impl<'a, E: TextControlElement> TextControlSelection<'a, E> {
         self.textinput.borrow().selection_direction()
     }
 
-    // https://html.spec.whatwg.org/multipage/#set-the-selection-range
+    /// <https://html.spec.whatwg.org/multipage/#set-the-selection-range>
     fn set_range(
         &self,
         start: Option<u32>,

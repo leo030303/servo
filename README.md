@@ -16,12 +16,10 @@ Coordination of Servo development happens:
 
 ## Getting started
 
-For more detailed build instructions, see the Servo book under [Setting up your environment], [Building Servo], [Building for Android] and [Building for OpenHarmony].
+For more detailed build instructions, see the Servo Book under [Getting the Code] and [Building Servo].
 
-[Setting up your environment]: https://book.servo.org/hacking/setting-up-your-environment.html
-[Building Servo]: https://book.servo.org/hacking/building-servo.html
-[Building for Android]: https://book.servo.org/hacking/building-for-android.html
-[Building for OpenHarmony]: https://book.servo.org/hacking/building-for-openharmony.html
+[Getting the Code]: https://book.servo.org/building/getting-the-code.html
+[Building Servo]: https://book.servo.org/building/building.html
 
 ### macOS
 
@@ -53,7 +51,6 @@ For more detailed build instructions, see the Servo book under [Setting up your 
   - **Windows 10/11 SDK (anything >= 10.0.19041.0)** (`Microsoft.VisualStudio.Component.Windows{10, 11}SDK.{>=19041}`)
   - **MSVC v143 - VS 2022 C++ x64/x86 build tools (Latest)** (`Microsoft.VisualStudio.Component.VC.Tools.x86.x64`)
   - **C++ ATL for latest v143 build tools (x86 & x64)** (`Microsoft.VisualStudio.Component.VC.ATL`)
-  - **C++ MFC for latest v143 build tools (x86 & x64)** (`Microsoft.VisualStudio.Component.VC.ATLMFC`)
 - Restart your shell to make sure `cargo` is available
 - Install the other dependencies: `.\mach bootstrap`
 - Build servoshell: `.\mach build`
@@ -62,7 +59,7 @@ For more detailed build instructions, see the Servo book under [Setting up your 
 
 - Ensure that the following environment variables are set:
   - `ANDROID_SDK_ROOT`
-  - `ANDROID_NDK_ROOT`: `$ANDROID_SDK_ROOT/ndk/26.2.11394342/`
+  - `ANDROID_NDK_ROOT`: `$ANDROID_SDK_ROOT/ndk/28.2.13676358/`
  `ANDROID_SDK_ROOT` can be any directory (such as `~/android-sdk`).
   All of the Android build dependencies will be installed there.
 - Install the latest version of the [Android command-line
@@ -73,7 +70,7 @@ For more detailed build instructions, see the Servo book under [Setting up your 
   sudo $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --install \
    "build-tools;34.0.0" \
    "emulator" \
-   "ndk;26.2.11394342" \
+   "ndk;28.2.13676358" \
    "platform-tools" \
    "platforms;android-33" \
    "system-images;android-33;google_apis;x86_64"

@@ -7,28 +7,45 @@ use std::ptr::NonNull;
 
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject, Value};
-use js::rust::HandleObject;
+use malloc_size_of::MallocSizeOf;
 use script_bindings::conversions::SafeToJSValConvertible;
 
+use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::CryptoKeyBinding::{
-    CryptoKeyMethods, KeyType, KeyUsage,
+    CryptoKeyMethods, CryptoKeyPair, KeyType, KeyUsage,
 };
 use crate::dom::bindings::reflector::{Reflector, reflect_dom_object};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::bindings::str::DOMString;
 use crate::dom::globalscope::GlobalScope;
+use crate::dom::subtlecrypto::KeyAlgorithmAndDerivatives;
 use crate::script_runtime::{CanGc, JSContext};
 
+pub(crate) enum CryptoKeyOrCryptoKeyPair {
+    CryptoKey(DomRoot<CryptoKey>),
+    CryptoKeyPair(CryptoKeyPair),
+}
+
 /// The underlying cryptographic data this key represents
-#[allow(dead_code)]
-#[derive(MallocSizeOf)]
 pub(crate) enum Handle {
+    RsaPrivateKey(rsa::RsaPrivateKey),
+    RsaPublicKey(rsa::RsaPublicKey),
+    P256PrivateKey(p256::SecretKey),
+    P384PrivateKey(p384::SecretKey),
+    P521PrivateKey(p521::SecretKey),
+    P256PublicKey(p256::PublicKey),
+    P384PublicKey(p384::PublicKey),
+    P521PublicKey(p521::PublicKey),
+    X25519PrivateKey(x25519_dalek::StaticSecret),
+    X25519PublicKey(x25519_dalek::PublicKey),
     Aes128(Vec<u8>),
     Aes192(Vec<u8>),
     Aes256(Vec<u8>),
+    HkdfSecret(Vec<u8>),
     Pbkdf2(Vec<u8>),
-    Hkdf(Vec<u8>),
     Hmac(Vec<u8>),
+    Ed25519(Vec<u8>),
+    ChaCha20Poly1305Key(chacha20poly1305::Key),
+    Argon2Password(Vec<u8>),
 }
 
 /// <https://w3c.github.io/webcrypto/#cryptokey-interface>
@@ -36,25 +53,33 @@ pub(crate) enum Handle {
 pub(crate) struct CryptoKey {
     reflector_: Reflector,
 
-    /// <https://w3c.github.io/webcrypto/#dom-cryptokey-type>
+    /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-type>
     key_type: KeyType,
 
-    /// <https://w3c.github.io/webcrypto/#dom-cryptokey-extractable>
+    /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-extractable>
     extractable: Cell<bool>,
 
-    /// The name of the algorithm used
+    /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-algorithm>
     ///
-    /// This is always the same as the `name` of the
-    /// [`[[algorithm]]`](https://w3c.github.io/webcrypto/#dom-cryptokey-algorithm)
-    /// internal slot, but we store it here again for convenience
-    algorithm: DOMString,
+    /// The contents of the [[algorithm]] internal slot shall be, or be derived from, a
+    /// KeyAlgorithm.
+    #[no_trace]
+    algorithm: KeyAlgorithmAndDerivatives,
 
-    /// <https://w3c.github.io/webcrypto/#dom-cryptokey-algorithm>
+    /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-algorithm_cached>
     #[ignore_malloc_size_of = "Defined in mozjs"]
-    algorithm_object: Heap<*mut JSObject>,
+    algorithm_cached: Heap<*mut JSObject>,
 
-    /// <https://w3c.github.io/webcrypto/#dom-cryptokey-usages>
-    usages: Vec<KeyUsage>,
+    /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-usages>
+    ///
+    /// The contents of the [[usages]] internal slot shall be of type Sequence<KeyUsage>.
+    usages: DomRefCell<Vec<KeyUsage>>,
+
+    /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-usages_cached>
+    #[ignore_malloc_size_of = "Defined in mozjs"]
+    usages_cached: Heap<*mut JSObject>,
+
+    /// <https://w3c.github.io/webcrypto/#dfn-CryptoKey-slot-handle>
     #[no_trace]
     handle: Handle,
 }
@@ -63,8 +88,8 @@ impl CryptoKey {
     fn new_inherited(
         key_type: KeyType,
         extractable: bool,
+        algorithm: KeyAlgorithmAndDerivatives,
         usages: Vec<KeyUsage>,
-        algorithm: DOMString,
         handle: Handle,
     ) -> CryptoKey {
         CryptoKey {
@@ -72,74 +97,105 @@ impl CryptoKey {
             key_type,
             extractable: Cell::new(extractable),
             algorithm,
-            algorithm_object: Heap::default(),
-            usages,
+            algorithm_cached: Heap::default(),
+            usages: DomRefCell::new(usages),
+            usages_cached: Heap::default(),
             handle,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         global: &GlobalScope,
         key_type: KeyType,
         extractable: bool,
-        algorithm: DOMString,
-        algorithm_object: HandleObject,
+        algorithm: KeyAlgorithmAndDerivatives,
         usages: Vec<KeyUsage>,
         handle: Handle,
         can_gc: CanGc,
     ) -> DomRoot<CryptoKey> {
-        let object = reflect_dom_object(
+        let crypto_key = reflect_dom_object(
             Box::new(CryptoKey::new_inherited(
                 key_type,
                 extractable,
-                usages,
-                algorithm,
+                algorithm.clone(),
+                usages.clone(),
                 handle,
             )),
             global,
             can_gc,
         );
 
-        object.algorithm_object.set(algorithm_object.get());
+        let cx = GlobalScope::get_cx();
 
-        object
+        // Create and store a cached object of algorithm
+        rooted!(in(*cx) let mut algorithm_object_value: Value);
+        algorithm.safe_to_jsval(cx, algorithm_object_value.handle_mut(), can_gc);
+        crypto_key
+            .algorithm_cached
+            .set(algorithm_object_value.to_object());
+
+        // Create and store a cached object of usages
+        rooted!(in(*cx) let mut usages_object_value: Value);
+        usages.safe_to_jsval(cx, usages_object_value.handle_mut(), can_gc);
+        crypto_key
+            .usages_cached
+            .set(usages_object_value.to_object());
+
+        crypto_key
     }
 
-    pub(crate) fn algorithm(&self) -> String {
-        self.algorithm.to_string()
+    pub(crate) fn algorithm(&self) -> &KeyAlgorithmAndDerivatives {
+        &self.algorithm
     }
 
-    pub(crate) fn usages(&self) -> &[KeyUsage] {
-        &self.usages
+    pub(crate) fn usages(&self) -> Vec<KeyUsage> {
+        self.usages.borrow().clone()
     }
 
     pub(crate) fn handle(&self) -> &Handle {
         &self.handle
+    }
+
+    pub(crate) fn set_extractable(&self, extractable: bool) {
+        self.extractable.set(extractable);
+    }
+
+    pub(crate) fn set_usages(&self, usages: &[KeyUsage]) {
+        *self.usages.borrow_mut() = usages.to_owned();
+
+        // Create and store a cached object of usages
+        let cx = GlobalScope::get_cx();
+        rooted!(in(*cx) let mut usages_object_value: Value);
+        usages.safe_to_jsval(cx, usages_object_value.handle_mut(), CanGc::note());
+        self.usages_cached.set(usages_object_value.to_object());
     }
 }
 
 impl CryptoKeyMethods<crate::DomTypeHolder> for CryptoKey {
     /// <https://w3c.github.io/webcrypto/#dom-cryptokey-type>
     fn Type(&self) -> KeyType {
+        // Reflects the [[type]] internal slot, which contains the type of the underlying key.
         self.key_type
     }
 
     /// <https://w3c.github.io/webcrypto/#dom-cryptokey-extractable>
     fn Extractable(&self) -> bool {
+        // Reflects the [[extractable]] internal slot, which indicates whether or not the raw
+        // keying material may be exported by the application.
         self.extractable.get()
     }
 
     /// <https://w3c.github.io/webcrypto/#dom-cryptokey-algorithm>
     fn Algorithm(&self, _cx: JSContext) -> NonNull<JSObject> {
-        NonNull::new(self.algorithm_object.get()).unwrap()
+        // Returns the cached ECMAScript object associated with the [[algorithm]] internal slot.
+        NonNull::new(self.algorithm_cached.get()).unwrap()
     }
 
     /// <https://w3c.github.io/webcrypto/#dom-cryptokey-usages>
-    fn Usages(&self, cx: JSContext) -> NonNull<JSObject> {
-        rooted!(in(*cx) let mut usages: Value);
-        self.usages.safe_to_jsval(cx, usages.handle_mut());
-        NonNull::new(usages.to_object()).unwrap()
+    fn Usages(&self, _cx: JSContext) -> NonNull<JSObject> {
+        // Returns the cached ECMAScript object associated with the [[usages]] internal slot, which
+        // indicates which cryptographic operations are permissible to be used with this key.
+        NonNull::new(self.usages_cached.get()).unwrap()
     }
 }
 
@@ -150,8 +206,35 @@ impl Handle {
             Self::Aes192(bytes) => bytes,
             Self::Aes256(bytes) => bytes,
             Self::Pbkdf2(bytes) => bytes,
-            Self::Hkdf(bytes) => bytes,
             Self::Hmac(bytes) => bytes,
+            Self::Ed25519(bytes) => bytes,
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl MallocSizeOf for Handle {
+    fn size_of(&self, ops: &mut malloc_size_of::MallocSizeOfOps) -> usize {
+        match self {
+            Handle::RsaPrivateKey(private_key) => private_key.size_of(ops),
+            Handle::RsaPublicKey(public_key) => public_key.size_of(ops),
+            Handle::P256PrivateKey(private_key) => private_key.size_of(ops),
+            Handle::P384PrivateKey(private_key) => private_key.size_of(ops),
+            Handle::P521PrivateKey(private_key) => private_key.size_of(ops),
+            Handle::P256PublicKey(public_key) => public_key.size_of(ops),
+            Handle::P384PublicKey(public_key) => public_key.size_of(ops),
+            Handle::P521PublicKey(public_key) => public_key.size_of(ops),
+            Handle::X25519PrivateKey(private_key) => private_key.size_of(ops),
+            Handle::X25519PublicKey(public_key) => public_key.size_of(ops),
+            Handle::Aes128(bytes) => bytes.size_of(ops),
+            Handle::Aes192(bytes) => bytes.size_of(ops),
+            Handle::Aes256(bytes) => bytes.size_of(ops),
+            Handle::HkdfSecret(secret) => secret.size_of(ops),
+            Handle::Pbkdf2(bytes) => bytes.size_of(ops),
+            Handle::Hmac(bytes) => bytes.size_of(ops),
+            Handle::Ed25519(bytes) => bytes.size_of(ops),
+            Handle::ChaCha20Poly1305Key(key) => key.size_of(ops),
+            Handle::Argon2Password(password) => password.size_of(ops),
         }
     }
 }

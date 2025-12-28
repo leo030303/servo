@@ -62,6 +62,10 @@ impl Location {
     }
 
     /// Navigate the relevant `Document`'s browsing context.
+    ///
+    /// This is ostensibly an implementation of
+    /// <https://html.spec.whatwg.org/multipage/#navigate>, but the specification has
+    /// greatly deviated from our code.
     pub(crate) fn navigate(
         &self,
         url: ServoUrl,
@@ -127,6 +131,7 @@ impl Location {
             None, // Top navigation doesn't inherit secure context
             Some(source_document.insecure_requests_policy()),
             source_document.has_trustworthy_ancestor_origin(),
+            source_document.creation_sandboxing_flag_set_considering_parent_iframe(),
         );
         self.window
             .load_url(history_handling, reload_triggered, load_data, can_gc);
@@ -146,7 +151,7 @@ impl Location {
     }
 
     /// Get this `Location` object's [relevant `Document`][1], or
-    /// `Err(Error::Security)` if it's non-null and its origin is not same
+    /// `Err(Error::Security(None))` if it's non-null and its origin is not same
     /// origin-domain with the entry setting object's origin.
     ///
     /// In the specification's terms:
@@ -185,7 +190,7 @@ impl Location {
             }) {
                 Ok(Some(document))
             } else {
-                Err(Error::Security)
+                Err(Error::Security(None))
             }
         } else {
             // The browsing context is null
@@ -194,7 +199,7 @@ impl Location {
     }
 
     /// Get this `Location` object's [relevant url][1] or
-    /// `Err(Error::Security)` if the [relevant `Document`][2] if it's non-null
+    /// `Err(Error::Security(None))` if the [relevant `Document`][2] if it's non-null
     /// and its origin is not same origin-domain with the entry setting object's
     /// origin.
     ///
@@ -258,14 +263,14 @@ impl Location {
         );
     }
 
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) fn origin(&self) -> &MutableOrigin {
         self.window.origin()
     }
 }
 
 impl LocationMethods<crate::DomTypeHolder> for Location {
-    // https://html.spec.whatwg.org/multipage/#dom-location-assign
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-assign>
     fn Assign(&self, url: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |_copy_url| {
@@ -274,7 +279,7 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
                 let base_url = self.entry_settings_object().api_base_url();
                 let url = match base_url.join(&url.0) {
                     Ok(url) => url,
-                    Err(_) => return Err(Error::Syntax),
+                    Err(_) => return Err(Error::Syntax(None)),
                 };
 
                 Ok(Some(url))
@@ -283,7 +288,7 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-reload
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-reload>
     fn Reload(&self, can_gc: CanGc) -> ErrorResult {
         let url = self.get_url_if_same_origin()?;
         self.navigate(
@@ -295,7 +300,7 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-replace
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-replace>
     fn Replace(&self, url: USVString, can_gc: CanGc) -> ErrorResult {
         // Step 1: If this Location object's relevant Document is null, then return.
         if self.has_document() {
@@ -304,7 +309,7 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
             let base_url = self.entry_settings_object().api_base_url();
             let url = match base_url.join(&url.0) {
                 Ok(url) => url,
-                Err(_) => return Err(Error::Syntax),
+                Err(_) => return Err(Error::Syntax(None)),
             };
             // Step 3: Location-object navigate to the resulting URL record with
             // the replacement flag set.
@@ -318,12 +323,12 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-hash
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-hash>
     fn GetHash(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Hash(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-hash
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-hash>
     fn SetHash(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |mut copy_url| {
@@ -349,12 +354,12 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-host
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-host>
     fn GetHost(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Host(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-host
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-host>
     fn SetHost(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |mut copy_url| {
@@ -373,17 +378,17 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-origin
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-origin>
     fn GetOrigin(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Origin(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-hostname
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-hostname>
     fn GetHostname(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Hostname(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-hostname
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-hostname>
     fn SetHostname(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |mut copy_url| {
@@ -402,24 +407,24 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-href
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-href>
     fn GetHref(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Href(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-href
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-href>
     fn SetHref(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         // Step 1: If this Location object's relevant Document is null, then return.
         if self.has_document() {
             // Note: no call to self.check_same_origin_domain()
-            // Step 2: Parse the given value relative to the entry settings object.
-            // If that failed, throw a TypeError exception.
+            // Step 2: Let url be the result of encoding-parsing a URL given the given value, relative to the entry settings object.
+            // Step 3: If url is failure, then throw a "SyntaxError" DOMException.
             let base_url = self.entry_settings_object().api_base_url();
             let url = match base_url.join(&value.0) {
                 Ok(url) => url,
-                Err(e) => return Err(Error::Type(format!("Couldn't parse URL: {}", e))),
+                Err(e) => return Err(Error::Syntax(Some(format!("Couldn't parse URL: {}", e)))),
             };
-            // Step 3: Location-object navigate to the resulting URL record.
+            // Step 4: Location-object navigate this to url.
             self.navigate(
                 url,
                 NavigationHistoryBehavior::Push,
@@ -430,12 +435,12 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         Ok(())
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-pathname
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-pathname>
     fn GetPathname(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Pathname(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-pathname
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-pathname>
     fn SetPathname(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |mut copy_url| {
@@ -455,12 +460,12 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-port
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-port>
     fn GetPort(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Port(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-port
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-port>
     fn SetPort(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |mut copy_url| {
@@ -485,12 +490,12 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-protocol
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-protocol>
     fn GetProtocol(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Protocol(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-protocol
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-protocol>
     fn SetProtocol(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |mut copy_url| {
@@ -504,7 +509,7 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
 
                 if copy_url.as_mut_url().set_scheme(scheme).is_err() {
                     // Step 5: If possibleFailure is failure, then throw a "SyntaxError" DOMException.
-                    return Err(Error::Syntax);
+                    return Err(Error::Syntax(None));
                 }
 
                 // Step 6: If copyURL's scheme is not an HTTP(S) scheme, then terminate these steps.
@@ -520,12 +525,12 @@ impl LocationMethods<crate::DomTypeHolder> for Location {
         )
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-search
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-search>
     fn GetSearch(&self) -> Fallible<USVString> {
         Ok(UrlHelper::Search(&self.get_url_if_same_origin()?))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-location-search
+    /// <https://html.spec.whatwg.org/multipage/#dom-location-search>
     fn SetSearch(&self, value: USVString, can_gc: CanGc) -> ErrorResult {
         self.setter_common(
             |mut copy_url| {

@@ -14,8 +14,9 @@ use fonts::{
     PlatformFontMethods, ShapingFlags, ShapingOptions,
 };
 use servo_url::ServoUrl;
+use style::computed_values::font_optical_sizing::T as FontOpticalSizing;
 use style::properties::longhands::font_variant_caps::computed_value::T as FontVariantCaps;
-use style::values::computed::{FontStretch, FontStyle, FontWeight};
+use style::values::computed::{FontStretch, FontStyle, FontSynthesis, FontWeight};
 use unicode_script::Script;
 
 fn make_font(path: PathBuf) -> Font {
@@ -27,13 +28,10 @@ fn make_font(path: PathBuf) -> Font {
     let data = FontData::from_bytes(&bytes);
 
     let identifier = FontIdentifier::Web(ServoUrl::from_file_path(path).unwrap());
-    let platform_font = PlatformFont::new_from_data(identifier.clone(), &data, None, &[]).unwrap();
+    let platform_font =
+        PlatformFont::new_from_data(identifier.clone(), &data, None, &[], false).unwrap();
 
-    let template = FontTemplate {
-        identifier,
-        descriptor: platform_font.descriptor(),
-        stylesheet: None,
-    };
+    let template = FontTemplate::new(identifier, platform_font.descriptor(), None, None);
     let descriptor = FontDescriptor {
         weight: FontWeight::normal(),
         stretch: FontStretch::hundred(),
@@ -41,6 +39,8 @@ fn make_font(path: PathBuf) -> Font {
         variant: FontVariantCaps::Normal,
         pt_size: Au::from_px(24),
         variation_settings: vec![],
+        synthesis_weight: FontSynthesis::Auto,
+        optical_sizing: FontOpticalSizing::Auto,
     };
     Font::new(FontTemplateRef::new(template), descriptor, Some(data), None).unwrap()
 }

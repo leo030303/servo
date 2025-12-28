@@ -2,12 +2,11 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
-
 use base::id::{DomPointId, DomPointIndex};
 use constellation_traits::DomPoint;
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use rustc_hash::FxHashMap;
 
 use crate::dom::bindings::codegen::Bindings::DOMPointBinding::{DOMPointInit, DOMPointMethods};
 use crate::dom::bindings::codegen::Bindings::DOMPointReadOnlyBinding::DOMPointReadOnlyMethods;
@@ -26,7 +25,6 @@ pub(crate) struct DOMPoint {
     point: DOMPointReadOnly,
 }
 
-#[allow(non_snake_case)]
 impl DOMPoint {
     fn new_inherited(x: f64, y: f64, z: f64, w: f64) -> DOMPoint {
         DOMPoint {
@@ -72,7 +70,7 @@ impl DOMPoint {
 }
 
 impl DOMPointMethods<crate::DomTypeHolder> for DOMPoint {
-    // https://drafts.fxtf.org/geometry/#dom-dompointreadonly-dompointreadonly
+    /// <https://drafts.fxtf.org/geometry/#dom-dompointreadonly-dompointreadonly>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -85,47 +83,47 @@ impl DOMPointMethods<crate::DomTypeHolder> for DOMPoint {
         Ok(DOMPoint::new_with_proto(global, proto, x, y, z, w, can_gc))
     }
 
-    // https://drafts.fxtf.org/geometry/#dom-dompoint-frompoint
+    /// <https://drafts.fxtf.org/geometry/#dom-dompoint-frompoint>
     fn FromPoint(global: &GlobalScope, init: &DOMPointInit, can_gc: CanGc) -> DomRoot<Self> {
         Self::new_from_init(global, init, can_gc)
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-x
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-x>
     fn X(&self) -> f64 {
         self.point.X()
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-x
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-x>
     fn SetX(&self, value: f64) {
         self.point.SetX(value);
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-y
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-y>
     fn Y(&self) -> f64 {
         self.point.Y()
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-y
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-y>
     fn SetY(&self, value: f64) {
         self.point.SetY(value);
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-z
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-z>
     fn Z(&self) -> f64 {
         self.point.Z()
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-z
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-z>
     fn SetZ(&self, value: f64) {
         self.point.SetZ(value);
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-w
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-w>
     fn W(&self) -> f64 {
         self.point.W()
     }
 
-    // https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-w
+    /// <https://dev.w3.org/fxtf/geometry/Overview.html#dom-dompointreadonly-w>
     fn SetW(&self, value: f64) {
         self.point.SetW(value);
     }
@@ -165,7 +163,7 @@ impl Serializable for DOMPoint {
 
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<DomPointId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<DomPointId, Self::Data>> {
         match data {
             StructuredData::Reader(reader) => &mut reader.points,
             StructuredData::Writer(writer) => &mut writer.points,

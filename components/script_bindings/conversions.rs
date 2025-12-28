@@ -31,18 +31,18 @@ use crate::inheritance::Castable;
 use crate::num::Finite;
 use crate::reflector::{DomObject, Reflector};
 use crate::root::DomRoot;
-use crate::script_runtime::JSContext as SafeJSContext;
+use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 use crate::str::{ByteString, DOMString, USVString};
 use crate::trace::RootedTraceableBox;
 use crate::utils::{DOMClass, DOMJSClass};
 
 /// A safe wrapper for `ToJSValConvertible`.
 pub trait SafeToJSValConvertible {
-    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue);
+    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue, can_gc: CanGc);
 }
 
 impl<T: ToJSValConvertible + ?Sized> SafeToJSValConvertible for T {
-    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue) {
+    fn safe_to_jsval(&self, cx: SafeJSContext, rval: MutableHandleValue, _can_gc: CanGc) {
         unsafe { self.to_jsval(*cx, rval) };
     }
 }
@@ -72,13 +72,6 @@ pub enum StringificationBehavior {
     Empty,
 }
 
-// https://heycam.github.io/webidl/#es-DOMString
-impl ToJSValConvertible for DOMString {
-    unsafe fn to_jsval(&self, cx: *mut JSContext, rval: MutableHandleValue) {
-        (**self).to_jsval(cx, rval);
-    }
-}
-
 /// A safe wrapper for `FromJSValConvertible`.
 pub trait SafeFromJSValConvertible: Sized {
     type Config;
@@ -88,6 +81,7 @@ pub trait SafeFromJSValConvertible: Sized {
         cx: SafeJSContext,
         value: HandleValue,
         option: Self::Config,
+        _can_gc: CanGc,
     ) -> Result<ConversionResult<Self>, ()>;
 }
 
@@ -98,6 +92,7 @@ impl<T: FromJSValConvertible> SafeFromJSValConvertible for T {
         cx: SafeJSContext,
         value: HandleValue,
         option: Self::Config,
+        _can_gc: CanGc,
     ) -> Result<ConversionResult<Self>, ()> {
         unsafe { T::from_jsval(*cx, value, option) }
     }
@@ -114,14 +109,9 @@ impl FromJSValConvertible for DOMString {
         if null_behavior == StringificationBehavior::Empty && value.get().is_null() {
             Ok(ConversionResult::Success(DOMString::new()))
         } else {
-            match ptr::NonNull::new(ToString(cx, value)) {
-                Some(jsstr) => Ok(ConversionResult::Success(DOMString::from_string(
-                    jsstr_to_string(cx, jsstr),
-                ))),
-                None => {
-                    debug!("ToString failed");
-                    Err(())
-                },
+            match DOMString::from_js_string(unsafe { SafeJSContext::from_ptr(cx) }, value) {
+                Ok(domstring) => Ok(ConversionResult::Success(domstring)),
+                Err(_) => Err(()),
             }
         }
     }
@@ -229,10 +219,12 @@ impl<T: DomObject + IDLInterface> FromJSValConvertible for DomRoot<T> {
         value: HandleValue,
         _config: Self::Config,
     ) -> Result<ConversionResult<DomRoot<T>>, ()> {
-        Ok(match root_from_handlevalue(value, cx) {
-            Ok(result) => ConversionResult::Success(result),
-            Err(()) => ConversionResult::Failure("value is not an object".into()),
-        })
+        Ok(
+            match root_from_handlevalue(value, SafeJSContext::from_ptr(cx)) {
+                Ok(result) => ConversionResult::Success(result),
+                Err(()) => ConversionResult::Failure("value is not an object".into()),
+            },
+        )
     }
 }
 
@@ -398,14 +390,17 @@ where
 /// # Safety
 /// cx must point to a valid, non-null JS context.
 #[allow(clippy::result_unit_err)]
-pub unsafe fn root_from_handlevalue<T>(v: HandleValue, cx: *mut JSContext) -> Result<DomRoot<T>, ()>
+pub fn root_from_handlevalue<T>(v: HandleValue, cx: SafeJSContext) -> Result<DomRoot<T>, ()>
 where
     T: DomObject + IDLInterface,
 {
     if !v.get().is_object() {
         return Err(());
     }
-    root_from_object(v.get().to_object(), cx)
+    #[expect(unsafe_code)]
+    unsafe {
+        root_from_object(v.get().to_object(), *cx)
+    }
 }
 
 /// Convert `id` to a `DOMString`. Returns `None` if `id` is not a string or
@@ -503,14 +498,18 @@ where
 /// # Safety
 /// `cx` must point to a valid, non-null JSContext.
 #[allow(clippy::result_unit_err)]
-pub unsafe fn native_from_handlevalue<T>(v: HandleValue, cx: *mut JSContext) -> Result<*const T, ()>
+pub fn native_from_handlevalue<T>(v: HandleValue, cx: SafeJSContext) -> Result<*const T, ()>
 where
     T: DomObject + IDLInterface,
 {
     if !v.get().is_object() {
         return Err(());
     }
-    native_from_object(v.get().to_object(), cx)
+
+    #[expect(unsafe_code)]
+    unsafe {
+        native_from_object(v.get().to_object(), *cx)
+    }
 }
 
 impl<T: ToJSValConvertible + JSTraceable> ToJSValConvertible for RootedTraceableBox<T> {
@@ -587,7 +586,7 @@ pub unsafe fn is_array_like<D: crate::DomTypes>(cx: *mut JSContext, value: Handl
 /// Caller is responsible for throwing a JS exception if needed in case of error.
 pub(crate) unsafe fn windowproxy_from_handlevalue<D: crate::DomTypes>(
     v: HandleValue,
-    _cx: *mut JSContext,
+    _cx: SafeJSContext,
 ) -> Result<DomRoot<D::WindowProxy>, ()> {
     if !v.get().is_object() {
         return Err(());

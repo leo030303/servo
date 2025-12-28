@@ -6,11 +6,13 @@
 //! (usually from the ScriptThread, and more specifically from DOM objects)
 
 use arrayvec::ArrayVec;
+use base::Epoch;
 use base::id::PipelineId;
 use ipc_channel::ipc::{IpcSender, IpcSharedMemory};
-use pixels::IpcSnapshot;
+use pixels::SharedSnapshot;
 use serde::{Deserialize, Serialize};
 use webrender_api::ImageKey;
+use webrender_api::euclid::default::Size2D;
 use webrender_api::units::DeviceIntSize;
 use wgpu_core::Label;
 use wgpu_core::binding_model::{
@@ -52,7 +54,18 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize, Serialize)]
+pub struct PendingTexture {
+    pub texture_id: TextureId,
+    pub encoder_id: CommandEncoderId,
+    pub configuration: ContextConfiguration,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 pub enum WebGPURequest {
+    SetImageKey {
+        context_id: WebGPUContextId,
+        image_key: ImageKey,
+    },
     BufferMapAsync {
         sender: IpcSender<Result<Mapping, BufferAccessError>>,
         buffer_id: BufferId,
@@ -149,24 +162,21 @@ pub enum WebGPURequest {
     CreateContext {
         buffer_ids: ArrayVec<BufferId, PRESENTATION_BUFFER_COUNT>,
         size: DeviceIntSize,
-        sender: IpcSender<(WebGPUContextId, ImageKey)>,
+        sender: IpcSender<WebGPUContextId>,
     },
-    /// Recreates swapchain (if needed)
-    UpdateContext {
+    /// Present texture to WebRender
+    Present {
         context_id: WebGPUContextId,
-        size: DeviceIntSize,
-        configuration: Option<ContextConfiguration>,
+        pending_texture: Option<PendingTexture>,
+        size: Size2D<u32>,
+        canvas_epoch: Epoch,
     },
-    /// Reads texture to swapchains buffer and maps it
-    SwapChainPresent {
-        context_id: WebGPUContextId,
-        texture_id: TextureId,
-        encoder_id: CommandEncoderId,
-    },
-    /// Obtains image from latest presentation buffer (same as wr update)
+    /// Create [`pixels::Snapshot`] with contents of the last present operation
+    /// or provided pending texture and send it over provided [`IpcSender`].
     GetImage {
         context_id: WebGPUContextId,
-        sender: IpcSender<IpcSnapshot>,
+        pending_texture: Option<PendingTexture>,
+        sender: IpcSender<SharedSnapshot>,
     },
     ValidateTextureDescriptor {
         device_id: DeviceId,

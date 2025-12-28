@@ -9,50 +9,58 @@ use std::mem;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use constellation_traits::ScriptToConstellationMessage;
+use constellation_traits::{KeyboardScroll, ScriptToConstellationMessage};
 use embedder_traits::{
-    Cursor, EditingActionEvent, EmbedderMsg, GamepadEvent as EmbedderGamepadEvent,
-    GamepadSupportedHapticEffects, GamepadUpdateType, ImeEvent, InputEvent,
-    KeyboardEvent as EmbedderKeyboardEvent, MouseButton, MouseButtonAction, MouseButtonEvent,
-    MouseLeftViewportEvent, ScrollEvent, TouchEvent as EmbedderTouchEvent, TouchEventType, TouchId,
-    UntrustedNodeAddress, WheelEvent as EmbedderWheelEvent,
+    Cursor, EditingActionEvent, EmbedderMsg, ImeEvent, InputEvent, InputEventAndId,
+    InputEventResult, KeyboardEvent as EmbedderKeyboardEvent, MouseButton, MouseButtonAction,
+    MouseButtonEvent, MouseLeftViewportEvent, ScrollEvent, TouchEvent as EmbedderTouchEvent,
+    TouchEventType, TouchId, UntrustedNodeAddress, WheelEvent as EmbedderWheelEvent,
 };
-use euclid::Point2D;
+#[cfg(feature = "gamepad")]
+use embedder_traits::{
+    GamepadEvent as EmbedderGamepadEvent, GamepadSupportedHapticEffects, GamepadUpdateType,
+};
+use euclid::{Point2D, Vector2D};
 use ipc_channel::ipc;
+use js::jsapi::JSAutoRealm;
 use keyboard_types::{Code, Key, KeyState, Modifiers, NamedKey};
-use layout_api::node_id_from_scroll_id;
+use layout_api::{ScrollContainerQueryFlags, node_id_from_scroll_id};
 use script_bindings::codegen::GenericBindings::DocumentBinding::DocumentMethods;
 use script_bindings::codegen::GenericBindings::EventBinding::EventMethods;
 use script_bindings::codegen::GenericBindings::NavigatorBinding::NavigatorMethods;
 use script_bindings::codegen::GenericBindings::NodeBinding::NodeMethods;
 use script_bindings::codegen::GenericBindings::PerformanceBinding::PerformanceMethods;
 use script_bindings::codegen::GenericBindings::TouchBinding::TouchMethods;
-use script_bindings::codegen::GenericBindings::WindowBinding::WindowMethods;
+use script_bindings::codegen::GenericBindings::WindowBinding::{ScrollBehavior, WindowMethods};
 use script_bindings::inheritance::Castable;
+use script_bindings::match_domstring_ascii;
 use script_bindings::num::Finite;
+use script_bindings::reflector::DomObject;
 use script_bindings::root::{Dom, DomRoot, DomSlice};
 use script_bindings::script_runtime::CanGc;
 use script_bindings::str::DOMString;
 use script_traits::ConstellationInputEvent;
 use servo_config::pref;
 use style_traits::CSSPixel;
-use xml5ever::{local_name, ns};
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::root::MutNullableDom;
 use crate::dom::clipboardevent::ClipboardEventType;
-use crate::dom::document::{FireMouseEventType, FocusInitiator, TouchEventResult};
-use crate::dom::event::{EventBubbles, EventCancelable, EventDefault};
-use crate::dom::gamepad::contains_user_gesture;
-use crate::dom::gamepadevent::GamepadEventType;
+use crate::dom::document::{FireMouseEventType, FocusInitiator};
+use crate::dom::event::{EventBubbles, EventCancelable, EventComposed, EventFlags};
+#[cfg(feature = "gamepad")]
+use crate::dom::gamepad::gamepad::{Gamepad, contains_user_gesture};
+#[cfg(feature = "gamepad")]
+use crate::dom::gamepad::gamepadevent::GamepadEventType;
 use crate::dom::inputevent::HitTestResult;
-use crate::dom::node::{self, Node, ShadowIncluding};
+use crate::dom::node::{self, Node, NodeTraits, ShadowIncluding};
 use crate::dom::pointerevent::PointerId;
+use crate::dom::scrolling_box::ScrollingBoxAxis;
 use crate::dom::types::{
-    ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, Gamepad,
-    GlobalScope, HTMLAnchorElement, KeyboardEvent, MouseEvent, PointerEvent, Touch, TouchEvent,
-    TouchList, WheelEvent, Window,
+    ClipboardEvent, CompositionEvent, DataTransfer, Element, Event, EventTarget, GlobalScope,
+    HTMLAnchorElement, KeyboardEvent, MouseEvent, PointerEvent, Touch, TouchEvent, TouchList,
+    WheelEvent, Window,
 };
 use crate::drag_data_store::{DragDataStore, Kind, Mode};
 use crate::realms::enter_realm;
@@ -67,16 +75,20 @@ pub(crate) struct DocumentEventHandler {
     window: Dom<Window>,
     /// Pending input events, to be handled at the next rendering opportunity.
     #[no_trace]
-    #[ignore_malloc_size_of = "CompositorEvent contains data from outside crates"]
+    #[ignore_malloc_size_of = "InputEvent contains data from outside crates"]
     pending_input_events: DomRefCell<Vec<ConstellationInputEvent>>,
-    /// The index of the last mouse move event in the pending compositor events queue.
+    /// The index of the last mouse move event in the pending input events queue.
     mouse_move_event_index: DomRefCell<Option<usize>>,
     /// <https://w3c.github.io/uievents/#event-type-dblclick>
     #[ignore_malloc_size_of = "Defined in std"]
     #[no_trace]
     last_click_info: DomRefCell<Option<(Instant, Point2D<f32, CSSPixel>)>>,
+    #[no_trace]
+    last_mouse_button_down_point: Cell<Option<Point2D<f32, CSSPixel>>>,
     /// The element that is currently hovered by the cursor.
     current_hover_target: MutNullableDom<Element>,
+    /// The element that was most recently clicked.
+    most_recently_clicked_element: MutNullableDom<Element>,
     /// The most recent mouse movement point, used for processing `mouseleave` events.
     #[no_trace]
     most_recent_mousemove_point: Cell<Option<Point2D<f32, CSSPixel>>>,
@@ -98,7 +110,9 @@ impl DocumentEventHandler {
             pending_input_events: Default::default(),
             mouse_move_event_index: Default::default(),
             last_click_info: Default::default(),
+            last_mouse_button_down_point: Default::default(),
             current_hover_target: Default::default(),
+            most_recently_clicked_element: Default::default(),
             most_recent_mousemove_point: Default::default(),
             current_cursor: Default::default(),
             active_touch_points: Default::default(),
@@ -106,24 +120,24 @@ impl DocumentEventHandler {
         }
     }
 
-    /// Note a pending compositor event, to be processed at the next `update_the_rendering` task.
+    /// Note a pending input event, to be processed at the next `update_the_rendering` task.
     pub(crate) fn note_pending_input_event(&self, event: ConstellationInputEvent) {
-        let mut pending_compositor_events = self.pending_input_events.borrow_mut();
-        if matches!(event.event, InputEvent::MouseMove(..)) {
+        let mut pending_input_events = self.pending_input_events.borrow_mut();
+        if matches!(event.event.event, InputEvent::MouseMove(..)) {
             // First try to replace any existing mouse move event.
             if let Some(mouse_move_event) = self
                 .mouse_move_event_index
                 .borrow()
-                .and_then(|index| pending_compositor_events.get_mut(index))
+                .and_then(|index| pending_input_events.get_mut(index))
             {
                 *mouse_move_event = event;
                 return;
             }
 
-            *self.mouse_move_event_index.borrow_mut() = Some(pending_compositor_events.len());
+            *self.mouse_move_event_index.borrow_mut() = Some(pending_input_events.len());
         }
 
-        pending_compositor_events.push(event);
+        pending_input_events.push(event);
     }
 
     /// Whether or not this [`Document`] has any pending input events to be processed during
@@ -158,49 +172,60 @@ impl DocumentEventHandler {
             self.active_keyboard_modifiers
                 .set(event.active_keyboard_modifiers);
 
-            match event.event.clone() {
+            // TODO: For some of these we still aren't properly calculating whether or not
+            // the event was handled or if `preventDefault()` was called on it. Each of
+            // these cases needs to be examined and some of them either fire more than one
+            // event or fire events later. We have to make a good decision about what to
+            // return to the embedder when that happens.
+            let result = match event.event.event.clone() {
                 InputEvent::MouseButton(mouse_button_event) => {
                     self.handle_native_mouse_button_event(mouse_button_event, &event, can_gc);
+                    InputEventResult::default()
                 },
                 InputEvent::MouseMove(_) => {
                     self.handle_native_mouse_move_event(&event, can_gc);
+                    InputEventResult::default()
                 },
                 InputEvent::MouseLeftViewport(mouse_leave_event) => {
                     self.handle_mouse_left_viewport_event(&event, &mouse_leave_event, can_gc);
+                    InputEventResult::default()
                 },
                 InputEvent::Touch(touch_event) => {
-                    self.handle_touch_event(touch_event, &event, can_gc);
+                    self.handle_touch_event(touch_event, &event, can_gc)
                 },
                 InputEvent::Wheel(wheel_event) => {
-                    self.handle_wheel_event(wheel_event, &event, can_gc);
+                    self.handle_wheel_event(wheel_event, &event, can_gc)
                 },
                 InputEvent::Keyboard(keyboard_event) => {
-                    self.handle_keyboard_event(keyboard_event, can_gc);
+                    self.handle_keyboard_event(keyboard_event, can_gc)
                 },
-                InputEvent::Ime(ime_event) => {
-                    self.handle_ime_event(ime_event, can_gc);
-                },
+                InputEvent::Ime(ime_event) => self.handle_ime_event(ime_event, can_gc),
+                #[cfg(feature = "gamepad")]
                 InputEvent::Gamepad(gamepad_event) => {
                     self.handle_gamepad_event(gamepad_event);
+                    InputEventResult::default()
                 },
                 InputEvent::EditingAction(editing_action_event) => {
-                    self.handle_editing_action(editing_action_event, can_gc);
+                    self.handle_editing_action(None, editing_action_event, can_gc)
                 },
                 InputEvent::Scroll(scroll_event) => {
                     self.handle_embedder_scroll_event(scroll_event);
+                    InputEventResult::default()
                 },
-            }
+            };
 
-            self.notify_webdriver_input_event_completed(event.event);
+            self.notify_embedder_that_event_was_handled(event.event, result);
         }
     }
 
-    fn notify_webdriver_input_event_completed(&self, event: InputEvent) {
-        let Some(id) = event.webdriver_message_id() else {
-            return;
-        };
-
-        // Webdriver should be notified once all current dom events have been processed.
+    fn notify_embedder_that_event_was_handled(
+        &self,
+        event: InputEventAndId,
+        result: InputEventResult,
+    ) {
+        // Wait to to notify the embedder that the vent was handled until all pending DOM
+        // event processing is finished.
+        let id = event.id;
         let trusted_window = Trusted::new(&*self.window);
         self.window
             .as_global_scope()
@@ -208,7 +233,8 @@ impl DocumentEventHandler {
             .dom_manipulation_task_source()
             .queue(task!(notify_webdriver_input_event_completed: move || {
                 let window = trusted_window.root();
-                window.send_to_constellation(ScriptToConstellationMessage::WebDriverInputComplete(id));
+                window.send_to_embedder(
+                    EmbedderMsg::InputEventHandled(window.webview_id(), id, result));
             }));
     }
 
@@ -352,8 +378,7 @@ impl DocumentEventHandler {
         let Some(new_target) = hit_test_result
             .node
             .inclusive_ancestors(ShadowIncluding::No)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
+            .find_map(DomRoot::downcast::<Element>)
         else {
             return;
         };
@@ -447,8 +472,8 @@ impl DocumentEventHandler {
             );
         }
 
-        // Send mousemove event to topmost target, unless it's an iframe, in which case the
-        // compositor should have also sent an event to the inner document.
+        // Send mousemove event to topmost target, unless it's an iframe, in which case
+        // `Paint` should have also sent an event to the inner document.
         MouseEvent::new_simple(
             &self.window,
             FireMouseEventType::Move,
@@ -481,17 +506,11 @@ impl DocumentEventHandler {
             if let Some(anchor) = target
                 .upcast::<Node>()
                 .inclusive_ancestors(ShadowIncluding::No)
-                .filter_map(DomRoot::downcast::<HTMLAnchorElement>)
-                .next()
+                .find_map(DomRoot::downcast::<HTMLAnchorElement>)
             {
                 let status = anchor
-                    .upcast::<Element>()
-                    .get_attribute(&ns!(), &local_name!("href"))
-                    .and_then(|href| {
-                        let value = href.value();
-                        let url = self.window.get_url();
-                        url.join(&value).map(|url| url.to_string()).ok()
-                    });
+                    .full_href_url_for_user_interface()
+                    .map(|url| url.to_string());
                 self.window
                     .send_to_embedder(EmbedderMsg::Status(self.window.webview_id(), status));
                 return;
@@ -506,9 +525,7 @@ impl DocumentEventHandler {
             previous_hover_target
                 .upcast::<Node>()
                 .inclusive_ancestors(ShadowIncluding::No)
-                .filter_map(DomRoot::downcast::<HTMLAnchorElement>)
-                .next()
-                .is_some()
+                .any(|node| node.is::<HTMLAnchorElement>())
         }) {
             self.window
                 .send_to_embedder(EmbedderMsg::Status(self.window.webview_id(), None));
@@ -548,26 +565,30 @@ impl DocumentEventHandler {
             event.action, hit_test_result.point_in_frame
         );
 
-        let Some(el) = hit_test_result
+        let Some(element) = hit_test_result
             .node
             .inclusive_ancestors(ShadowIncluding::Yes)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
+            .find_map(DomRoot::downcast::<Element>)
         else {
             return;
         };
 
-        let node = el.upcast::<Node>();
+        let node = element.upcast::<Node>();
         debug!("{:?} on {:?}", event.action, node.debug_str());
 
         // https://w3c.github.io/uievents/#hit-test
         // Prevent mouse event if element is disabled.
         // TODO: also inert.
-        if el.is_actually_disabled() {
+        if element.is_actually_disabled() {
             return;
         }
 
+        let mouse_event_type_string = match event.action {
+            embedder_traits::MouseButtonAction::Up => "mouseup",
+            embedder_traits::MouseButtonAction::Down => "mousedown",
+        };
         let dom_event = DomRoot::upcast::<Event>(MouseEvent::for_platform_mouse_event(
+            mouse_event_type_string,
             event,
             input_event.pressed_mouse_buttons,
             &self.window,
@@ -576,18 +597,12 @@ impl DocumentEventHandler {
             can_gc,
         ));
 
-        let activatable = el.as_maybe_activatable();
+        let activatable = element.as_maybe_activatable();
         match event.action {
-            // https://w3c.github.io/uievents/#handle-native-mouse-click
-            MouseButtonAction::Click => {
-                el.set_click_in_progress(true);
-                dom_event.dispatch(node.upcast(), false, can_gc);
-                el.set_click_in_progress(false);
-
-                self.maybe_fire_dblclick(node, &hit_test_result, input_event, can_gc);
-            },
-            // https://w3c.github.io/uievents/#handle-native-mouse-down
             MouseButtonAction::Down => {
+                self.last_mouse_button_down_point
+                    .set(Some(hit_test_result.point_in_frame));
+
                 if let Some(a) = activatable {
                     a.enter_formal_activation_state();
                 }
@@ -598,7 +613,7 @@ impl DocumentEventHandler {
                 // delegate the focus target into its shadow host.
                 // TODO: This focus delegation should be done
                 // with shadow DOM delegateFocus attribute.
-                let target_el = el.find_focusable_shadow_host_if_necessary();
+                let target_el = element.find_focusable_shadow_host_if_necessary();
 
                 let document = self.window.Document();
                 document.begin_focus_transaction();
@@ -637,8 +652,64 @@ impl DocumentEventHandler {
 
                 // Step 7. dispatch event at target.
                 dom_event.dispatch(node.upcast(), false, can_gc);
+
+                self.maybe_trigger_click_for_mouse_button_down_event(
+                    event,
+                    input_event,
+                    &hit_test_result,
+                    &element,
+                    can_gc,
+                );
             },
         }
+    }
+
+    /// <https://w3c.github.io/uievents/#handle-native-mouse-click>
+    fn maybe_trigger_click_for_mouse_button_down_event(
+        &self,
+        event: MouseButtonEvent,
+        input_event: &ConstellationInputEvent,
+        hit_test_result: &HitTestResult,
+        element: &Element,
+        can_gc: CanGc,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        let Some(last_mouse_button_down_point) = self.last_mouse_button_down_point.take() else {
+            return;
+        };
+
+        let distance = last_mouse_button_down_point.distance_to(hit_test_result.point_in_frame);
+        let maximum_click_distance = 10.0 * self.window.device_pixel_ratio().get();
+        if distance > maximum_click_distance {
+            return;
+        }
+
+        // From <https://w3c.github.io/uievents/#event-type-click>
+        // > The click event type MUST be dispatched on the topmost event target indicated by the
+        // > pointer, when the user presses down and releases the primary pointer button.
+
+        // For nodes inside a text input UA shadow DOM, dispatch dblclick at the shadow host.
+        let delegated = element.find_focusable_shadow_host_if_necessary();
+        let element = delegated.as_deref().unwrap_or(element);
+        self.most_recently_clicked_element.set(Some(element));
+
+        element.set_click_in_progress(true);
+        let dom_event = DomRoot::upcast::<Event>(MouseEvent::for_platform_mouse_event(
+            "click",
+            event,
+            input_event.pressed_mouse_buttons,
+            &self.window,
+            hit_test_result,
+            input_event.active_keyboard_modifiers,
+            can_gc,
+        ));
+        let node = element.upcast::<Node>();
+        dom_event.dispatch(node.upcast(), false, can_gc);
+        element.set_click_in_progress(false);
+
+        self.maybe_fire_dblclick(node, hit_test_result, input_event, can_gc);
     }
 
     /// <https://www.w3.org/TR/uievents/#maybe-show-context-menu>
@@ -689,14 +760,10 @@ impl DocumentEventHandler {
 
         // Step 4. If result is true, then show the UA context menu
         if result {
-            let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel.");
-            self.window.send_to_embedder(EmbedderMsg::ShowContextMenu(
-                self.window.webview_id(),
-                sender,
-                None,
-                vec![],
-            ));
-            let _ = receiver.recv().unwrap();
+            self.window
+                .Document()
+                .embedder_controls()
+                .show_context_menu(hit_test_result);
         };
     }
 
@@ -763,30 +830,11 @@ impl DocumentEventHandler {
         event: EmbedderTouchEvent,
         input_event: &ConstellationInputEvent,
         can_gc: CanGc,
-    ) {
-        let result = self.handle_touch_event_inner(event, input_event, can_gc);
-        if let (TouchEventResult::Processed(handled), true) = (result, event.is_cancelable()) {
-            let sequence_id = event.expect_sequence_id();
-            let result = if handled {
-                embedder_traits::TouchEventResult::DefaultAllowed(sequence_id, event.event_type)
-            } else {
-                embedder_traits::TouchEventResult::DefaultPrevented(sequence_id, event.event_type)
-            };
-            self.window
-                .send_to_constellation(ScriptToConstellationMessage::TouchEventProcessed(result));
-        }
-    }
-
-    fn handle_touch_event_inner(
-        &self,
-        event: EmbedderTouchEvent,
-        input_event: &ConstellationInputEvent,
-        can_gc: CanGc,
-    ) -> TouchEventResult {
+    ) -> InputEventResult {
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
             self.update_active_touch_points_when_early_return(event);
-            return TouchEventResult::Forwarded;
+            return Default::default();
         };
 
         let TouchId(identifier) = event.id;
@@ -800,11 +848,10 @@ impl DocumentEventHandler {
         let Some(el) = hit_test_result
             .node
             .inclusive_ancestors(ShadowIncluding::No)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
+            .find_map(DomRoot::downcast::<Element>)
         else {
             self.update_active_touch_points_when_early_return(event);
-            return TouchEventResult::Forwarded;
+            return Default::default();
         };
 
         let target = DomRoot::upcast::<EventTarget>(el);
@@ -863,11 +910,12 @@ impl DocumentEventHandler {
             TouchList::new(window, touches.r(), can_gc)
         };
 
-        let event = TouchEvent::new(
+        let touch_event = TouchEvent::new(
             window,
             DOMString::from(event_name),
             EventBubbles::Bubbles,
             EventCancelable::from(event.is_cancelable()),
+            EventComposed::Composed,
             Some(window),
             0i32,
             &touches,
@@ -881,7 +929,9 @@ impl DocumentEventHandler {
             can_gc,
         );
 
-        TouchEventResult::Processed(event.upcast::<Event>().fire(&target, can_gc))
+        let event = touch_event.upcast::<Event>();
+        event.fire(&target, can_gc);
+        event.flags().into()
     }
 
     // If hittest fails, we still need to update the active point information.
@@ -913,7 +963,11 @@ impl DocumentEventHandler {
     }
 
     /// The entry point for all key processing for web content
-    fn handle_keyboard_event(&self, keyboard_event: EmbedderKeyboardEvent, can_gc: CanGc) {
+    fn handle_keyboard_event(
+        &self,
+        keyboard_event: EmbedderKeyboardEvent,
+        can_gc: CanGc,
+    ) -> InputEventResult {
         let document = self.window.Document();
         let focused = document.get_focused_element();
         let body = document.GetBody();
@@ -941,9 +995,14 @@ impl DocumentEventHandler {
             keyboard_event.event.key.legacy_keycode(),
             can_gc,
         );
+
         let event = keyevent.upcast::<Event>();
         event.fire(target, can_gc);
-        let mut cancel_state = event.get_cancel_state();
+
+        let mut flags = event.flags();
+        if flags.contains(EventFlags::Canceled) {
+            return flags.into();
+        }
 
         // https://w3c.github.io/uievents/#keys-cancelable-keys
         // it MUST prevent the respective beforeinput and input
@@ -956,11 +1015,10 @@ impl DocumentEventHandler {
         );
         if keyboard_event.event.state == KeyState::Down &&
             is_character_value_key &&
-            !keyboard_event.event.is_composing &&
-            cancel_state != EventDefault::Prevented
+            !keyboard_event.event.is_composing
         {
             // https://w3c.github.io/uievents/#keypress-event-order
-            let event = KeyboardEvent::new(
+            let keypress_event = KeyboardEvent::new(
                 &self.window,
                 DOMString::from("keypress"),
                 true,
@@ -977,35 +1035,34 @@ impl DocumentEventHandler {
                 0,
                 can_gc,
             );
-            let ev = event.upcast::<Event>();
-            ev.fire(target, can_gc);
-            cancel_state = ev.get_cancel_state();
+            let event = keypress_event.upcast::<Event>();
+            event.fire(target, can_gc);
+            flags = event.flags();
         }
 
-        if cancel_state == EventDefault::Allowed {
-            self.window.send_to_embedder(EmbedderMsg::Keyboard(
-                self.window.webview_id(),
-                keyboard_event.clone(),
-            ));
+        if flags.contains(EventFlags::Canceled) {
+            return flags.into();
+        }
 
-            // This behavior is unspecced
-            // We are supposed to dispatch synthetic click activation for Space and/or Return,
-            // however *when* we do it is up to us.
-            // Here, we're dispatching it after the key event so the script has a chance to cancel it
-            // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27337
-            if (keyboard_event.event.key == Key::Named(NamedKey::Enter) ||
-                keyboard_event.event.code == Code::Space) &&
-                keyboard_event.event.state == KeyState::Up
-            {
-                if let Some(elem) = target.downcast::<Element>() {
-                    elem.upcast::<Node>()
-                        .fire_synthetic_pointer_event_not_trusted(DOMString::from("click"), can_gc);
-                }
+        // This behavior is unspecced
+        // We are supposed to dispatch synthetic click activation for Space and/or Return,
+        // however *when* we do it is up to us.
+        // Here, we're dispatching it after the key event so the script has a chance to cancel it
+        // https://www.w3.org/Bugs/Public/show_bug.cgi?id=27337
+        if (keyboard_event.event.key == Key::Named(NamedKey::Enter) ||
+            keyboard_event.event.code == Code::Space) &&
+            keyboard_event.event.state == KeyState::Up
+        {
+            if let Some(elem) = target.downcast::<Element>() {
+                elem.upcast::<Node>()
+                    .fire_synthetic_pointer_event_not_trusted(DOMString::from("click"), can_gc);
             }
         }
+
+        flags.into()
     }
 
-    fn handle_ime_event(&self, event: ImeEvent, can_gc: CanGc) {
+    fn handle_ime_event(&self, event: ImeEvent, can_gc: CanGc) -> InputEventResult {
         let document = self.window.Document();
         let composition_event = match event {
             ImeEvent::Dismissed => {
@@ -1014,7 +1071,7 @@ impl DocumentEventHandler {
                     FocusInitiator::Local,
                     can_gc,
                 );
-                return;
+                return Default::default();
             },
             ImeEvent::Composition(composition_event) => composition_event,
         };
@@ -1028,11 +1085,11 @@ impl DocumentEventHandler {
             elem.upcast()
         } else {
             // Event is only dispatched if there is a focused element.
-            return;
+            return Default::default();
         };
 
         let cancelable = composition_event.state == keyboard_types::CompositionState::Start;
-        CompositionEvent::new(
+        let event = CompositionEvent::new(
             &self.window,
             DOMString::from(composition_event.state.event_type()),
             true,
@@ -1041,9 +1098,11 @@ impl DocumentEventHandler {
             0,
             DOMString::from(composition_event.data),
             can_gc,
-        )
-        .upcast::<Event>()
-        .fire(target, can_gc);
+        );
+
+        let event = event.upcast::<Event>();
+        event.fire(target, can_gc);
+        event.flags().into()
     }
 
     fn handle_wheel_event(
@@ -1051,19 +1110,18 @@ impl DocumentEventHandler {
         event: EmbedderWheelEvent,
         input_event: &ConstellationInputEvent,
         can_gc: CanGc,
-    ) {
+    ) -> InputEventResult {
         // Ignore all incoming events without a hit test.
         let Some(hit_test_result) = self.window.hit_test_from_input_event(input_event) else {
-            return;
+            return Default::default();
         };
 
         let Some(el) = hit_test_result
             .node
             .inclusive_ancestors(ShadowIncluding::No)
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
+            .find_map(DomRoot::downcast::<Element>)
         else {
-            return;
+            return Default::default();
         };
 
         let node = el.upcast::<Node>();
@@ -1106,11 +1164,12 @@ impl DocumentEventHandler {
 
         let dom_event = dom_event.upcast::<Event>();
         dom_event.set_trusted(true);
+        dom_event.fire(node.upcast(), can_gc);
 
-        let target = node.upcast();
-        dom_event.fire(target, can_gc);
+        dom_event.flags().into()
     }
 
+    #[cfg(feature = "gamepad")]
     fn handle_gamepad_event(&self, gamepad_event: EmbedderGamepadEvent) {
         match gamepad_event {
             EmbedderGamepadEvent::Connected(index, name, bounds, supported_haptic_effects) => {
@@ -1132,6 +1191,7 @@ impl DocumentEventHandler {
     }
 
     /// <https://www.w3.org/TR/gamepad/#dfn-gamepadconnected>
+    #[cfg(feature = "gamepad")]
     fn handle_gamepad_connect(
         &self,
         // As the spec actually defines how to set the gamepad index, the GilRs index
@@ -1171,6 +1231,7 @@ impl DocumentEventHandler {
     }
 
     /// <https://www.w3.org/TR/gamepad/#dfn-gamepaddisconnected>
+    #[cfg(feature = "gamepad")]
     fn handle_gamepad_disconnect(&self, index: usize) {
         let trusted_window = Trusted::new(&*self.window);
         self.window
@@ -1190,6 +1251,7 @@ impl DocumentEventHandler {
     }
 
     /// <https://www.w3.org/TR/gamepad/#receiving-inputs>
+    #[cfg(feature = "gamepad")]
     fn receive_new_gamepad_button_or_axis(&self, index: usize, update_type: GamepadUpdateType) {
         let trusted_window = Trusted::new(&*self.window);
 
@@ -1234,7 +1296,12 @@ impl DocumentEventHandler {
     }
 
     /// <https://www.w3.org/TR/clipboard-apis/#clipboard-actions>
-    fn handle_editing_action(&self, action: EditingActionEvent, can_gc: CanGc) -> bool {
+    pub(crate) fn handle_editing_action(
+        &self,
+        element: Option<DomRoot<Element>>,
+        action: EditingActionEvent,
+        can_gc: CanGc,
+    ) -> InputEventResult {
         let clipboard_event_type = match action {
             EditingActionEvent::Copy => ClipboardEventType::Copy,
             EditingActionEvent::Cut => ClipboardEventType::Cut,
@@ -1251,37 +1318,29 @@ impl DocumentEventHandler {
 
         // Step 1 If the script-triggered flag is set and the script-may-access-clipboard flag is unset
         if script_triggered && !script_may_access_clipboard {
-            return false;
+            return InputEventResult::empty();
         }
 
         // Step 2 Fire a clipboard event
-        let event = ClipboardEvent::new(
-            &self.window,
-            None,
-            DOMString::from(clipboard_event_type.as_str()),
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
-            None,
-            can_gc,
-        );
-        self.fire_clipboard_event(&event, clipboard_event_type, can_gc);
+        let clipboard_event =
+            self.fire_clipboard_event(element.clone(), clipboard_event_type, can_gc);
 
         // Step 3 If a script doesn't call preventDefault()
         // the event will be handled inside target's VirtualMethods::handle_event
-
-        let e = event.upcast::<Event>();
-
-        if !e.IsTrusted() {
-            return false;
+        let event = clipboard_event.upcast::<Event>();
+        if !event.IsTrusted() {
+            return event.flags().into();
         }
 
         // Step 4 If the event was canceled, then
-        if e.DefaultPrevented() {
-            match e.Type().str() {
+        if event.DefaultPrevented() {
+            let event_type = event.Type();
+            match_domstring_ascii!(event_type,
+
                 "copy" => {
                     // Step 4.1 Call the write content to the clipboard algorithm,
                     // passing on the DataTransferItemList items, a clear-was-called flag and a types-to-clear list.
-                    if let Some(clipboard_data) = event.get_clipboard_data() {
+                    if let Some(clipboard_data) = clipboard_event.get_clipboard_data() {
                         let drag_data_store =
                             clipboard_data.data_store().expect("This shouldn't fail");
                         self.write_content_to_the_clipboard(&drag_data_store);
@@ -1290,30 +1349,45 @@ impl DocumentEventHandler {
                 "cut" => {
                     // Step 4.1 Call the write content to the clipboard algorithm,
                     // passing on the DataTransferItemList items, a clear-was-called flag and a types-to-clear list.
-                    if let Some(clipboard_data) = event.get_clipboard_data() {
+                    if let Some(clipboard_data) = clipboard_event.get_clipboard_data() {
                         let drag_data_store =
                             clipboard_data.data_store().expect("This shouldn't fail");
                         self.write_content_to_the_clipboard(&drag_data_store);
                     }
 
                     // Step 4.2 Fire a clipboard event named clipboardchange
-                    self.fire_clipboardchange_event(can_gc);
+                    self.fire_clipboard_event(element, ClipboardEventType::Change, can_gc);
                 },
-                "paste" => return false,
+                // Step 4.1 Return false.
+                // Note: This function deviates from the specification a bit by returning
+                // the `InputEventResult` below.
+                "paste" => (),
                 _ => (),
-            }
+            )
         }
-        // Step 5
-        true
+
+        // Step 5: Return true from the action.
+        // In this case we are returning the `InputEventResult` instead of true or false.
+        event.flags().into()
     }
 
     /// <https://www.w3.org/TR/clipboard-apis/#fire-a-clipboard-event>
-    fn fire_clipboard_event(
+    pub(crate) fn fire_clipboard_event(
         &self,
-        event: &ClipboardEvent,
-        action: ClipboardEventType,
+        target: Option<DomRoot<Element>>,
+        clipboard_event_type: ClipboardEventType,
         can_gc: CanGc,
-    ) {
+    ) -> DomRoot<ClipboardEvent> {
+        let clipboard_event = ClipboardEvent::new(
+            &self.window,
+            None,
+            DOMString::from(clipboard_event_type.as_str()),
+            EventBubbles::Bubbles,
+            EventCancelable::Cancelable,
+            None,
+            can_gc,
+        );
+
         // Step 1 Let clear_was_called be false
         // Step 2 Let types_to_clear an empty list
         let mut drag_data_store = DragDataStore::new();
@@ -1325,28 +1399,29 @@ impl DocumentEventHandler {
 
         // Step 6 if the context is editable:
         let document = self.window.Document();
-        let focused = document.get_focused_element();
-        let body = document.GetBody();
+        let target = target.or(document.get_focused_element());
+        let target = target
+            .map(|target| DomRoot::from_ref(target.upcast()))
+            .or_else(|| {
+                document
+                    .GetBody()
+                    .map(|body| DomRoot::from_ref(body.upcast()))
+            })
+            .unwrap_or_else(|| DomRoot::from_ref(self.window.upcast()));
 
-        let target = match (&focused, &body) {
-            (Some(focused), _) => focused.upcast(),
-            (&None, Some(body)) => body.upcast(),
-            (&None, &None) => self.window.upcast(),
-        };
         // Step 6.2 else TODO require Selection see https://github.com/w3c/clipboard-apis/issues/70
-
         // Step 7
-        match action {
+        match clipboard_event_type {
             ClipboardEventType::Copy | ClipboardEventType::Cut => {
                 // Step 7.2.1
                 drag_data_store.set_mode(Mode::ReadWrite);
             },
             ClipboardEventType::Paste => {
                 let (sender, receiver) = ipc::channel().unwrap();
-                self.window
-                    .send_to_constellation(ScriptToConstellationMessage::ForwardToEmbedder(
-                        EmbedderMsg::GetClipboardText(self.window.webview_id(), sender),
-                    ));
+                self.window.send_to_embedder(EmbedderMsg::GetClipboardText(
+                    self.window.webview_id(),
+                    sender,
+                ));
                 let text_contents = receiver
                     .recv()
                     .map(Result::unwrap_or_default)
@@ -1381,27 +1456,19 @@ impl DocumentEventHandler {
         );
 
         // Step 8
-        event.set_clipboard_data(Some(&clipboard_event_data));
-        let event = event.upcast::<Event>();
+        clipboard_event.set_clipboard_data(Some(&clipboard_event_data));
+
         // Step 9
+        let event = clipboard_event.upcast::<Event>();
         event.set_trusted(trusted);
+
         // Step 10 Set event’s composed to true.
         event.set_composed(true);
-        // Step 11
-        event.dispatch(target, false, can_gc);
-    }
 
-    pub(crate) fn fire_clipboardchange_event(&self, can_gc: CanGc) {
-        let clipboardchange_event = ClipboardEvent::new(
-            &self.window,
-            None,
-            DOMString::from("clipboardchange"),
-            EventBubbles::Bubbles,
-            EventCancelable::Cancelable,
-            None,
-            can_gc,
-        );
-        self.fire_clipboard_event(&clipboardchange_event, ClipboardEventType::Change, can_gc);
+        // Step 11
+        event.dispatch(&target, false, can_gc);
+
+        DomRoot::from(clipboard_event)
     }
 
     /// <https://www.w3.org/TR/clipboard-apis/#write-content-to-the-clipboard>
@@ -1444,7 +1511,7 @@ impl DocumentEventHandler {
 
     /// Handle scroll event triggered by user interactions from embedder side.
     /// <https://drafts.csswg.org/cssom-view/#scrolling-events>
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn handle_embedder_scroll_event(&self, event: ScrollEvent) {
         // If it is a viewport scroll.
         let document = self.window.Document();
@@ -1460,13 +1527,129 @@ impl DocumentEventHandler {
             };
             let Some(element) = node
                 .inclusive_ancestors(ShadowIncluding::No)
-                .filter_map(DomRoot::downcast::<Element>)
-                .next()
+                .find_map(DomRoot::downcast::<Element>)
             else {
                 return;
             };
 
             document.handle_element_scroll_event(&element);
         }
+    }
+
+    pub(crate) fn run_default_keyboard_event_handler(&self, event: &KeyboardEvent) {
+        if event.upcast::<Event>().type_() != atom!("keydown") {
+            return;
+        }
+        if !event.modifiers().is_empty() {
+            return;
+        }
+        let scroll = match event.key() {
+            Key::Named(NamedKey::ArrowDown) => KeyboardScroll::Down,
+            Key::Named(NamedKey::ArrowLeft) => KeyboardScroll::Left,
+            Key::Named(NamedKey::ArrowRight) => KeyboardScroll::Right,
+            Key::Named(NamedKey::ArrowUp) => KeyboardScroll::Up,
+            Key::Named(NamedKey::End) => KeyboardScroll::End,
+            Key::Named(NamedKey::Home) => KeyboardScroll::Home,
+            Key::Named(NamedKey::PageDown) => KeyboardScroll::PageDown,
+            Key::Named(NamedKey::PageUp) => KeyboardScroll::PageUp,
+            _ => return,
+        };
+        self.do_keyboard_scroll(scroll);
+    }
+
+    pub(crate) fn do_keyboard_scroll(&self, scroll: KeyboardScroll) {
+        let scroll_axis = match scroll {
+            KeyboardScroll::Left | KeyboardScroll::Right => ScrollingBoxAxis::X,
+            _ => ScrollingBoxAxis::Y,
+        };
+
+        let document = self.window.Document();
+        let mut scrolling_box = document
+            .get_focused_element()
+            .or(self.most_recently_clicked_element.get())
+            .and_then(|element| element.scrolling_box(ScrollContainerQueryFlags::Inclusive))
+            .unwrap_or_else(|| {
+                document.viewport_scrolling_box(ScrollContainerQueryFlags::Inclusive)
+            });
+
+        while !scrolling_box.can_keyboard_scroll_in_axis(scroll_axis) {
+            // Always fall back to trying to scroll the entire document.
+            if scrolling_box.is_viewport() {
+                break;
+            }
+            let parent = scrolling_box.parent().unwrap_or_else(|| {
+                document.viewport_scrolling_box(ScrollContainerQueryFlags::Inclusive)
+            });
+            scrolling_box = parent;
+        }
+
+        let calculate_current_scroll_offset_and_delta = || {
+            const LINE_HEIGHT: f32 = 76.0;
+            const LINE_WIDTH: f32 = 76.0;
+
+            let current_scroll_offset = scrolling_box.scroll_position();
+            (
+                current_scroll_offset,
+                match scroll {
+                    KeyboardScroll::Home => Vector2D::new(0.0, -current_scroll_offset.y),
+                    KeyboardScroll::End => Vector2D::new(
+                        0.0,
+                        -current_scroll_offset.y + scrolling_box.content_size().height -
+                            scrolling_box.size().height,
+                    ),
+                    KeyboardScroll::PageDown => {
+                        Vector2D::new(0.0, scrolling_box.size().height - 2.0 * LINE_HEIGHT)
+                    },
+                    KeyboardScroll::PageUp => {
+                        Vector2D::new(0.0, 2.0 * LINE_HEIGHT - scrolling_box.size().height)
+                    },
+                    KeyboardScroll::Up => Vector2D::new(0.0, -LINE_HEIGHT),
+                    KeyboardScroll::Down => Vector2D::new(0.0, LINE_HEIGHT),
+                    KeyboardScroll::Left => Vector2D::new(-LINE_WIDTH, 0.0),
+                    KeyboardScroll::Right => Vector2D::new(LINE_WIDTH, 0.0),
+                },
+            )
+        };
+
+        // If trying to scroll the viewport of this `Window` and this is the root `Document`
+        // of the `WebView`, then send the srolling operation to the renderer, so that it
+        // can properly pan any pinch zoom viewport.
+        let parent_pipeline = self.window.parent_info();
+        if scrolling_box.is_viewport() && parent_pipeline.is_none() {
+            let (_, delta) = calculate_current_scroll_offset_and_delta();
+            self.window
+                .paint_api()
+                .scroll_viewport_by_delta(self.window.webview_id(), delta);
+        }
+
+        // If this is the viewport and we cannot scroll, try to ask a parent viewport to scroll,
+        // if we are inside an `<iframe>`.
+        if !scrolling_box.can_keyboard_scroll_in_axis(scroll_axis) {
+            assert!(scrolling_box.is_viewport());
+
+            let window_proxy = document.window().window_proxy();
+            if let Some(iframe) = window_proxy.frame_element() {
+                // When the `<iframe>` is local (in this ScriptThread), we can
+                // synchronously chain up the keyboard scrolling event.
+                let cx = GlobalScope::get_cx();
+                let iframe_window = iframe.owner_window();
+                let _ac = JSAutoRealm::new(*cx, iframe_window.reflector().get_jsobject().get());
+                iframe_window
+                    .Document()
+                    .event_handler()
+                    .do_keyboard_scroll(scroll);
+            } else if let Some(parent_pipeline) = parent_pipeline {
+                // Otherwise, if we have a parent (presumably from a different origin)
+                // asynchronously ask the Constellation to forward the event to the parent
+                // pipeline, if we have one.
+                document.window().send_to_constellation(
+                    ScriptToConstellationMessage::ForwardKeyboardScroll(parent_pipeline, scroll),
+                );
+            };
+            return;
+        }
+
+        let (current_scroll_offset, delta) = calculate_current_scroll_offset_and_delta();
+        scrolling_box.scroll_to(delta + current_scroll_offset, ScrollBehavior::Auto);
     }
 }

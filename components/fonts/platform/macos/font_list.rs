@@ -16,7 +16,7 @@ use crate::{
     FontTemplateDescriptor, LowercaseFontFamilyName,
 };
 
-pub fn for_each_available_family<F>(mut callback: F)
+pub(crate) fn for_each_available_family<F>(mut callback: F)
 where
     F: FnMut(String),
 {
@@ -26,7 +26,7 @@ where
     }
 }
 
-pub fn for_each_variation<F>(family_name: &str, mut callback: F)
+pub(crate) fn for_each_variation<F>(family_name: &str, mut callback: F)
 where
     F: FnMut(FontTemplate),
 {
@@ -51,6 +51,7 @@ where
                 callback(FontTemplate::new(
                     FontIdentifier::Local(identifier),
                     descriptor,
+                    None,
                     None,
                 ));
             }
@@ -84,11 +85,20 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
             {
                 families.push("Lucida Grande");
             },
+            // In Japanese typography, it is not common to use different fonts
+            // for Kanji(Han), Hiragana, and Katakana within the same document. Since Hiragino supports
+            // a comprehensive set of Japanese kanji, we uniformly fallback to Hiragino for all Japanese text.
+            _ if options.lang == Some(String::from("ja")) => {
+                families.push("Hiragino Sans");
+                families.push("Hiragino Kaku Gothic ProN");
+            },
             // CJK-related script codes are a bit troublesome because of unification;
             // we'll probably just get HAN much of the time, so the choice of which
             // language font to try for fallback is rather arbitrary. Usually, though,
             // we hope that font prefs will have handled this earlier.
-            _ if matches!(script, Script::Bopomofo | Script::Han) => {
+            _ if matches!(script, Script::Bopomofo | Script::Han) &&
+                options.lang != Some(String::from("ja")) =>
+            {
                 // TODO: Need to differentiate between traditional and simplified Han here!
                 families.push("Songti SC");
                 if options.character as u32 > 0x10000 {
@@ -155,7 +165,7 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
         }
     }
 
-    add_noto_fallback_families(options, &mut families);
+    add_noto_fallback_families(options.clone(), &mut families);
 
     // https://en.wikipedia.org/wiki/Plane_(Unicode)#Supplementary_Multilingual_Plane
     let unicode_plane = unicode_plane(options.character);
@@ -175,14 +185,16 @@ pub fn fallback_font_families(options: FallbackFontSelectionOptions) -> Vec<&'st
     families
 }
 
-pub fn default_system_generic_font_family(generic: GenericFontFamily) -> LowercaseFontFamilyName {
+pub(crate) fn default_system_generic_font_family(
+    generic: GenericFontFamily,
+) -> LowercaseFontFamilyName {
     match generic {
         GenericFontFamily::None | GenericFontFamily::Serif => "Times",
         GenericFontFamily::SansSerif => "Helvetica",
         GenericFontFamily::Monospace => "Menlo",
         GenericFontFamily::Cursive => "Apple Chancery",
         GenericFontFamily::Fantasy => "Papyrus",
-        GenericFontFamily::SystemUi => "Menlo",
+        GenericFontFamily::SystemUi => "Helvetica",
     }
     .into()
 }

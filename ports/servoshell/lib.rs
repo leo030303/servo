@@ -15,13 +15,23 @@ mod crash_handler;
 pub(crate) mod desktop;
 #[cfg(any(target_os = "android", target_env = "ohos"))]
 mod egl;
-mod output_image;
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 mod panic_hook;
 mod parser;
 mod prefs;
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
+#[cfg(not(target_os = "android"))]
 mod resources;
+mod running_app_state;
+mod webdriver;
+mod window;
+
+#[cfg(all(
+    feature = "gamepad",
+    not(any(target_os = "android", target_env = "ohos"))
+))]
+pub(crate) use crate::desktop::gamepad::GamepadSupport;
+#[cfg(all(feature = "gamepad", any(target_os = "android", target_env = "ohos")))]
+pub(crate) use crate::egl::gamepad::GamepadSupport;
 
 pub mod platform {
     #[cfg(target_os = "macos")]
@@ -97,9 +107,7 @@ pub fn init_tracing(filter_directives: Option<&str>) {
     }
 }
 
-pub fn servo_version() -> String {
-    format!("Servo {}-{}", env!("CARGO_PKG_VERSION"), env!("GIT_SHA"))
-}
+pub const VERSION: &str = concat!("Servo ", env!("CARGO_PKG_VERSION"), "-", env!("GIT_SHA"));
 
 /// Plumbs tracing spans into HiTrace, with the following caveats:
 ///

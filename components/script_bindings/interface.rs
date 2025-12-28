@@ -74,8 +74,8 @@ impl NonCallbackInterfaceObjectClass {
                 name: c"Function".as_ptr(),
                 flags: 0,
                 cOps: &constructor_behavior.0,
-                spec: 0 as *const _,
-                ext: 0 as *const _,
+                spec: ptr::null(),
+                ext: ptr::null(),
                 oOps: &OBJECT_OPS,
             },
             _proto_id: proto_id,
@@ -641,7 +641,7 @@ pub fn get_desired_proto(
         // something akin to the ES6 specification's GetProtototypeFromConstructor (so
         // get .prototype on the newTarget, with a fallback to some sort of default).
 
-        // First, a fast path for the case when the the constructor is in fact one of
+        // First, a fast path for the case when the constructor is in fact one of
         // our DOM constructors.  This is safe because on those the "constructor"
         // property is non-configurable and non-writable, so we don't have to do the
         // slow JS_GetProperty call.

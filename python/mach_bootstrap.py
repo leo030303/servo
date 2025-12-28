@@ -4,10 +4,10 @@
 
 import hashlib
 import os
-from os import PathLike
+import runpy
 import subprocess
 import sys
-import runpy
+from os import PathLike
 from typing import TYPE_CHECKING
 
 SCRIPT_PATH = os.path.abspath(os.path.dirname(__file__))
@@ -147,6 +147,9 @@ def _activate_virtualenv(topdir: str) -> None:
 
         script_dir = "Scripts" if _is_windows() else "bin"
         runpy.run_path(os.path.join(virtualenv_path, script_dir, "activate_this.py"))
+        # On NixOS, prepend nix-provided binary paths so they take precedence over .venv/bin
+        if "SERVO_NIX_BIN_DIR" in os.environ:
+            os.environ["PATH"] = os.environ["SERVO_NIX_BIN_DIR"] + os.pathsep + os.environ.get("PATH", "")
 
     install_virtual_env_requirements(topdir, marker_path)
 
@@ -184,9 +187,11 @@ def bootstrap_command_only(topdir: str) -> int:
 
     try:
         force = "-f" in sys.argv or "--force" in sys.argv
+        yes = "--yes" in sys.argv or "-y" in sys.argv
         skip_platform = "--skip-platform" in sys.argv
         skip_lints = "--skip-lints" in sys.argv
-        servo.platform.get().bootstrap(force, skip_platform, skip_lints)
+        skip_nextest = "--skip-nextest" in sys.argv
+        servo.platform.get().bootstrap(force, yes, skip_platform, skip_lints, skip_nextest)
     except NotImplementedError as exception:
         print(exception)
         return 1

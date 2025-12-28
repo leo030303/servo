@@ -6,13 +6,27 @@ use std::cell::Cell;
 use std::marker::PhantomData;
 use std::ops::Deref;
 
+use js::context::JSContext as SafeJSContext;
 use js::jsapi::JSContext as RawJSContext;
+use js::realm::CurrentRealm;
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct JSContext(*mut RawJSContext);
 
-#[allow(unsafe_code)]
+impl From<&mut SafeJSContext> for JSContext {
+    fn from(safe_cx: &mut SafeJSContext) -> Self {
+        unsafe { JSContext(safe_cx.raw_cx()) }
+    }
+}
+
+impl<'a> From<&mut CurrentRealm<'a>> for JSContext {
+    fn from(safe_cx: &mut CurrentRealm<'a>) -> Self {
+        unsafe { JSContext(safe_cx.raw_cx()) }
+    }
+}
+
+#[expect(unsafe_code)]
 impl JSContext {
     /// Create a new [`JSContext`] object from the given raw pointer.
     ///
@@ -22,9 +36,18 @@ impl JSContext {
     pub unsafe fn from_ptr(raw_js_context: *mut RawJSContext) -> Self {
         JSContext(raw_js_context)
     }
+
+    /// For compatibility with [js::context::JSContext]
+    pub fn raw_cx(&self) -> *mut RawJSContext {
+        self.0
+    }
+
+    /// For compatibility with [js::context::JSContext]
+    pub fn raw_cx_no_gc(&self) -> *mut RawJSContext {
+        self.0
+    }
 }
 
-#[allow(unsafe_code)]
 impl Deref for JSContext {
     type Target = *mut RawJSContext;
 
@@ -58,5 +81,10 @@ impl CanGc {
     /// current stack frame.
     pub fn note() -> CanGc {
         CanGc(PhantomData)
+    }
+
+    /// &mut SafeJSContext is always an indication that GC is possible.
+    pub fn from_cx(_cx: &mut SafeJSContext) -> CanGc {
+        CanGc::note()
     }
 }

@@ -3,28 +3,25 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::LazyCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use html5ever::{LocalName, Namespace, ns};
 use js::rust::HandleObject;
 
-use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::MutationObserverBinding::MutationObserver_Binding::MutationObserverMethods;
 use crate::dom::bindings::codegen::Bindings::MutationObserverBinding::{
     MutationCallback, MutationObserverInit,
 };
 use crate::dom::bindings::error::{Error, Fallible};
-use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::{DomGlobal, Reflector, reflect_dom_object_with_proto};
-use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
-use crate::dom::eventtarget::EventTarget;
 use crate::dom::mutationrecord::MutationRecord;
 use crate::dom::node::{Node, ShadowIncluding};
 use crate::dom::window::Window;
-use crate::microtask::Microtask;
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
 
@@ -33,8 +30,8 @@ pub(crate) struct MutationObserver {
     reflector_: Reflector,
     #[ignore_malloc_size_of = "can't measure Rc values"]
     callback: Rc<MutationCallback>,
-    record_queue: DomRefCell<Vec<DomRoot<MutationRecord>>>,
-    node_list: DomRefCell<Vec<DomRoot<Node>>>,
+    record_queue: DomRefCell<Vec<Dom<MutationRecord>>>,
+    node_list: DomRefCell<Vec<Dom<Node>>>,
 }
 
 pub(crate) enum Mutation<'a> {
@@ -44,7 +41,7 @@ pub(crate) enum Mutation<'a> {
         old_value: Option<DOMString>,
     },
     CharacterData {
-        old_value: DOMString,
+        old_value: String,
     },
     ChildList {
         added: Option<&'a [&'a Node]>,
@@ -55,8 +52,9 @@ pub(crate) enum Mutation<'a> {
 }
 
 #[derive(JSTraceable, MallocSizeOf)]
+#[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub(crate) struct RegisteredObserver {
-    pub(crate) observer: DomRoot<MutationObserver>,
+    pub(crate) observer: Dom<MutationObserver>,
     options: ObserverOptions,
 }
 
@@ -91,59 +89,12 @@ impl MutationObserver {
         }
     }
 
-    /// <https://dom.spec.whatwg.org/#queue-a-mutation-observer-compound-microtask>
-    pub(crate) fn queue_mutation_observer_microtask() {
-        // Step 1. If the surrounding agent’s mutation observer microtask queued is true, then return.
-        if ScriptThread::is_mutation_observer_microtask_queued() {
-            return;
-        }
-
-        // Step 2. Set the surrounding agent’s mutation observer microtask queued to true.
-        ScriptThread::set_mutation_observer_microtask_queued(true);
-
-        // Step 3. Queue a microtask to notify mutation observers.
-        ScriptThread::enqueue_microtask(Microtask::NotifyMutationObservers);
+    pub(crate) fn record_queue(&self) -> &DomRefCell<Vec<Dom<MutationRecord>>> {
+        &self.record_queue
     }
 
-    /// <https://dom.spec.whatwg.org/#notify-mutation-observers>
-    pub(crate) fn notify_mutation_observers(can_gc: CanGc) {
-        // Step 1. Set the surrounding agent’s mutation observer microtask queued to false.
-        ScriptThread::set_mutation_observer_microtask_queued(false);
-
-        // Step 2. Let notifySet be a clone of the surrounding agent’s pending mutation observers.
-        // TODO Step 3. Empty the surrounding agent’s pending mutation observers.
-        let notify_list = ScriptThread::get_mutation_observers();
-
-        // Step 4. Let signalSet be a clone of the surrounding agent’s signal slots.
-        // Step 5. Empty the surrounding agent’s signal slots.
-        let signal_set = ScriptThread::take_signal_slots();
-
-        // Step 6. For each mo of notifySet:
-        for mo in &notify_list {
-            // Step 6.1 Let records be a clone of mo’s record queue.
-            let queue: Vec<DomRoot<MutationRecord>> = mo.record_queue.borrow().clone();
-
-            // Step 6.2 Empty mo’s record queue.
-            mo.record_queue.borrow_mut().clear();
-
-            // TODO Step 6.3 For each node of mo’s node list, remove all transient registered observers
-            // whose observer is mo from node’s registered observer list.
-
-            // Step 6.4 If records is not empty, then invoke mo’s callback with « records,
-            // mo » and "report", and with callback this value mo.
-            if !queue.is_empty() {
-                let _ = mo
-                    .callback
-                    .Call_(&**mo, queue, mo, ExceptionHandling::Report, can_gc);
-            }
-        }
-
-        // Step 6. For each slot of signalSet, fire an event named slotchange,
-        // with its bubbles attribute set to true, at slot.
-        for slot in signal_set {
-            slot.upcast::<EventTarget>()
-                .fire_event(atom!("slotchange"), can_gc);
-        }
+    pub(crate) fn callback(&self) -> &Rc<MutationCallback> {
+        &self.callback
     }
 
     /// <https://dom.spec.whatwg.org/#queueing-a-mutation-record>
@@ -156,31 +107,38 @@ impl MutationObserver {
         if !target.global().as_window().get_exists_mut_observer() {
             return;
         }
-        // Step 1
-        let mut interested_observers: Vec<(DomRoot<MutationObserver>, Option<DOMString>)> = vec![];
+        // Step 1 Let interestedObservers be an empty map.
+        let mut interested_observers: HashMap<DomRoot<MutationObserver>, Option<DOMString>> =
+            HashMap::new();
 
-        // Step 2 & 3
+        // Step 2 Let nodes be the inclusive ancestors of target.
+        // Step 3 For each node in nodes ...
         for node in target.inclusive_ancestors(ShadowIncluding::No) {
             let registered = node.registered_mutation_observers();
             if registered.is_none() {
                 continue;
             }
 
+            // Step 3 ... and then for each registered of node’s registered observer list:
             for registered in &*registered.unwrap() {
+                // 3.2 "1": node is not target and options["subtree"] is false
                 if &*node != target && !registered.options.subtree {
                     continue;
                 }
 
                 match *attr_type {
+                    // 3.2 "2", "3"
                     Mutation::Attribute {
                         ref name,
                         ref namespace,
                         ref old_value,
                     } => {
-                        // Step 3.1
+                        // 3.1.2 "2": type is "attributes" and options["attributes"] either does not exist or is false
                         if !registered.options.attributes {
                             continue;
                         }
+                        // 3.1.2 "3": type is "attributes", options["attributeFilter"] exists,
+                        // and options["attributeFilter"] does not contain name or namespace is non-null
                         if !registered.options.attribute_filter.is_empty() {
                             if *namespace != ns!() {
                                 continue;
@@ -189,62 +147,57 @@ impl MutationObserver {
                                 .options
                                 .attribute_filter
                                 .iter()
-                                .any(|s| **s == **name)
+                                .any(|s| *s == **name)
                             {
                                 continue;
                             }
                         }
-                        // Step 3.1.2
-                        let paired_string = if registered.options.attribute_old_value {
-                            old_value.clone()
+                        // 3.2.1 Let mo be registered’s observer.
+                        let mo = registered.observer.as_rooted();
+                        // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
+                        if registered.options.attribute_old_value {
+                            // 3.2.3 ... type is "attributes" and options["attributeOldValue"] is true ...
+                            interested_observers.insert(mo, old_value.clone());
                         } else {
-                            None
-                        };
-                        // Step 3.1.1
-                        let idx = interested_observers
-                            .iter()
-                            .position(|(o, _)| std::ptr::eq(&**o, &*registered.observer));
-                        if let Some(idx) = idx {
-                            interested_observers[idx].1 = paired_string;
-                        } else {
-                            interested_observers
-                                .push((DomRoot::from_ref(&*registered.observer), paired_string));
+                            // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
+                            interested_observers.entry(mo).or_insert(None);
                         }
                     },
+                    // 3.2 "4"
                     Mutation::CharacterData { ref old_value } => {
+                        // 3.2 "4": type is "characterData" and options["characterData"] either does not exist or is false
                         if !registered.options.character_data {
                             continue;
                         }
-                        // Step 3.1.2
-                        let paired_string = if registered.options.character_data_old_value {
-                            Some(old_value.clone())
-                        } else {
-                            None
-                        };
-                        // Step 3.1.1
-                        let idx = interested_observers
-                            .iter()
-                            .position(|(o, _)| std::ptr::eq(&**o, &*registered.observer));
-                        if let Some(idx) = idx {
-                            interested_observers[idx].1 = paired_string;
-                        } else {
+                        // 3.2.1 Let mo be registered’s observer.
+                        let mo = registered.observer.as_rooted();
+                        if registered.options.character_data_old_value {
+                            // 3.2.3 ... type is "characterData" and options["characterDataOldValue"] is true
                             interested_observers
-                                .push((DomRoot::from_ref(&*registered.observer), paired_string));
+                                .insert(mo, Some(DOMString::from(old_value.clone())));
+                        } else {
+                            // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
+                            interested_observers.entry(mo).or_insert(None);
                         }
                     },
+                    // 3.2 "5"
                     Mutation::ChildList { .. } => {
+                        // 3.2 "5": type is "childList" and options["childList"] is false
                         if !registered.options.child_list {
                             continue;
                         }
-                        interested_observers.push((DomRoot::from_ref(&*registered.observer), None));
+                        // 3.2.1 Let mo be registered’s observer.
+                        let mo = registered.observer.as_rooted();
+                        // 3.2.2 If interestedObservers[mo] does not exist, then set interestedObservers[mo] to null.
+                        interested_observers.entry(mo).or_insert(None);
                     },
                 }
             }
         }
 
-        // Step 4
-        for (observer, paired_string) in interested_observers {
-            // Steps 4.1-4.7
+        // Step 4 For each observer → mappedOldValue of interestedObservers:
+        for (observer, mapped_old_value) in interested_observers {
+            // Step 4.1 Let record be a new MutationRecord object ...
             let record = match *attr_type {
                 Mutation::Attribute {
                     ref name,
@@ -260,12 +213,12 @@ impl MutationObserver {
                         target,
                         name,
                         namespace,
-                        paired_string,
+                        mapped_old_value,
                         CanGc::note(),
                     )
                 },
                 Mutation::CharacterData { .. } => {
-                    MutationRecord::character_data_mutated(target, paired_string, CanGc::note())
+                    MutationRecord::character_data_mutated(target, mapped_old_value, CanGc::note())
                 },
                 Mutation::ChildList {
                     ref added,
@@ -281,12 +234,18 @@ impl MutationObserver {
                     CanGc::note(),
                 ),
             };
-            // Step 4.8
-            observer.record_queue.borrow_mut().push(record);
+            // Step 4.2 Enqueue record to observer’s record queue.
+            observer
+                .record_queue
+                .borrow_mut()
+                .push(Dom::from_ref(&*record));
+            // Step 4.3 Append observer to the surrounding agent’s pending mutation observers.
+            ScriptThread::mutation_observers().add_mutation_observer(&observer);
         }
 
-        // Step 5
-        MutationObserver::queue_mutation_observer_microtask();
+        // Step 5 Queue a mutation observer microtask.
+        let mutation_observers = ScriptThread::mutation_observers();
+        mutation_observers.queue_mutation_observer_microtask(ScriptThread::microtask_queue());
     }
 }
 
@@ -300,7 +259,7 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
     ) -> Fallible<DomRoot<MutationObserver>> {
         global.set_exists_mut_observer();
         let observer = MutationObserver::new_with_proto(global, proto, callback, can_gc);
-        ScriptThread::add_mutation_observer(&observer);
+        ScriptThread::mutation_observers().add_mutation_observer(&observer);
         Ok(observer)
     }
 
@@ -380,7 +339,7 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
         // Step 8
         if add_new_observer {
             target.add_mutation_observer(RegisteredObserver {
-                observer: DomRoot::from_ref(self),
+                observer: Dom::from_ref(self),
                 options: ObserverOptions {
                     attributes,
                     attribute_old_value,
@@ -392,7 +351,7 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
                 },
             });
 
-            self.node_list.borrow_mut().push(DomRoot::from_ref(target));
+            self.node_list.borrow_mut().push(Dom::from_ref(target));
         }
 
         Ok(())
@@ -400,7 +359,12 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
 
     /// <https://dom.spec.whatwg.org/#dom-mutationobserver-takerecords>
     fn TakeRecords(&self) -> Vec<DomRoot<MutationRecord>> {
-        let records: Vec<DomRoot<MutationRecord>> = self.record_queue.borrow().clone();
+        let records: Vec<DomRoot<MutationRecord>> = self
+            .record_queue
+            .borrow()
+            .iter()
+            .map(|record| record.as_rooted())
+            .collect();
         self.record_queue.borrow_mut().clear();
         records
     }
@@ -408,8 +372,15 @@ impl MutationObserverMethods<crate::DomTypeHolder> for MutationObserver {
     /// <https://dom.spec.whatwg.org/#dom-mutationobserver-disconnect>
     fn Disconnect(&self) {
         // Step 1
-        let mut nodes = self.node_list.borrow_mut();
-        for node in nodes.drain(..) {
+        let nodes = self
+            .node_list
+            .borrow()
+            .iter()
+            .map(|node| node.as_rooted())
+            .collect::<Vec<_>>();
+        self.node_list.borrow_mut().clear();
+
+        for node in nodes {
             node.remove_mutation_observer(self);
         }
 

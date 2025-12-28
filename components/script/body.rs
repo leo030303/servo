@@ -11,6 +11,7 @@ use ipc_channel::ipc::{self, IpcReceiver, IpcSender, IpcSharedMemory};
 use ipc_channel::router::ROUTER;
 use js::jsapi::{Heap, JS_ClearPendingException, JSObject, Value as JSValue};
 use js::jsval::{JSVal, UndefinedValue};
+use js::realm::CurrentRealm;
 use js::rust::HandleValue;
 use js::rust::wrappers::{JS_GetPendingException, JS_ParseJSON};
 use js::typedarray::{ArrayBufferU8, Uint8};
@@ -27,13 +28,13 @@ use crate::dom::bindings::codegen::Bindings::XMLHttpRequestBinding::BodyInit;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::refcounted::Trusted;
 use crate::dom::bindings::reflector::{DomGlobal, DomObject};
-use crate::dom::bindings::root::{Dom, DomRoot};
+use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::blob::{Blob, normalize_type_string};
 use crate::dom::formdata::FormData;
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlformelement::{encode_multipart_form_data, generate_boundary};
+use crate::dom::html::htmlformelement::{encode_multipart_form_data, generate_boundary};
 use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::readablestream::{ReadableStream, get_read_promise_bytes, get_read_promise_done};
@@ -41,6 +42,31 @@ use crate::dom::urlsearchparams::URLSearchParams;
 use crate::realms::{AlreadyInRealm, InRealm, enter_realm};
 use crate::script_runtime::{CanGc, JSContext};
 use crate::task_source::SendableTaskSource;
+
+/// <https://fetch.spec.whatwg.org/#concept-body-clone>
+pub(crate) fn clone_body_stream_for_dom_body(
+    original_body_stream: &MutNullableDom<ReadableStream>,
+    cloned_body_stream: &MutNullableDom<ReadableStream>,
+    can_gc: CanGc,
+) -> Fallible<()> {
+    // To clone a body *body*, run these steps:
+
+    let Some(stream) = original_body_stream.get() else {
+        return Ok(());
+    };
+
+    // step 1. Let « out1, out2 » be the result of teeing body’s stream.
+    let branches = stream.tee(true, can_gc)?;
+    let out1 = &*branches[0];
+    let out2 = &*branches[1];
+
+    // step 2. Set body’s stream to out1.
+    // step 3. Return a body whose stream is out2 and other members are copied from body.
+    original_body_stream.set(Some(out1));
+    cloned_body_stream.set(Some(out2));
+
+    Ok(())
+}
 
 /// The Dom object, or ReadableStream, that is the source of a body.
 /// <https://fetch.spec.whatwg.org/#concept-body-source>
@@ -234,6 +260,7 @@ impl TransmitBodyConnectHandler {
             task!(setup_native_body_promise_handler: move || {
                 let rooted_stream = stream.root();
                 let global = rooted_stream.global();
+                let cx = GlobalScope::get_cx();
 
                 // Step 4, the result of reading a chunk from body’s stream with reader.
                 let promise = rooted_stream.read_a_chunk(CanGc::note());
@@ -241,20 +268,20 @@ impl TransmitBodyConnectHandler {
                 // Step 5, the parallel steps waiting for and handling the result of the read promise,
                 // are a combination of the promise native handler here,
                 // and the corresponding IPC route in `component::net::http_loader`.
-                let promise_handler = Box::new(TransmitBodyPromiseHandler {
+                rooted!(in(*cx) let mut promise_handler = Some(TransmitBodyPromiseHandler {
                     bytes_sender: bytes_sender.clone(),
                     stream: Dom::from_ref(&rooted_stream.clone()),
                     control_sender: control_sender.clone(),
-                });
+                }));
 
-                let rejection_handler = Box::new(TransmitBodyPromiseRejectionHandler {
+                rooted!(in(*cx) let mut rejection_handler = Some(TransmitBodyPromiseRejectionHandler {
                     bytes_sender,
                     stream: Dom::from_ref(&rooted_stream.clone()),
                     control_sender,
-                });
+                }));
 
                 let handler =
-                    PromiseNativeHandler::new(&global, Some(promise_handler), Some(rejection_handler), CanGc::note());
+                    PromiseNativeHandler::new(&global, promise_handler.take().map(|h| Box::new(h) as Box<_>), rejection_handler.take().map(|h| Box::new(h) as Box<_>), CanGc::note());
 
                 let realm = enter_realm(&*global);
                 let comp = InRealm::Entered(&realm);
@@ -278,9 +305,14 @@ struct TransmitBodyPromiseHandler {
     control_sender: IpcSender<BodyChunkRequest>,
 }
 
+impl js::gc::Rootable for TransmitBodyPromiseHandler {}
+
 impl Callback for TransmitBodyPromiseHandler {
     /// Step 5 of <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
-    fn callback(&self, cx: JSContext, v: HandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, v: HandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let _realm = InRealm::Already(&cx.into());
+        let cx = cx.into();
         let is_done = match get_read_promise_done(cx, &v, can_gc) {
             Ok(is_done) => is_done,
             Err(_) => {
@@ -332,20 +364,26 @@ struct TransmitBodyPromiseRejectionHandler {
     control_sender: IpcSender<BodyChunkRequest>,
 }
 
+impl js::gc::Rootable for TransmitBodyPromiseRejectionHandler {}
+
 impl Callback for TransmitBodyPromiseRejectionHandler {
     /// <https://fetch.spec.whatwg.org/#concept-request-transmit-body>
-    fn callback(&self, _cx: JSContext, _v: HandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: HandleValue) {
         // Step 5.4, the "rejection" steps.
         let _ = self.control_sender.send(BodyChunkRequest::Error);
-        self.stream.stop_reading(can_gc);
+        self.stream.stop_reading(CanGc::from_cx(cx));
     }
 }
 
-/// The result of <https://fetch.spec.whatwg.org/#concept-bodyinit-extract>
+/// <https://fetch.spec.whatwg.org/#body-with-type>
 pub(crate) struct ExtractedBody {
+    /// <https://fetch.spec.whatwg.org/#concept-body-stream>
     pub(crate) stream: DomRoot<ReadableStream>,
+    /// <https://fetch.spec.whatwg.org/#concept-body-source>
     pub(crate) source: BodySource,
+    /// <https://fetch.spec.whatwg.org/#concept-body-total-bytes>
     pub(crate) total_bytes: Option<usize>,
+    /// <https://fetch.spec.whatwg.org/#body-with-type-type>
     pub(crate) content_type: Option<DOMString>,
 }
 
@@ -435,17 +473,27 @@ impl ExtractedBody {
 
 /// <https://fetch.spec.whatwg.org/#concept-bodyinit-extract>
 pub(crate) trait Extractable {
-    fn extract(&self, global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody>;
+    fn extract(
+        &self,
+        global: &GlobalScope,
+        keep_alive: bool,
+        can_gc: CanGc,
+    ) -> Fallible<ExtractedBody>;
 }
 
 impl Extractable for BodyInit {
-    // https://fetch.spec.whatwg.org/#concept-bodyinit-extract
-    fn extract(&self, global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody> {
+    /// <https://fetch.spec.whatwg.org/#concept-bodyinit-extract>
+    fn extract(
+        &self,
+        global: &GlobalScope,
+        keep_alive: bool,
+        can_gc: CanGc,
+    ) -> Fallible<ExtractedBody> {
         match self {
-            BodyInit::String(s) => s.extract(global, can_gc),
-            BodyInit::URLSearchParams(usp) => usp.extract(global, can_gc),
-            BodyInit::Blob(b) => b.extract(global, can_gc),
-            BodyInit::FormData(formdata) => formdata.extract(global, can_gc),
+            BodyInit::String(s) => s.extract(global, keep_alive, can_gc),
+            BodyInit::URLSearchParams(usp) => usp.extract(global, keep_alive, can_gc),
+            BodyInit::Blob(b) => b.extract(global, keep_alive, can_gc),
+            BodyInit::FormData(formdata) => formdata.extract(global, keep_alive, can_gc),
             BodyInit::ArrayBuffer(typedarray) => {
                 let bytes = typedarray.to_vec();
                 let total_bytes = bytes.len();
@@ -469,9 +517,13 @@ impl Extractable for BodyInit {
                 })
             },
             BodyInit::ReadableStream(stream) => {
-                // TODO:
-                // 1. If the keepalive flag is set, then throw a TypeError.
-
+                // If keepalive is true, then throw a TypeError.
+                if keep_alive {
+                    return Err(Error::Type(
+                        "The body's stream is for a keepalive request".to_string(),
+                    ));
+                }
+                // If object is disturbed or locked, then throw a TypeError.
                 if stream.is_locked() || stream.is_disturbed() {
                     return Err(Error::Type(
                         "The body's stream is disturbed or locked".to_string(),
@@ -490,7 +542,12 @@ impl Extractable for BodyInit {
 }
 
 impl Extractable for Vec<u8> {
-    fn extract(&self, global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody> {
+    fn extract(
+        &self,
+        global: &GlobalScope,
+        _keep_alive: bool,
+        can_gc: CanGc,
+    ) -> Fallible<ExtractedBody> {
         let bytes = self.clone();
         let total_bytes = self.len();
         let stream = ReadableStream::new_from_bytes(global, bytes, can_gc)?;
@@ -505,9 +562,14 @@ impl Extractable for Vec<u8> {
 }
 
 impl Extractable for Blob {
-    fn extract(&self, _global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody> {
+    fn extract(
+        &self,
+        _global: &GlobalScope,
+        _keep_alive: bool,
+        can_gc: CanGc,
+    ) -> Fallible<ExtractedBody> {
         let blob_type = self.Type();
-        let content_type = if blob_type.as_ref().is_empty() {
+        let content_type = if blob_type.is_empty() {
             None
         } else {
             Some(blob_type)
@@ -524,7 +586,12 @@ impl Extractable for Blob {
 }
 
 impl Extractable for DOMString {
-    fn extract(&self, global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody> {
+    fn extract(
+        &self,
+        global: &GlobalScope,
+        _keep_alive: bool,
+        can_gc: CanGc,
+    ) -> Fallible<ExtractedBody> {
         let bytes = self.as_bytes().to_owned();
         let total_bytes = bytes.len();
         let content_type = Some(DOMString::from("text/plain;charset=UTF-8"));
@@ -539,7 +606,12 @@ impl Extractable for DOMString {
 }
 
 impl Extractable for FormData {
-    fn extract(&self, global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody> {
+    fn extract(
+        &self,
+        global: &GlobalScope,
+        _keep_alive: bool,
+        can_gc: CanGc,
+    ) -> Fallible<ExtractedBody> {
         let boundary = generate_boundary();
         let bytes = encode_multipart_form_data(&mut self.datums(), boundary.clone(), UTF_8);
         let total_bytes = bytes.len();
@@ -558,7 +630,12 @@ impl Extractable for FormData {
 }
 
 impl Extractable for URLSearchParams {
-    fn extract(&self, global: &GlobalScope, can_gc: CanGc) -> Fallible<ExtractedBody> {
+    fn extract(
+        &self,
+        global: &GlobalScope,
+        _keep_alive: bool,
+        can_gc: CanGc,
+    ) -> Fallible<ExtractedBody> {
         let bytes = self.serialize_utf8().into_bytes();
         let total_bytes = bytes.len();
         let content_type = Some(DOMString::from(
@@ -617,7 +694,7 @@ pub(crate) fn consume_body<T: BodyMixin + DomObject>(
     let promise = Promise::new_in_current_realm(comp, can_gc);
 
     // If object is unusable, then return a promise rejected with a TypeError.
-    if object.is_disturbed() || object.is_locked() {
+    if object.is_unusable() {
         promise.reject_error(
             Error::Type("The body's stream is disturbed or locked".to_string()),
             can_gc,
@@ -668,7 +745,6 @@ pub(crate) fn consume_body<T: BodyMixin + DomObject>(
     // TODO: #36049
     reader.read_all_bytes(
         cx,
-        &global,
         Rc::new(move |bytes: &[u8]| {
             resolve_result_promise(
                 body_type,
@@ -682,7 +758,6 @@ pub(crate) fn consume_body<T: BodyMixin + DomObject>(
         Rc::new(move |cx, v| {
             error_promise.reject(cx, v, can_gc);
         }),
-        comp,
         can_gc,
     );
 
@@ -754,7 +829,7 @@ fn run_text_data_algorithm(bytes: Vec<u8>) -> Fallible<FetchedData> {
     ))
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 /// <https://fetch.spec.whatwg.org/#ref-for-concept-body-consume-body%E2%91%A3>
 fn run_json_data_algorithm(cx: JSContext, bytes: Vec<u8>) -> Fallible<FetchedData> {
     // The JSON spec allows implementations to either ignore UTF-8 BOM or treat it as an error.
@@ -855,7 +930,7 @@ pub(crate) fn run_array_buffer_data_algorithm(
     Ok(FetchedData::ArrayBuffer(rooted_heap))
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn decode_to_utf16_with_bom_removal(
     bytes: &[u8],
     encoding: &'static Encoding,
@@ -874,12 +949,12 @@ pub(crate) fn decode_to_utf16_with_bom_removal(
 
 /// <https://fetch.spec.whatwg.org/#body>
 pub(crate) trait BodyMixin {
-    /// <https://fetch.spec.whatwg.org/#concept-body-disturbed>
-    fn is_disturbed(&self) -> bool;
+    /// <https://fetch.spec.whatwg.org/#dom-body-bodyused>
+    fn is_body_used(&self) -> bool;
+    /// <https://fetch.spec.whatwg.org/#body-unusable>
+    fn is_unusable(&self) -> bool;
     /// <https://fetch.spec.whatwg.org/#dom-body-body>
     fn body(&self) -> Option<DomRoot<ReadableStream>>;
-    /// <https://fetch.spec.whatwg.org/#concept-body-locked>
-    fn is_locked(&self) -> bool;
     /// <https://fetch.spec.whatwg.org/#concept-body-mime-type>
     fn get_mime_type(&self, can_gc: CanGc) -> Vec<u8>;
 }

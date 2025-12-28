@@ -38,14 +38,14 @@ input:not(:placeholder-shown)::placeholder {
 
 input::-servo-text-control-inner-editor, input::placeholder {
   block-size: fit-content !important;
+  inset-block: 0 !important;
+  margin-block: auto !important;
   min-width: stretch;
   white-space: pre;
 }
 
 input::placeholder {
   color: grey;
-  inset-block: 0 !important;
-  margin-block: auto !important;
   overflow: hidden;
   pointer-events: none !important;
   position: absolute !important;
@@ -145,15 +145,19 @@ center { text-align: -moz-center; }
 
 label { cursor: default; }
 
-img {
+canvas, embed, iframe, img, video {
   overflow: clip !important;
   overflow-clip-margin: 0 !important;
 }
 
-input:not([type=radio i]):not([type=checkbox i]):not([type=reset i]):not([type=button i]):not([type=submit i]) {
+input:not([type=radio i], [type=checkbox i], [type=reset i], [type=button i], [type=submit i]) {
   cursor: text;
   overflow: hidden !important;
   white-space: pre;
+}
+
+input:is([type=submit i], [type=reset i], [type=button i], [type=checkbox i], [type=radio i], [type=color i]) {
+  cursor: default;
 }
 
 textarea {

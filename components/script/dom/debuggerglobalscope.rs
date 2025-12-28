@@ -2,15 +2,16 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 
+use base::generic_channel::{GenericCallback, GenericSender};
 use base::id::{Index, PipelineId, PipelineNamespaceId};
 use constellation_traits::ScriptToConstellationChan;
 use devtools_traits::{DevtoolScriptControlMsg, ScriptToDevtoolsControlMsg, SourceInfo, WorkerId};
 use dom_struct::dom_struct;
-use embedder_traits::JavaScriptEvaluationError;
 use embedder_traits::resources::{self, Resource};
-use ipc_channel::ipc::IpcSender;
+use embedder_traits::{JavaScriptEvaluationError, ScriptToEmbedderChan};
 use js::jsval::UndefinedValue;
 use js::rust::wrappers::JS_DefineDebuggerObject;
 use net_traits::ResourceThreads;
@@ -22,6 +23,7 @@ use script_bindings::codegen::GenericBindings::DebuggerGlobalScopeBinding::{
 use script_bindings::realms::InRealm;
 use script_bindings::reflector::DomObject;
 use servo_url::{ImmutableOrigin, MutableOrigin, ServoUrl};
+use storage_traits::StorageThreads;
 
 use crate::dom::bindings::codegen::Bindings::DebuggerGlobalScopeBinding;
 use crate::dom::bindings::error::report_pending_exception;
@@ -34,7 +36,6 @@ use crate::dom::types::{DebuggerAddDebuggeeEvent, DebuggerGetPossibleBreakpoints
 #[cfg(feature = "webgpu")]
 use crate::dom::webgpu::identityhub::IdentityHub;
 use crate::realms::enter_realm;
-use crate::script_module::ScriptFetchOptions;
 use crate::script_runtime::{CanGc, IntroductionType, JSContext};
 
 #[dom_struct]
@@ -44,10 +45,10 @@ use crate::script_runtime::{CanGc, IntroductionType, JSContext};
 pub(crate) struct DebuggerGlobalScope {
     global_scope: GlobalScope,
     #[no_trace]
-    devtools_to_script_sender: IpcSender<DevtoolScriptControlMsg>,
+    devtools_to_script_sender: GenericSender<DevtoolScriptControlMsg>,
     #[no_trace]
     get_possible_breakpoints_result_sender:
-        RefCell<Option<IpcSender<Vec<devtools_traits::RecommendedBreakpointLocation>>>>,
+        RefCell<Option<GenericSender<Vec<devtools_traits::RecommendedBreakpointLocation>>>>,
 }
 
 impl DebuggerGlobalScope {
@@ -58,15 +59,17 @@ impl DebuggerGlobalScope {
     ///   pipeline ids, and they may contain debuggees from more than one pipeline
     /// - in web worker threads, it should be set to the pipeline id of the page that created the thread, because
     ///   those threads can’t generate pipeline ids, and they only contain one debuggee from one pipeline
-    #[allow(unsafe_code, clippy::too_many_arguments)]
+    #[expect(unsafe_code, clippy::too_many_arguments)]
     pub(crate) fn new(
         debugger_pipeline_id: PipelineId,
-        script_to_devtools_sender: Option<IpcSender<ScriptToDevtoolsControlMsg>>,
-        devtools_to_script_sender: IpcSender<DevtoolScriptControlMsg>,
+        script_to_devtools_sender: Option<GenericCallback<ScriptToDevtoolsControlMsg>>,
+        devtools_to_script_sender: GenericSender<DevtoolScriptControlMsg>,
         mem_profiler_chan: mem::ProfilerChan,
         time_profiler_chan: time::ProfilerChan,
         script_to_constellation_chan: ScriptToConstellationChan,
+        script_to_embedder_chan: ScriptToEmbedderChan,
         resource_threads: ResourceThreads,
+        storage_threads: StorageThreads,
         #[cfg(feature = "webgpu")] gpu_id_hub: std::sync::Arc<IdentityHub>,
         can_gc: CanGc,
     ) -> DomRoot<Self> {
@@ -77,12 +80,13 @@ impl DebuggerGlobalScope {
                 mem_profiler_chan,
                 time_profiler_chan,
                 script_to_constellation_chan,
+                script_to_embedder_chan,
                 resource_threads,
+                storage_threads,
                 MutableOrigin::new(ImmutableOrigin::new_opaque()),
                 ServoUrl::parse_with_base(None, "about:internal/debugger")
                     .expect("Guaranteed by argument"),
                 None,
-                Default::default(),
                 #[cfg(feature = "webgpu")]
                 gpu_id_hub,
                 None,
@@ -118,21 +122,19 @@ impl DebuggerGlobalScope {
         self.upcast::<GlobalScope>()
     }
 
-    fn evaluate_js(&self, script: &str, can_gc: CanGc) -> Result<(), JavaScriptEvaluationError> {
+    fn evaluate_js(
+        &self,
+        script: Cow<'_, str>,
+        can_gc: CanGc,
+    ) -> Result<(), JavaScriptEvaluationError> {
         rooted!(in (*Self::get_cx()) let mut rval = UndefinedValue());
-        self.global_scope.evaluate_js_on_global_with_result(
-            script,
-            rval.handle_mut(),
-            ScriptFetchOptions::default_classic_script(&self.global_scope),
-            self.global_scope.api_base_url(),
-            can_gc,
-            None,
-        )
+        self.global_scope
+            .evaluate_js_on_global(script, "", None, rval.handle_mut(), can_gc)
     }
 
     pub(crate) fn execute(&self, can_gc: CanGc) {
         if self
-            .evaluate_js(&resources::read_string(Resource::DebuggerJS), can_gc)
+            .evaluate_js(resources::read_string(Resource::DebuggerJS).into(), can_gc)
             .is_err()
         {
             let ar = enter_realm(self);
@@ -147,6 +149,7 @@ impl DebuggerGlobalScope {
         debuggee_pipeline_id: PipelineId,
         debuggee_worker_id: Option<WorkerId>,
     ) {
+        let _realm = enter_realm(self);
         let debuggee_pipeline_id =
             crate::dom::pipelineid::PipelineId::new(self.upcast(), debuggee_pipeline_id, can_gc);
         let event = DomRoot::upcast::<Event>(DebuggerAddDebuggeeEvent::new(
@@ -166,13 +169,14 @@ impl DebuggerGlobalScope {
         &self,
         can_gc: CanGc,
         spidermonkey_id: u32,
-        result_sender: IpcSender<Vec<devtools_traits::RecommendedBreakpointLocation>>,
+        result_sender: GenericSender<Vec<devtools_traits::RecommendedBreakpointLocation>>,
     ) {
         assert!(
             self.get_possible_breakpoints_result_sender
                 .replace(Some(result_sender))
                 .is_none()
         );
+        let _realm = enter_realm(self);
         let event = DomRoot::upcast::<Event>(DebuggerGetPossibleBreakpointsEvent::new(
             self.upcast(),
             spidermonkey_id,
@@ -211,7 +215,7 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
             // (currently impossible to do robustly due to <https://bugzilla.mozilla.org/show_bug.cgi?id=1982001>)
             let url_original = args.url.str();
             // FIXME: use page/worker url as base here
-            let url_original = ServoUrl::parse(url_original).ok();
+            let url_original = ServoUrl::parse(&url_original).ok();
 
             // If the source has a `urlOverride` (aka `displayURL` aka `//# sourceURL`), it should be a valid url,
             // possibly relative to the page/worker url, and we should treat the source as coming from that url for
@@ -222,7 +226,7 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
                 .as_ref()
                 .map(|url| url.str())
                 // FIXME: use page/worker url as base here, not `url_original`
-                .and_then(|url| ServoUrl::parse_with_base(url_original.as_ref(), url).ok());
+                .and_then(|url| ServoUrl::parse_with_base(url_original.as_ref(), &url).ok());
 
             // If the `introductionType` is “eval or eval-like”, the `url` won’t be meaningful, so ignore these
             // sources unless we have a `urlOverride` (aka `displayURL` aka `//# sourceURL`).
@@ -236,7 +240,7 @@ impl DebuggerGlobalScopeMethods<crate::DomTypeHolder> for DebuggerGlobalScope {
                 IntroductionType::EVENT_HANDLER_STR,
                 IntroductionType::DOM_TIMER_STR,
             ]
-            .contains(&introduction_type.str()) &&
+            .contains(&&*introduction_type.str()) &&
                 url_override.is_none()
             {
                 debug!(

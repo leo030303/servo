@@ -7,6 +7,7 @@
 
 use std::default::Default;
 use std::path::PathBuf;
+use std::process;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -15,11 +16,6 @@ use servo_url::ServoUrl;
 /// Global flags for Servo, currently set on the command line.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Opts {
-    /// Whether or not Servo should wait for web content to go into an idle state, therefore
-    /// likely producing a stable output image. This is useful for taking screenshots of pages
-    /// after they have loaded.
-    pub wait_for_stable_image: bool,
-
     /// `None` to disable the time profiler or `Some` to enable it with:
     ///
     ///  - an interval in seconds to cause it to produce output on that interval.
@@ -42,7 +38,7 @@ pub struct Opts {
 
     /// Debug options that are used by developers to control Servo
     /// behavior for debugging purposes.
-    pub debug: DebugOptions,
+    pub debug: DiagnosticsLogging,
 
     /// Whether we're running in multiprocess mode.
     pub multiprocess: bool,
@@ -66,7 +62,7 @@ pub struct Opts {
     pub random_pipeline_closure_seed: Option<usize>,
 
     /// Load shaders from disk.
-    pub shaders_dir: Option<PathBuf>,
+    pub shaders_path: Option<PathBuf>,
 
     /// Directory for a default config directory
     pub config_dir: Option<PathBuf>,
@@ -94,81 +90,115 @@ pub struct Opts {
 
 /// Debug options for Servo, currently set on the command line with -Z
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct DebugOptions {
+pub struct DiagnosticsLogging {
     /// List all the debug options.
     pub help: bool,
 
     /// Print the DOM after each restyle.
-    pub dump_style_tree: bool,
+    pub style_tree: bool,
 
-    /// Dumps the rule tree.
-    pub dump_rule_tree: bool,
+    /// Log the rule tree.
+    pub rule_tree: bool,
 
-    /// Print the fragment tree after each layout.
-    pub dump_flow_tree: bool,
+    /// Log the fragment tree after each layout.
+    pub flow_tree: bool,
 
-    /// Print the stacking context tree after each layout.
-    pub dump_stacking_context_tree: bool,
+    /// Log the stacking context tree after each layout.
+    pub stacking_context_tree: bool,
 
-    /// Print the scroll tree after each layout.
-    pub dump_scroll_tree: bool,
+    /// Log the scroll tree after each layout.
+    ///
+    /// Displays the hierarchy of scrollable areas and their properties.
+    pub scroll_tree: bool,
 
-    /// Print the display list after each layout.
-    pub dump_display_list: bool,
+    /// Log the display list after each layout.
+    pub display_list: bool,
 
-    /// Print notifications when there is a relayout.
+    /// Log notifications when a relayout occurs.
     pub relayout_event: bool,
 
-    /// Periodically print out on which events script threads spend their processing time.
+    /// Periodically log on which events script threads spend their processing time.
     pub profile_script_events: bool,
 
-    /// True if each step of layout is traced to an external JSON file
-    /// for debugging purposes. Setting this implies sequential layout
-    /// and paint.
-    pub trace_layout: bool,
+    /// Log style sharing cache statistics to after each restyle.
+    ///
+    /// Shows hit/miss statistics for the style sharing cache
+    pub style_statistics: bool,
 
-    /// Disable the style sharing cache.
-    pub disable_share_style_cache: bool,
-
-    /// Whether to show in stdout style sharing cache stats after a restyle.
-    pub dump_style_statistics: bool,
-
-    /// Translate mouse input into touch events.
-    pub convert_mouse_to_touch: bool,
-
-    /// Log GC passes and their durations.
+    /// Log garbage collection passes and their durations.
     pub gc_profile: bool,
-
-    /// Show webrender profiling stats on screen.
-    pub webrender_stats: bool,
-
-    /// True to use OS native signposting facilities. This makes profiling events (script activity,
-    /// reflow, compositing, etc.) appear in Instruments.app on macOS.
-    pub signpost: bool,
 }
 
-impl DebugOptions {
-    pub fn extend(&mut self, debug_string: String) -> Result<(), String> {
-        for option in debug_string.split(',') {
+impl DiagnosticsLogging {
+    /// Create a new DiagnosticsLogging configuration.
+    ///
+    /// In non-production builds, this will automatically read and parse the
+    /// SERVO_DIAGNOSTICS environment variable if it is set.
+    pub fn new() -> Self {
+        let mut config: DiagnosticsLogging = Default::default();
+
+        // Disabled for production builds
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(diagnostics_var) = std::env::var("SERVO_DIAGNOSTICS") {
+                if let Err(error) = config.extend_from_string(&diagnostics_var) {
+                    eprintln!("Could not parse debug logging option: {error}");
+                }
+            }
+        }
+
+        config
+    }
+
+    /// Print available diagnostic logging options and their descriptions.
+    fn print_debug_options_usage(app: &str) {
+        fn print_option(name: &str, description: &str) {
+            println!("\t{:<35} {}", name, description);
+        }
+
+        println!(
+            "Usage: {} debug option,[options,...]\n\twhere options include\n\nOptions:",
+            app
+        );
+        print_option("help", "Show this help message");
+        print_option("style-tree", "Log the style tree after each restyle");
+        print_option("rule-tree", "Log the rule tree");
+        print_option("flow-tree", "Log the fragment tree after each layout");
+        print_option(
+            "stacking-context-tree",
+            "Log the stacking context tree after each layout",
+        );
+        print_option("scroll-tree", "Log the scroll tree after each layout");
+        print_option("display-list", "Log the display list after each layout");
+        print_option("style-stats", "Log style sharing cache statistics");
+        print_option("relayout-event", "Log when relayout occurs");
+        print_option("profile-script-events", "Log script event processing time");
+        print_option("gc-profile", "Log garbage collection statistics");
+        println!();
+
+        process::exit(0);
+    }
+
+    /// Extend the current configuration with additional options.
+    ///
+    /// Parses the string and merges any enabled options into the current configuration.
+    pub fn extend_from_string(&mut self, option_string: &str) -> Result<(), String> {
+        for option in option_string.split(',') {
+            let option = option.trim();
             match option {
-                "help" => self.help = true,
-                "convert-mouse-to-touch" => self.convert_mouse_to_touch = true,
-                "disable-share-style-cache" => self.disable_share_style_cache = true,
-                "dump-display-list" => self.dump_display_list = true,
-                "dump-stacking-context-tree" => self.dump_stacking_context_tree = true,
-                "dump-flow-tree" => self.dump_flow_tree = true,
-                "dump-rule-tree" => self.dump_rule_tree = true,
-                "dump-style-tree" => self.dump_style_tree = true,
-                "dump-scroll-tree" => self.dump_scroll_tree = true,
+                "help" => Self::print_debug_options_usage("servo"),
+                "display-list" => self.display_list = true,
+                "stacking-context-tree" => self.stacking_context_tree = true,
+                "flow-tree" => self.flow_tree = true,
+                "rule-tree" => self.rule_tree = true,
+                "style-tree" => self.style_tree = true,
+                "style-stats" => self.style_statistics = true,
+                "scroll-tree" => self.scroll_tree = true,
                 "gc-profile" => self.gc_profile = true,
                 "profile-script-events" => self.profile_script_events = true,
                 "relayout-event" => self.relayout_event = true,
-                "signpost" => self.signpost = true,
-                "dump-style-stats" => self.dump_style_statistics = true,
-                "trace-layout" => self.trace_layout = true,
-                "wr-stats" => self.webrender_stats = true,
                 "" => {},
-                _ => return Err(String::from(option)),
+                _ => return Err(format!("Unknown diagnostic option: {option}")),
             };
         }
 
@@ -176,7 +206,7 @@ impl DebugOptions {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum OutputOptions {
     /// Database connection config (hostname, name, user, pass)
     FileName(String),
@@ -186,7 +216,6 @@ pub enum OutputOptions {
 impl Default for Opts {
     fn default() -> Self {
         Self {
-            wait_for_stable_image: false,
             time_profiling: None,
             time_profiler_trace_path: None,
             nonincremental_layout: false,
@@ -200,7 +229,7 @@ impl Default for Opts {
             sandbox: false,
             debug: Default::default(),
             config_dir: None,
-            shaders_dir: None,
+            shaders_path: None,
             certificate_path: None,
             ignore_certificate_errors: false,
             unminify_js: false,

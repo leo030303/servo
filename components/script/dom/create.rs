@@ -6,86 +6,87 @@ use html5ever::{LocalName, Prefix, QualName, local_name, ns};
 use js::rust::HandleObject;
 
 use crate::dom::bindings::error::{report_pending_exception, throw_dom_exception};
+use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::customelementregistry::{
-    CustomElementState, is_valid_custom_element_name, upgrade_element,
+    CustomElementRegistry, CustomElementState, is_valid_custom_element_name, upgrade_element,
 };
 use crate::dom::document::Document;
 use crate::dom::element::{CustomElementCreationMode, Element, ElementCreator};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::htmlanchorelement::HTMLAnchorElement;
-use crate::dom::htmlareaelement::HTMLAreaElement;
-use crate::dom::htmlaudioelement::HTMLAudioElement;
-use crate::dom::htmlbaseelement::HTMLBaseElement;
-use crate::dom::htmlbodyelement::HTMLBodyElement;
-use crate::dom::htmlbrelement::HTMLBRElement;
-use crate::dom::htmlbuttonelement::HTMLButtonElement;
-use crate::dom::htmlcanvaselement::HTMLCanvasElement;
-use crate::dom::htmldataelement::HTMLDataElement;
-use crate::dom::htmldatalistelement::HTMLDataListElement;
-use crate::dom::htmldetailselement::HTMLDetailsElement;
-use crate::dom::htmldialogelement::HTMLDialogElement;
-use crate::dom::htmldirectoryelement::HTMLDirectoryElement;
-use crate::dom::htmldivelement::HTMLDivElement;
-use crate::dom::htmldlistelement::HTMLDListElement;
-use crate::dom::htmlelement::HTMLElement;
-use crate::dom::htmlembedelement::HTMLEmbedElement;
-use crate::dom::htmlfieldsetelement::HTMLFieldSetElement;
-use crate::dom::htmlfontelement::HTMLFontElement;
-use crate::dom::htmlformelement::HTMLFormElement;
-use crate::dom::htmlframeelement::HTMLFrameElement;
-use crate::dom::htmlframesetelement::HTMLFrameSetElement;
-use crate::dom::htmlheadelement::HTMLHeadElement;
-use crate::dom::htmlheadingelement::{HTMLHeadingElement, HeadingLevel};
-use crate::dom::htmlhrelement::HTMLHRElement;
-use crate::dom::htmlhtmlelement::HTMLHtmlElement;
-use crate::dom::htmliframeelement::HTMLIFrameElement;
-use crate::dom::htmlimageelement::HTMLImageElement;
-use crate::dom::htmlinputelement::HTMLInputElement;
-use crate::dom::htmllabelelement::HTMLLabelElement;
-use crate::dom::htmllegendelement::HTMLLegendElement;
-use crate::dom::htmllielement::HTMLLIElement;
-use crate::dom::htmllinkelement::HTMLLinkElement;
-use crate::dom::htmlmapelement::HTMLMapElement;
-use crate::dom::htmlmenuelement::HTMLMenuElement;
-use crate::dom::htmlmetaelement::HTMLMetaElement;
-use crate::dom::htmlmeterelement::HTMLMeterElement;
-use crate::dom::htmlmodelement::HTMLModElement;
-use crate::dom::htmlobjectelement::HTMLObjectElement;
-use crate::dom::htmlolistelement::HTMLOListElement;
-use crate::dom::htmloptgroupelement::HTMLOptGroupElement;
-use crate::dom::htmloptionelement::HTMLOptionElement;
-use crate::dom::htmloutputelement::HTMLOutputElement;
-use crate::dom::htmlparagraphelement::HTMLParagraphElement;
-use crate::dom::htmlparamelement::HTMLParamElement;
-use crate::dom::htmlpictureelement::HTMLPictureElement;
-use crate::dom::htmlpreelement::HTMLPreElement;
-use crate::dom::htmlprogresselement::HTMLProgressElement;
-use crate::dom::htmlquoteelement::HTMLQuoteElement;
-use crate::dom::htmlscriptelement::HTMLScriptElement;
-use crate::dom::htmlselectelement::HTMLSelectElement;
-use crate::dom::htmlslotelement::HTMLSlotElement;
-use crate::dom::htmlsourceelement::HTMLSourceElement;
-use crate::dom::htmlspanelement::HTMLSpanElement;
-use crate::dom::htmlstyleelement::HTMLStyleElement;
-use crate::dom::htmltablecaptionelement::HTMLTableCaptionElement;
-use crate::dom::htmltablecellelement::HTMLTableCellElement;
-use crate::dom::htmltablecolelement::HTMLTableColElement;
-use crate::dom::htmltableelement::HTMLTableElement;
-use crate::dom::htmltablerowelement::HTMLTableRowElement;
-use crate::dom::htmltablesectionelement::HTMLTableSectionElement;
-use crate::dom::htmltemplateelement::HTMLTemplateElement;
-use crate::dom::htmltextareaelement::HTMLTextAreaElement;
-use crate::dom::htmltimeelement::HTMLTimeElement;
-use crate::dom::htmltitleelement::HTMLTitleElement;
-use crate::dom::htmltrackelement::HTMLTrackElement;
-use crate::dom::htmlulistelement::HTMLUListElement;
-use crate::dom::htmlunknownelement::HTMLUnknownElement;
-use crate::dom::htmlvideoelement::HTMLVideoElement;
-use crate::dom::svgelement::SVGElement;
-use crate::dom::svgimageelement::SVGImageElement;
-use crate::dom::svgsvgelement::SVGSVGElement;
+use crate::dom::html::htmlanchorelement::HTMLAnchorElement;
+use crate::dom::html::htmlareaelement::HTMLAreaElement;
+use crate::dom::html::htmlaudioelement::HTMLAudioElement;
+use crate::dom::html::htmlbaseelement::HTMLBaseElement;
+use crate::dom::html::htmlbodyelement::HTMLBodyElement;
+use crate::dom::html::htmlbrelement::HTMLBRElement;
+use crate::dom::html::htmlbuttonelement::HTMLButtonElement;
+use crate::dom::html::htmlcanvaselement::HTMLCanvasElement;
+use crate::dom::html::htmldataelement::HTMLDataElement;
+use crate::dom::html::htmldatalistelement::HTMLDataListElement;
+use crate::dom::html::htmldetailselement::HTMLDetailsElement;
+use crate::dom::html::htmldialogelement::HTMLDialogElement;
+use crate::dom::html::htmldirectoryelement::HTMLDirectoryElement;
+use crate::dom::html::htmldivelement::HTMLDivElement;
+use crate::dom::html::htmldlistelement::HTMLDListElement;
+use crate::dom::html::htmlelement::HTMLElement;
+use crate::dom::html::htmlembedelement::HTMLEmbedElement;
+use crate::dom::html::htmlfieldsetelement::HTMLFieldSetElement;
+use crate::dom::html::htmlfontelement::HTMLFontElement;
+use crate::dom::html::htmlformelement::HTMLFormElement;
+use crate::dom::html::htmlframeelement::HTMLFrameElement;
+use crate::dom::html::htmlframesetelement::HTMLFrameSetElement;
+use crate::dom::html::htmlheadelement::HTMLHeadElement;
+use crate::dom::html::htmlheadingelement::{HTMLHeadingElement, HeadingLevel};
+use crate::dom::html::htmlhrelement::HTMLHRElement;
+use crate::dom::html::htmlhtmlelement::HTMLHtmlElement;
+use crate::dom::html::htmliframeelement::HTMLIFrameElement;
+use crate::dom::html::htmlimageelement::HTMLImageElement;
+use crate::dom::html::htmlinputelement::HTMLInputElement;
+use crate::dom::html::htmllabelelement::HTMLLabelElement;
+use crate::dom::html::htmllegendelement::HTMLLegendElement;
+use crate::dom::html::htmllielement::HTMLLIElement;
+use crate::dom::html::htmllinkelement::HTMLLinkElement;
+use crate::dom::html::htmlmapelement::HTMLMapElement;
+use crate::dom::html::htmlmenuelement::HTMLMenuElement;
+use crate::dom::html::htmlmetaelement::HTMLMetaElement;
+use crate::dom::html::htmlmeterelement::HTMLMeterElement;
+use crate::dom::html::htmlmodelement::HTMLModElement;
+use crate::dom::html::htmlobjectelement::HTMLObjectElement;
+use crate::dom::html::htmlolistelement::HTMLOListElement;
+use crate::dom::html::htmloptgroupelement::HTMLOptGroupElement;
+use crate::dom::html::htmloptionelement::HTMLOptionElement;
+use crate::dom::html::htmloutputelement::HTMLOutputElement;
+use crate::dom::html::htmlparagraphelement::HTMLParagraphElement;
+use crate::dom::html::htmlparamelement::HTMLParamElement;
+use crate::dom::html::htmlpictureelement::HTMLPictureElement;
+use crate::dom::html::htmlpreelement::HTMLPreElement;
+use crate::dom::html::htmlprogresselement::HTMLProgressElement;
+use crate::dom::html::htmlquoteelement::HTMLQuoteElement;
+use crate::dom::html::htmlscriptelement::HTMLScriptElement;
+use crate::dom::html::htmlselectelement::HTMLSelectElement;
+use crate::dom::html::htmlslotelement::HTMLSlotElement;
+use crate::dom::html::htmlsourceelement::HTMLSourceElement;
+use crate::dom::html::htmlspanelement::HTMLSpanElement;
+use crate::dom::html::htmlstyleelement::HTMLStyleElement;
+use crate::dom::html::htmltablecaptionelement::HTMLTableCaptionElement;
+use crate::dom::html::htmltablecellelement::HTMLTableCellElement;
+use crate::dom::html::htmltablecolelement::HTMLTableColElement;
+use crate::dom::html::htmltableelement::HTMLTableElement;
+use crate::dom::html::htmltablerowelement::HTMLTableRowElement;
+use crate::dom::html::htmltablesectionelement::HTMLTableSectionElement;
+use crate::dom::html::htmltemplateelement::HTMLTemplateElement;
+use crate::dom::html::htmltextareaelement::HTMLTextAreaElement;
+use crate::dom::html::htmltimeelement::HTMLTimeElement;
+use crate::dom::html::htmltitleelement::HTMLTitleElement;
+use crate::dom::html::htmltrackelement::HTMLTrackElement;
+use crate::dom::html::htmlulistelement::HTMLUListElement;
+use crate::dom::html::htmlunknownelement::HTMLUnknownElement;
+use crate::dom::html::htmlvideoelement::HTMLVideoElement;
+use crate::dom::svg::svgelement::SVGElement;
+use crate::dom::svg::svgimageelement::SVGImageElement;
+use crate::dom::svg::svgsvgelement::SVGSVGElement;
 use crate::realms::{InRealm, enter_realm};
 use crate::script_runtime::CanGc;
 use crate::script_thread::ScriptThread;
@@ -117,8 +118,7 @@ fn create_svg_element(
 }
 
 /// <https://dom.spec.whatwg.org/#concept-create-element>
-#[allow(unsafe_code)]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 fn create_html_element(
     name: QualName,
     prefix: Option<Prefix>,
@@ -131,47 +131,56 @@ fn create_html_element(
 ) -> DomRoot<Element> {
     assert_eq!(name.ns, ns!(html));
 
-    // Step 2. Let definition be the result of looking up a custom element
+    // Step 2. If registry is "default", then set registry
+    // to the result of looking up a custom element registry given document.
+    // TODO: We don't pass in any other value than "default" atm
+    let registry = CustomElementRegistry::lookup_a_custom_element_registry(document.upcast());
+
+    // Step 3. Let definition be the result of looking up a custom element
     // definition given document, namespace, localName, and is.
     let definition = document.lookup_custom_element_definition(&name.ns, &name.local, is.as_ref());
 
-    // Step 3. If definition is non-null...
+    // Step 4. If definition is non-null...
     if let Some(definition) = definition {
         // ...and definition’s name is not equal to its local name
         // (i.e., definition represents a customized built-in element):
         if !definition.is_autonomous() {
-            // Step 3.1. Let interface be the element interface for localName and the HTML namespace.
-            // Step 3.2. Set result to a new element that implements interface, with no attributes,
-            // namespace set to the HTML namespace, namespace prefix set to prefix,
-            // local name set to localName, custom element state set to "undefined",
-            // custom element definition set to null, is value set to is,
-            // and node document set to document.
+            // Step 4.1. Let interface be the element interface for localName and the HTML namespace.
+            // Step 4.2. Set result to the result of creating an element internal given document,
+            // interface, localName, the HTML namespace, prefix, "undefined", is, and registry.
             let element = create_native_html_element(name, prefix, document, creator, proto);
             element.set_is(definition.name.clone());
             element.set_custom_element_state(CustomElementState::Undefined);
+            element.set_custom_element_registry(registry);
+
             match mode {
-                // Step 3.3. If synchronousCustomElements is true, then run this step while catching any exceptions:
+                // Step 4.3. If synchronousCustomElements is true, then run this step while catching any exceptions:
                 CustomElementCreationMode::Synchronous => {
-                    // Step 3.3.1. Upgrade result using definition.
+                    // Step 4.3.1. Upgrade result using definition.
                     upgrade_element(definition, &element, can_gc);
                     // TODO: "If this step threw an exception exception:" steps.
                 },
-                // Step 3.4. Otherwise, enqueue a custom element upgrade reaction given result and definition.
+                // Step 4.4. Otherwise, enqueue a custom element upgrade reaction given result and definition.
                 CustomElementCreationMode::Asynchronous => {
                     ScriptThread::enqueue_upgrade_reaction(&element, definition)
                 },
             }
             return element;
         } else {
-            // Step 4. Otherwise, if definition is non-null:
+            // Step 5. Otherwise, if definition is non-null:
             match mode {
-                // Step 4.1. If synchronousCustomElements is true, then run these
+                // Step 5.1. If synchronousCustomElements is true, then run these
                 // steps while catching any exceptions:
                 CustomElementCreationMode::Synchronous => {
                     let local_name = name.local.clone();
                     // TODO(jdm) Pass proto to create_element?
                     // Steps 4.1.1-4.1.11
-                    return match definition.create_element(document, prefix.clone(), can_gc) {
+                    return match definition.create_element(
+                        document,
+                        prefix.clone(),
+                        registry.clone(),
+                        can_gc,
+                    ) {
                         Ok(element) => {
                             element.set_custom_element_definition(definition.clone());
                             element
@@ -189,15 +198,13 @@ fn create_html_element(
                             throw_dom_exception(cx, &global, error, can_gc);
                             report_pending_exception(cx, true, InRealm::Entered(&ar), can_gc);
 
-                            // Substep 2. Set result to a new element that implements the HTMLUnknownElement interface,
-                            // with no attributes, namespace set to the HTML namespace, namespace prefix set to prefix,
-                            // local name set to localName, custom element state set to "failed",
-                            // custom element definition set to null, is value set to null,
-                            // and node document set to document.
+                            // Substep 2. Set result to the result of creating an element internal given document,
+                            // HTMLUnknownElement, localName, the HTML namespace, prefix, "failed", null, and registry.
                             let element = DomRoot::upcast::<Element>(HTMLUnknownElement::new(
                                 local_name, prefix, document, proto, can_gc,
                             ));
                             element.set_custom_element_state(CustomElementState::Failed);
+                            element.set_custom_element_registry(registry);
                             element
                         },
                     };
@@ -217,6 +224,7 @@ fn create_html_element(
                         can_gc,
                     ));
                     result.set_custom_element_state(CustomElementState::Undefined);
+                    result.set_custom_element_registry(registry);
                     // Step 4.2.2. Enqueue a custom element upgrade reaction given result and definition.
                     ScriptThread::enqueue_upgrade_reaction(&result, definition);
                     return result;
@@ -238,12 +246,16 @@ fn create_html_element(
         Some(is) => {
             result.set_is(is);
             result.set_custom_element_state(CustomElementState::Undefined);
+            result.set_custom_element_registry(registry);
         },
         None => {
             if is_valid_custom_element_name(&name.local) {
                 result.set_custom_element_state(CustomElementState::Undefined);
+                result.set_custom_element_registry(registry);
             } else {
-                result.set_custom_element_state(CustomElementState::Uncustomized);
+                // Note: This is a performance optimization. See the doc comment of the method for
+                // more information.
+                result.set_initial_custom_element_state_to_uncustomized();
             }
         },
     };

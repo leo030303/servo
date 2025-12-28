@@ -8,6 +8,7 @@ use std::rc::Rc;
 use dom_struct::dom_struct;
 use js::rust::{HandleObject, MutableHandleValue};
 use net_traits::image_cache::Image;
+use script_bindings::match_domstring_ascii;
 
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::DataTransferBinding::DataTransferMethods;
@@ -18,7 +19,7 @@ use crate::dom::bindings::str::DOMString;
 use crate::dom::datatransferitemlist::DataTransferItemList;
 use crate::dom::element::Element;
 use crate::dom::filelist::FileList;
-use crate::dom::htmlimageelement::HTMLImageElement;
+use crate::dom::html::htmlimageelement::HTMLImageElement;
 use crate::dom::window::Window;
 use crate::drag_data_store::{DragDataStore, Mode};
 use crate::script_runtime::{CanGc, JSContext};
@@ -42,7 +43,7 @@ pub(crate) struct DataTransfer {
     drop_effect: DomRefCell<DOMString>,
     effect_allowed: DomRefCell<DOMString>,
     items: Dom<DataTransferItemList>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     #[no_trace]
     data_store: Rc<RefCell<Option<DragDataStore>>>,
 }
@@ -112,7 +113,7 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
 
     /// <https://html.spec.whatwg.org/multipage/#dom-datatransfer-dropeffect>
     fn SetDropEffect(&self, value: DOMString) {
-        if VALID_DROP_EFFECTS.contains(&value.as_ref()) {
+        if VALID_DROP_EFFECTS.contains(&&*value.str()) {
             *self.drop_effect.borrow_mut() = value;
         }
     }
@@ -129,7 +130,7 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
             .borrow()
             .as_ref()
             .is_some_and(|data_store| data_store.mode() == Mode::ReadWrite) &&
-            VALID_EFFECTS_ALLOWED.contains(&value.as_ref())
+            VALID_EFFECTS_ALLOWED.contains(&&*value.str())
         {
             *self.drop_effect.borrow_mut() = value;
         }
@@ -187,7 +188,7 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
         // Step 4 Let convert-to-URL be false.
         let mut convert_to_url = false;
 
-        let type_ = match format.as_ref() {
+        let type_ = match_domstring_ascii!(format,
             // Step 5 If format equals "text", change it to "text/plain".
             "text" => DOMString::from("text/plain"),
             // Step 6 If format equals "url", change it to "text/uri-list" and set convert-to-URL to true.
@@ -195,8 +196,7 @@ impl DataTransferMethods<crate::DomTypeHolder> for DataTransfer {
                 convert_to_url = true;
                 DOMString::from("text/uri-list")
             },
-            _ => format,
-        };
+            _ => format.clone(),);
 
         let data = data_store.find_matching_text(&type_);
 

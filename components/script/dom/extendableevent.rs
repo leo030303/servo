@@ -26,7 +26,6 @@ pub(crate) struct ExtendableEvent {
     extensions_allowed: bool,
 }
 
-#[allow(non_snake_case)]
 impl ExtendableEvent {
     pub(crate) fn new_inherited() -> ExtendableEvent {
         ExtendableEvent {
@@ -68,7 +67,7 @@ impl ExtendableEvent {
 }
 
 impl ExtendableEventMethods<crate::DomTypeHolder> for ExtendableEvent {
-    // https://w3c.github.io/ServiceWorker/#dom-extendableevent-extendableevent
+    /// <https://w3c.github.io/ServiceWorker/#dom-extendableevent-extendableevent>
     fn Constructor(
         worker: &ServiceWorkerGlobalScope,
         proto: Option<HandleObject>,
@@ -86,18 +85,18 @@ impl ExtendableEventMethods<crate::DomTypeHolder> for ExtendableEvent {
         ))
     }
 
-    // https://w3c.github.io/ServiceWorker/#wait-until-method
+    /// <https://w3c.github.io/ServiceWorker/#wait-until-method>
     fn WaitUntil(&self, _cx: JSContext, _val: HandleValue) -> ErrorResult {
         // Step 1
         if !self.extensions_allowed {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         // Step 2
         // TODO add a extended_promises array to enqueue the `val`
         Ok(())
     }
 
-    // https://dom.spec.whatwg.org/#dom-event-istrusted
+    /// <https://dom.spec.whatwg.org/#dom-event-istrusted>
     fn IsTrusted(&self) -> bool {
         self.event.IsTrusted()
     }

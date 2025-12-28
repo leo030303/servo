@@ -42,7 +42,7 @@ impl AudioListener {
         let position_x = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Position(ParamDir::X),
             AutomationRate::A_rate,
@@ -54,7 +54,7 @@ impl AudioListener {
         let position_y = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Position(ParamDir::Y),
             AutomationRate::A_rate,
@@ -66,7 +66,7 @@ impl AudioListener {
         let position_z = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Position(ParamDir::Z),
             AutomationRate::A_rate,
@@ -78,7 +78,7 @@ impl AudioListener {
         let forward_x = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Forward(ParamDir::X),
             AutomationRate::A_rate,
@@ -90,7 +90,7 @@ impl AudioListener {
         let forward_y = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Forward(ParamDir::Y),
             AutomationRate::A_rate,
@@ -102,7 +102,7 @@ impl AudioListener {
         let forward_z = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Forward(ParamDir::Z),
             AutomationRate::A_rate,
@@ -114,7 +114,7 @@ impl AudioListener {
         let up_x = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Up(ParamDir::X),
             AutomationRate::A_rate,
@@ -126,7 +126,7 @@ impl AudioListener {
         let up_y = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Up(ParamDir::Y),
             AutomationRate::A_rate,
@@ -138,7 +138,7 @@ impl AudioListener {
         let up_z = AudioParam::new(
             window,
             context,
-            node,
+            Some(node),
             AudioNodeType::AudioListenerNode,
             ParamType::Up(ParamDir::Z),
             AutomationRate::A_rate,
@@ -173,48 +173,48 @@ impl AudioListener {
     }
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 impl AudioListenerMethods<crate::DomTypeHolder> for AudioListener {
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-positionx
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-positionx>
     fn PositionX(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.position_x)
     }
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-positiony
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-positiony>
     fn PositionY(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.position_y)
     }
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-positionz
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-positionz>
     fn PositionZ(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.position_z)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardx
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardx>
     fn ForwardX(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.forward_x)
     }
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardy
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardy>
     fn ForwardY(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.forward_y)
     }
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardz
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-forwardz>
     fn ForwardZ(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.forward_z)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-upx
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-upx>
     fn UpX(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.up_x)
     }
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-upy
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-upy>
     fn UpY(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.up_y)
     }
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-upz
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-upz>
     fn UpZ(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.up_z)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-setorientation
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-setorientation>
     fn SetOrientation(
         &self,
         x: Finite<f32>,
@@ -233,7 +233,7 @@ impl AudioListenerMethods<crate::DomTypeHolder> for AudioListener {
         Ok(DomRoot::from_ref(self))
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiolistener-setposition
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiolistener-setposition>
     fn SetPosition(
         &self,
         x: Finite<f32>,

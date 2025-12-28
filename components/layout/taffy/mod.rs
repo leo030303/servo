@@ -92,7 +92,7 @@ pub(crate) struct TaffyItemBox {
     pub(crate) taffy_level_box: TaffyItemBoxInner,
 }
 
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 #[derive(Debug, MallocSizeOf)]
 pub(crate) enum TaffyItemBoxInner {
     InFlowBox(IndependentFormattingContext),
@@ -128,26 +128,7 @@ impl TaffyItemBox {
         }
     }
 
-    pub(crate) fn clear_fragment_layout_cache(&mut self) {
-        self.taffy_layout = Default::default();
-        self.positioning_context = PositioningContext::default();
-        match self.taffy_level_box {
-            TaffyItemBoxInner::InFlowBox(ref independent_formatting_context) => {
-                independent_formatting_context
-                    .base
-                    .clear_fragment_layout_cache()
-            },
-            TaffyItemBoxInner::OutOfFlowAbsolutelyPositionedBox(ref positioned_box) => {
-                positioned_box
-                    .borrow()
-                    .context
-                    .base
-                    .clear_fragment_layout_cache()
-            },
-        }
-    }
-
-    pub(crate) fn with_base<T>(&self, callback: impl Fn(&LayoutBoxBase) -> T) -> T {
+    pub(crate) fn with_base<T>(&self, callback: impl FnOnce(&LayoutBoxBase) -> T) -> T {
         match self.taffy_level_box {
             TaffyItemBoxInner::InFlowBox(ref independent_formatting_context) => {
                 callback(&independent_formatting_context.base)
@@ -158,7 +139,7 @@ impl TaffyItemBox {
         }
     }
 
-    pub(crate) fn with_base_mut<T>(&mut self, callback: impl Fn(&mut LayoutBoxBase) -> T) -> T {
+    pub(crate) fn with_base_mut<T>(&mut self, callback: impl FnOnce(&mut LayoutBoxBase) -> T) -> T {
         match &mut self.taffy_level_box {
             TaffyItemBoxInner::InFlowBox(independent_formatting_context) => {
                 callback(&mut independent_formatting_context.base)

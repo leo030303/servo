@@ -5,7 +5,7 @@
 use std::vec::IntoIter;
 
 use app_units::Au;
-use fonts::FontMetrics;
+use fonts::{FontMetrics, FontRef};
 use malloc_size_of_derive::MallocSizeOf;
 use script::layout_dom::ServoThreadSafeLayoutNode;
 use servo_arc::Arc as ServoArc;
@@ -39,7 +39,7 @@ pub(crate) struct InlineBox {
     pub is_last_split: bool,
     /// The index of the default font in the [`super::InlineFormattingContext`]'s font metrics store.
     /// This is initialized during IFC shaping.
-    pub default_font_index: Option<usize>,
+    pub default_font: Option<FontRef>,
 }
 
 impl InlineBox {
@@ -51,7 +51,7 @@ impl InlineBox {
             identifier: InlineBoxIdentifier::default(),
             is_first_split: true,
             is_last_split: false,
-            default_font_index: None,
+            default_font: None,
         }
     }
 
@@ -61,6 +61,7 @@ impl InlineBox {
             shared_inline_styles: self.shared_inline_styles.clone(),
             is_first_split: false,
             is_last_split: false,
+            default_font: self.default_font.clone(),
             ..*self
         }
     }
@@ -154,7 +155,7 @@ impl InlineBoxes {
         let is_reversed = to_index < from_index;
 
         // Do not include the first or final token, depending on direction. These can be equal
-        // if we are starting or going to the the root of the inline formatting context, in which
+        // if we are starting or going to the root of the inline formatting context, in which
         // case we don't want to adjust.
         if to_index > from_index && from.is_some() {
             from_index += 1;

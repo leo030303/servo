@@ -6,7 +6,7 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::rust::HandleValue;
-use strum_macros::AsRefStr;
+use strum::AsRefStr;
 
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::codegen::Bindings::TrustedTypePolicyBinding::TrustedTypePolicyMethods;
@@ -31,11 +31,11 @@ pub struct TrustedTypePolicy {
 
     name: String,
 
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     create_html: Option<Rc<CreateHTMLCallback>>,
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     create_script: Option<Rc<CreateScriptCallback>>,
-    #[ignore_malloc_size_of = "Rc has unclear ownership"]
+    #[conditional_malloc_size_of]
     create_script_url: Option<Rc<CreateScriptURLCallback>>,
 }
 
@@ -137,7 +137,7 @@ impl TrustedTypePolicy {
                     // rethrowing any exceptions.
                     callback
                         .Call__(input, arguments, ExceptionHandling::Rethrow, can_gc)
-                        .map(|result| result.map(|str| DOMString::from(str.as_ref())))
+                        .map(|result| result.map(DOMString::from))
                 },
             },
         }

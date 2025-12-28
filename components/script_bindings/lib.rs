@@ -19,6 +19,7 @@ pub mod callback;
 mod constant;
 mod constructor;
 pub mod conversions;
+pub mod domstring;
 pub mod error;
 mod finalize;
 mod guard;
@@ -51,7 +52,7 @@ pub mod codegen {
     pub mod Globals {
         include!(concat!(env!("OUT_DIR"), "/Globals.rs"));
     }
-    #[allow(dead_code, unused_imports, clippy::enum_variant_names)]
+    #[allow(unused_imports, clippy::enum_variant_names)]
     pub mod InheritTypes {
         include!(concat!(env!("OUT_DIR"), "/InheritTypes.rs"));
     }
@@ -63,7 +64,6 @@ pub mod codegen {
         include!(concat!(env!("OUT_DIR"), "/DomTypes.rs"));
     }
     #[allow(
-        dead_code,
         clippy::extra_unused_type_parameters,
         clippy::missing_safety_doc,
         clippy::result_unit_err

@@ -46,6 +46,7 @@ impl OscillatorNode {
         window: &Window,
         context: &BaseAudioContext,
         options: &OscillatorOptions,
+        can_gc: CanGc,
     ) -> Fallible<OscillatorNode> {
         let node_options =
             options
@@ -69,7 +70,7 @@ impl OscillatorNode {
             440.,
             f32::MIN,
             f32::MAX,
-            CanGc::note(),
+            can_gc,
         );
         let detune = AudioParam::new(
             window,
@@ -81,7 +82,7 @@ impl OscillatorNode {
             0.,
             -440. / 2.,
             440. / 2.,
-            CanGc::note(),
+            can_gc,
         );
         Ok(OscillatorNode {
             source_node,
@@ -108,7 +109,7 @@ impl OscillatorNode {
         options: &OscillatorOptions,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<OscillatorNode>> {
-        let node = OscillatorNode::new_inherited(window, context, options)?;
+        let node = OscillatorNode::new_inherited(window, context, options, can_gc)?;
         Ok(reflect_dom_object_with_proto(
             Box::new(node),
             window,
@@ -119,7 +120,7 @@ impl OscillatorNode {
 }
 
 impl OscillatorNodeMethods<crate::DomTypeHolder> for OscillatorNode {
-    // https://webaudio.github.io/web-audio-api/#dom-oscillatornode-oscillatornode
+    /// <https://webaudio.github.io/web-audio-api/#dom-oscillatornode-oscillatornode>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -130,25 +131,25 @@ impl OscillatorNodeMethods<crate::DomTypeHolder> for OscillatorNode {
         OscillatorNode::new_with_proto(window, proto, context, options, can_gc)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-oscillatornode-frequency
+    /// <https://webaudio.github.io/web-audio-api/#dom-oscillatornode-frequency>
     fn Frequency(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.frequency)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-oscillatornode-detune
+    /// <https://webaudio.github.io/web-audio-api/#dom-oscillatornode-detune>
     fn Detune(&self) -> DomRoot<AudioParam> {
         DomRoot::from_ref(&self.detune)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-oscillatornode-type
+    /// <https://webaudio.github.io/web-audio-api/#dom-oscillatornode-type>
     fn Type(&self) -> OscillatorType {
         self.oscillator_type.get()
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-oscillatornode-type
+    /// <https://webaudio.github.io/web-audio-api/#dom-oscillatornode-type>
     fn SetType(&self, type_: OscillatorType) -> ErrorResult {
         if type_ == OscillatorType::Custom {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         self.oscillator_type.set(type_);
         self.source_node

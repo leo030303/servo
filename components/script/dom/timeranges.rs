@@ -150,24 +150,24 @@ impl TimeRanges {
 }
 
 impl TimeRangesMethods<crate::DomTypeHolder> for TimeRanges {
-    // https://html.spec.whatwg.org/multipage/#dom-timeranges-length
+    /// <https://html.spec.whatwg.org/multipage/#dom-timeranges-length>
     fn Length(&self) -> u32 {
         self.ranges.len()
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-timeranges-start
+    /// <https://html.spec.whatwg.org/multipage/#dom-timeranges-start>
     fn Start(&self, index: u32) -> Fallible<Finite<f64>> {
         self.ranges
             .start(index)
             .map(Finite::wrap)
-            .map_err(|_| Error::IndexSize)
+            .map_err(|_| Error::IndexSize(None))
     }
 
-    // https://html.spec.whatwg.org/multipage/#dom-timeranges-end
+    /// <https://html.spec.whatwg.org/multipage/#dom-timeranges-end>
     fn End(&self, index: u32) -> Fallible<Finite<f64>> {
         self.ranges
             .end(index)
             .map(Finite::wrap)
-            .map_err(|_| Error::IndexSize)
+            .map_err(|_| Error::IndexSize(None))
     }
 }

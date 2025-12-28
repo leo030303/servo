@@ -2,7 +2,6 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::HashMap;
 use std::ptr;
 use std::rc::Rc;
 
@@ -14,6 +13,7 @@ use js::jsapi::JSObject;
 use js::rust::HandleObject;
 use js::typedarray::{ArrayBufferU8, Uint8};
 use net_traits::filemanager_thread::RelativePos;
+use rustc_hash::FxHashMap;
 use uuid::Uuid;
 
 use crate::dom::bindings::buffer_source::create_buffer_source;
@@ -120,7 +120,7 @@ impl Serializable for Blob {
 
     fn serialized_storage<'a>(
         reader: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<BlobId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<BlobId, Self::Data>> {
         match reader {
             StructuredData::Reader(r) => &mut r.blob_impls,
             StructuredData::Writer(w) => &mut w.blobs,
@@ -130,7 +130,7 @@ impl Serializable for Blob {
 
 /// Extract bytes from BlobParts, used by Blob and File constructor
 /// <https://w3c.github.io/FileAPI/#constructorBlob>
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn blob_parts_to_bytes(
     mut blobparts: Vec<ArrayBufferOrArrayBufferViewOrBlobOrString>,
 ) -> Result<Vec<u8>, ()> {
@@ -138,7 +138,7 @@ pub(crate) fn blob_parts_to_bytes(
     for blobpart in &mut blobparts {
         match blobpart {
             ArrayBufferOrArrayBufferViewOrBlobOrString::String(s) => {
-                ret.extend(s.as_bytes());
+                ret.extend_from_slice(&s.as_bytes());
             },
             ArrayBufferOrArrayBufferViewOrBlobOrString::Blob(b) => {
                 let bytes = b.get_bytes().unwrap_or(vec![]);
@@ -160,7 +160,7 @@ pub(crate) fn blob_parts_to_bytes(
 
 impl BlobMethods<crate::DomTypeHolder> for Blob {
     // https://w3c.github.io/FileAPI/#constructorBlob
-    #[allow(non_snake_case)]
+    #[expect(non_snake_case)]
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -172,22 +172,22 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
             None => Vec::new(),
             Some(blobparts) => match blob_parts_to_bytes(blobparts) {
                 Ok(bytes) => bytes,
-                Err(_) => return Err(Error::InvalidCharacter),
+                Err(_) => return Err(Error::InvalidCharacter(None)),
             },
         };
 
-        let type_string = normalize_type_string(blobPropertyBag.type_.as_ref());
+        let type_string = normalize_type_string(&blobPropertyBag.type_.str());
         let blob_impl = BlobImpl::new_from_bytes(bytes, type_string);
 
         Ok(Blob::new_with_proto(global, proto, blob_impl, can_gc))
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-size
+    /// <https://w3c.github.io/FileAPI/#dfn-size>
     fn Size(&self) -> u64 {
         self.global().get_blob_size(&self.blob_id)
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-type
+    /// <https://w3c.github.io/FileAPI/#dfn-type>
     fn Type(&self) -> DOMString {
         DOMString::from(self.type_string())
     }
@@ -206,7 +206,7 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         can_gc: CanGc,
     ) -> DomRoot<Blob> {
         let global = self.global();
-        let type_string = normalize_type_string(&content_type.unwrap_or_default());
+        let type_string = normalize_type_string(&content_type.unwrap_or_default().str());
 
         // If our parent is already a sliced blob then we reference the data from the grandparent instead,
         // to keep the blob ancestry chain short.
@@ -248,10 +248,9 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         p
     }
 
-    // https://w3c.github.io/FileAPI/#arraybuffer-method-algo
+    /// <https://w3c.github.io/FileAPI/#arraybuffer-method-algo>
     fn ArrayBuffer(&self, in_realm: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let cx = GlobalScope::get_cx();
-        let global = GlobalScope::from_safe_context(cx, in_realm);
         let promise = Promise::new_in_current_realm(in_realm, can_gc);
 
         // 1. Let stream be the result of calling get stream on this.
@@ -272,7 +271,6 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         let failure_promise = promise.clone();
         reader.read_all_bytes(
             cx,
-            &global,
             Rc::new(move |bytes| {
                 rooted!(in(*cx) let mut js_object = ptr::null_mut::<JSObject>());
                 // 4. Return the result of transforming promise by a fulfillment handler that returns a new
@@ -289,7 +287,6 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
             Rc::new(move |cx, value| {
                 failure_promise.reject(cx, value, can_gc);
             }),
-            in_realm,
             can_gc,
         );
 
@@ -299,7 +296,6 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
     /// <https://w3c.github.io/FileAPI/#dom-blob-bytes>
     fn Bytes(&self, in_realm: InRealm, can_gc: CanGc) -> Rc<Promise> {
         let cx = GlobalScope::get_cx();
-        let global = GlobalScope::from_safe_context(cx, in_realm);
         let p = Promise::new_in_current_realm(in_realm, can_gc);
 
         // 1. Let stream be the result of calling get stream on this.
@@ -320,7 +316,6 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
         let p_failure = p.clone();
         reader.read_all_bytes(
             cx,
-            &global,
             Rc::new(move |bytes| {
                 rooted!(in(*cx) let mut js_object = ptr::null_mut::<JSObject>());
                 let arr = create_buffer_source::<Uint8>(cx, bytes, js_object.handle_mut(), can_gc)
@@ -330,7 +325,6 @@ impl BlobMethods<crate::DomTypeHolder> for Blob {
             Rc::new(move |cx, v| {
                 p_failure.reject(cx, v, can_gc);
             }),
-            in_realm,
             can_gc,
         );
         p

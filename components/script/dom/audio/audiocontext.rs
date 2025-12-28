@@ -28,7 +28,7 @@ use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::{Trusted, TrustedPromise};
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::DomRoot;
-use crate::dom::htmlmediaelement::HTMLMediaElement;
+use crate::dom::html::htmlmediaelement::HTMLMediaElement;
 use crate::dom::mediastream::MediaStream;
 use crate::dom::mediastreamtrack::MediaStreamTrack;
 use crate::dom::promise::Promise;
@@ -48,7 +48,7 @@ pub(crate) struct AudioContext {
 
 impl AudioContext {
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
-    // https://webaudio.github.io/web-audio-api/#AudioContext-constructors
+    /// <https://webaudio.github.io/web-audio-api/#AudioContext-constructors>
     fn new_inherited(
         options: &AudioContextOptions,
         pipeline_id: PipelineId,
@@ -110,7 +110,7 @@ impl AudioContext {
 }
 
 impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
-    // https://webaudio.github.io/web-audio-api/#AudioContext-constructors
+    /// <https://webaudio.github.io/web-audio-api/#AudioContext-constructors>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -120,17 +120,17 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
         AudioContext::new(window, proto, options, can_gc)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiocontext-baselatency
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-baselatency>
     fn BaseLatency(&self) -> Finite<f64> {
         Finite::wrap(self.base_latency)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiocontext-outputlatency
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-outputlatency>
     fn OutputLatency(&self) -> Finite<f64> {
         Finite::wrap(self.output_latency)
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiocontext-outputlatency
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-outputlatency>
     fn GetOutputTimestamp(&self) -> AudioTimestamp {
         // TODO
         AudioTimestamp {
@@ -139,14 +139,14 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
         }
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiocontext-suspend
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-suspend>
     fn Suspend(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         // Step 1.
         let promise = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 2.
         if self.context.control_thread_state() == ProcessingState::Closed {
-            promise.reject_error(Error::InvalidState, can_gc);
+            promise.reject_error(Error::InvalidState(None), can_gc);
             return promise;
         }
 
@@ -195,14 +195,14 @@ impl AudioContextMethods<crate::DomTypeHolder> for AudioContext {
         promise
     }
 
-    // https://webaudio.github.io/web-audio-api/#dom-audiocontext-close
+    /// <https://webaudio.github.io/web-audio-api/#dom-audiocontext-close>
     fn Close(&self, comp: InRealm, can_gc: CanGc) -> Rc<Promise> {
         // Step 1.
         let promise = Promise::new_in_current_realm(comp, can_gc);
 
         // Step 2.
         if self.context.control_thread_state() == ProcessingState::Closed {
-            promise.reject_error(Error::InvalidState, can_gc);
+            promise.reject_error(Error::InvalidState(None), can_gc);
             return promise;
         }
 

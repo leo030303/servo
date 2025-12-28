@@ -2,37 +2,40 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::ops::Index;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::sync::{Arc, Weak};
 
-use base::id::WebViewId;
-use embedder_traits::{EmbedderMsg, EmbedderProxy, FilterPattern};
+use base::generic_channel;
+use base::threadpool::ThreadPool;
+use embedder_traits::{
+    EmbedderControlId, EmbedderControlResponse, EmbedderMsg, EmbedderProxy, FilePickerRequest,
+    SelectedFile,
+};
 use headers::{ContentLength, ContentRange, ContentType, HeaderMap, HeaderMapExt, Range};
 use http::header::{self, HeaderValue};
-use ipc_channel::ipc::{self, IpcSender};
+use ipc_channel::ipc::IpcSender;
 use log::warn;
 use mime::{self, Mime};
 use net_traits::blob_url_store::{BlobBuf, BlobURLStoreError};
 use net_traits::filemanager_thread::{
     FileManagerResult, FileManagerThreadError, FileManagerThreadMsg, FileOrigin, FileTokenCheck,
-    ReadFileProgress, RelativePos, SelectedFile,
+    ReadFileProgress, RelativePos,
 };
 use net_traits::http_percent_encode;
 use net_traits::response::{Response, ResponseBody};
+use parking_lot::{Mutex, RwLock};
+use rustc_hash::{FxHashMap, FxHashSet};
 use servo_arc::Arc as ServoArc;
-use servo_config::pref;
 use tokio::sync::mpsc::UnboundedSender as TokioSender;
 use url::Url;
 use uuid::Uuid;
 
 use crate::fetch::methods::{CancellationListener, Data, RangeRequestBounds};
 use crate::protocols::get_range_request_bounds;
-use crate::resource_thread::CoreResourceThreadPool;
 
 pub const FILE_CHUNK_SIZE: usize = 32768; // 32 KB
 
@@ -53,7 +56,7 @@ struct FileStoreEntry {
     is_valid_url: AtomicBool,
     /// UUIDs of fetch instances that acquired an interest in this file,
     /// when the url was still valid.
-    outstanding_tokens: HashSet<Uuid>,
+    outstanding_tokens: FxHashSet<Uuid>,
 }
 
 #[derive(Clone)]
@@ -78,14 +81,11 @@ enum FileImpl {
 pub struct FileManager {
     embedder_proxy: EmbedderProxy,
     store: Arc<FileManagerStore>,
-    thread_pool: Weak<CoreResourceThreadPool>,
+    thread_pool: Weak<ThreadPool>,
 }
 
 impl FileManager {
-    pub fn new(
-        embedder_proxy: EmbedderProxy,
-        pool_handle: Weak<CoreResourceThreadPool>,
-    ) -> FileManager {
+    pub fn new(embedder_proxy: EmbedderProxy, pool_handle: Weak<ThreadPool>) -> FileManager {
         FileManager {
             embedder_proxy,
             store: Arc::new(FileManagerStore::new()),
@@ -154,36 +154,14 @@ impl FileManager {
     /// Message handler
     pub fn handle(&self, msg: FileManagerThreadMsg) {
         match msg {
-            FileManagerThreadMsg::SelectFile(webview_id, filter, sender, origin, opt_test_path) => {
+            FileManagerThreadMsg::SelectFiles(control_id, file_picker_request, response_sender) => {
                 let store = self.store.clone();
                 let embedder = self.embedder_proxy.clone();
                 self.thread_pool
                     .upgrade()
                     .map(|pool| {
                         pool.spawn(move || {
-                            store.select_file(webview_id, filter, sender, origin, opt_test_path, embedder);
-                        });
-                    })
-                    .unwrap_or_else(|| {
-                        warn!(
-                            "FileManager tried to select a file after CoreResourceManager has exited."
-                        );
-                    });
-            },
-            FileManagerThreadMsg::SelectFiles(
-                webview_id,
-                filter,
-                sender,
-                origin,
-                opt_test_paths,
-            ) => {
-                let store = self.store.clone();
-                let embedder = self.embedder_proxy.clone();
-                self.thread_pool
-                    .upgrade()
-                    .map(|pool| {
-                        pool.spawn(move || {
-                            store.select_files(webview_id, filter, sender, origin, opt_test_paths, embedder);
+                            store.select_files(control_id, file_picker_request, response_sender, embedder);
                         });
                     })
                     .unwrap_or_else(|| {
@@ -228,14 +206,14 @@ impl FileManager {
                 pool.spawn(move || {
                     loop {
                         if cancellation_listener.cancelled() {
-                            *res_body.lock().unwrap() = ResponseBody::Done(vec![]);
+                            *res_body.lock() = ResponseBody::Done(vec![]);
                             let _ = done_sender.send(Data::Cancelled);
                             return;
                         }
                         let length = {
                             let buffer = reader.fill_buf().unwrap().to_vec();
                             let mut buffer_len = buffer.len();
-                            if let ResponseBody::Receiving(ref mut body) = *res_body.lock().unwrap()
+                            if let ResponseBody::Receiving(ref mut body) = *res_body.lock()
                             {
                                 let offset = usize::min(
                                     {
@@ -267,7 +245,7 @@ impl FileManager {
                             buffer_len
                         };
                         if length == 0 {
-                            let mut body = res_body.lock().unwrap();
+                            let mut body = res_body.lock();
                             let completed_body = match *body {
                                 ResponseBody::Receiving(ref mut body) => std::mem::take(body),
                                 _ => vec![],
@@ -432,13 +410,13 @@ enum BlobBounds {
 /// from FileID to FileStoreEntry which might have different backend implementation.
 /// Access to the content is encapsulated as methods of this struct.
 struct FileManagerStore {
-    entries: RwLock<HashMap<Uuid, FileStoreEntry>>,
+    entries: RwLock<FxHashMap<Uuid, FileStoreEntry>>,
 }
 
 impl FileManagerStore {
     fn new() -> Self {
         FileManagerStore {
-            entries: RwLock::new(HashMap::new()),
+            entries: RwLock::new(FxHashMap::default()),
         }
     }
 
@@ -449,7 +427,7 @@ impl FileManagerStore {
         file_token: &FileTokenCheck,
         origin_in: &FileOrigin,
     ) -> Result<FileImpl, BlobURLStoreError> {
-        match self.entries.read().unwrap().get(id) {
+        match self.entries.read().get(id) {
             Some(entry) => {
                 if *origin_in != *entry.origin {
                     Err(BlobURLStoreError::InvalidOrigin)
@@ -472,7 +450,7 @@ impl FileManagerStore {
 
     pub fn invalidate_token(&self, token: &FileTokenCheck, file_id: &Uuid) {
         if let FileTokenCheck::Required(token) = token {
-            let mut entries = self.entries.write().unwrap();
+            let mut entries = self.entries.write();
             if let Some(entry) = entries.get_mut(file_id) {
                 entry.outstanding_tokens.remove(token);
 
@@ -496,7 +474,7 @@ impl FileManagerStore {
     }
 
     pub fn get_token_for_file(&self, file_id: &Uuid) -> FileTokenCheck {
-        let mut entries = self.entries.write().unwrap();
+        let mut entries = self.entries.write();
         let parent_id = match entries.get(file_id) {
             Some(entry) => {
                 if let FileImpl::Sliced(ref parent_id, _) = entry.file_impl {
@@ -523,15 +501,15 @@ impl FileManagerStore {
     }
 
     fn insert(&self, id: Uuid, entry: FileStoreEntry) {
-        self.entries.write().unwrap().insert(id, entry);
+        self.entries.write().insert(id, entry);
     }
 
     fn remove(&self, id: &Uuid) {
-        self.entries.write().unwrap().remove(id);
+        self.entries.write().remove(id);
     }
 
     fn inc_ref(&self, id: &Uuid, origin_in: &FileOrigin) -> Result<(), BlobURLStoreError> {
-        match self.entries.read().unwrap().get(id) {
+        match self.entries.read().get(id) {
             Some(entry) => {
                 if entry.origin == *origin_in {
                     entry.refs.fetch_add(1, Ordering::Relaxed);
@@ -576,104 +554,64 @@ impl FileManagerStore {
         }
     }
 
-    fn query_files_from_embedder(
-        &self,
-        webview_id: WebViewId,
-        patterns: Vec<FilterPattern>,
-        multiple_files: bool,
-        embedder_proxy: EmbedderProxy,
-    ) -> Option<Vec<PathBuf>> {
-        let (ipc_sender, ipc_receiver) = ipc::channel().expect("Failed to create IPC channel!");
-        embedder_proxy.send(EmbedderMsg::SelectFiles(
-            webview_id,
-            patterns,
-            multiple_files,
-            ipc_sender,
-        ));
-        match ipc_receiver.recv() {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("Failed to receive files from embedder ({:?}).", e);
-                None
-            },
-        }
-    }
-
-    fn select_file(
-        &self,
-        webview_id: WebViewId,
-        patterns: Vec<FilterPattern>,
-        sender: IpcSender<FileManagerResult<SelectedFile>>,
-        origin: FileOrigin,
-        opt_test_path: Option<PathBuf>,
-        embedder_proxy: EmbedderProxy,
-    ) {
-        // Check if the select_files preference is enabled
-        // to ensure process-level security against compromised script;
-        // Then try applying opt_test_path directly for testing convenience
-        let opt_s = if pref!(dom_testing_html_input_element_select_files_enabled) {
-            opt_test_path
-        } else {
-            self.query_files_from_embedder(webview_id, patterns, false, embedder_proxy)
-                .and_then(|mut x| x.pop())
-        };
-
-        match opt_s {
-            Some(s) => {
-                let selected_path = Path::new(&s);
-                let result = self.create_entry(selected_path, &origin);
-                let _ = sender.send(result);
-            },
-            None => {
-                let _ = sender.send(Err(FileManagerThreadError::UserCancelled));
-            },
-        }
-    }
-
     fn select_files(
         &self,
-        webview_id: WebViewId,
-        patterns: Vec<FilterPattern>,
-        sender: IpcSender<FileManagerResult<Vec<SelectedFile>>>,
-        origin: FileOrigin,
-        opt_test_paths: Option<Vec<PathBuf>>,
+        control_id: EmbedderControlId,
+        file_picker_request: FilePickerRequest,
+        response_sender: IpcSender<EmbedderControlResponse>,
         embedder_proxy: EmbedderProxy,
     ) {
-        // Check if the select_files preference is enabled
-        // to ensure process-level security against compromised script;
-        // Then try applying opt_test_paths directly for testing convenience
-        let opt_v = if pref!(dom_testing_html_input_element_select_files_enabled) {
-            opt_test_paths
-        } else {
-            self.query_files_from_embedder(webview_id, patterns, true, embedder_proxy)
+        let (ipc_sender, ipc_receiver) =
+            generic_channel::channel().expect("Failed to create IPC channel!");
+
+        let origin = file_picker_request.origin.clone();
+        embedder_proxy.send(EmbedderMsg::SelectFiles(
+            control_id,
+            file_picker_request,
+            ipc_sender,
+        ));
+
+        let paths = match ipc_receiver.recv() {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                let _ = response_sender.send(EmbedderControlResponse::FilePicker(None));
+                return;
+            },
+            Err(error) => {
+                warn!("Failed to receive files from embedder ({:?}).", error);
+                let _ = response_sender.send(EmbedderControlResponse::FilePicker(None));
+                return;
+            },
         };
 
-        match opt_v {
-            Some(v) => {
-                let mut selected_paths = vec![];
+        let mut failed = false;
+        let files: Vec<_> = paths
+            .into_iter()
+            .filter_map(|path| match self.create_entry(&path, &origin) {
+                Ok(entry) => Some(entry),
+                Err(error) => {
+                    failed = true;
+                    warn!("Failed to create entry for selected file: {error:?}");
+                    None
+                },
+            })
+            .collect();
 
-                for s in &v {
-                    selected_paths.push(Path::new(s));
-                }
-
-                let mut replies = vec![];
-
-                for path in selected_paths {
-                    match self.create_entry(path, &origin) {
-                        Ok(triple) => replies.push(triple),
-                        Err(e) => {
-                            let _ = sender.send(Err(e));
-                            return;
-                        },
-                    };
-                }
-
-                let _ = sender.send(Ok(replies));
-            },
-            None => {
-                let _ = sender.send(Err(FileManagerThreadError::UserCancelled));
-            },
+        // From <https://w3c.github.io/webdriver/#dfn-element-send-keys>:
+        //
+        // > Step 8.5: Verify that each file given by the user exists. If any do not,
+        // > return error with error code invalid argument.
+        //
+        // WebDriver expects that if any of the files isn't found we don't select any files.
+        if failed {
+            for file in files.iter() {
+                self.remove(&file.id);
+            }
+            let _ = response_sender.send(EmbedderControlResponse::FilePicker(Some(Vec::new())));
+            return;
         }
+
+        let _ = response_sender.send(EmbedderControlResponse::FilePicker(Some(files)));
     }
 
     fn create_entry(
@@ -818,7 +756,7 @@ impl FileManagerStore {
     }
 
     fn dec_ref(&self, id: &Uuid, origin_in: &FileOrigin) -> Result<(), BlobURLStoreError> {
-        let (do_remove, opt_parent_id) = match self.entries.read().unwrap().get(id) {
+        let (do_remove, opt_parent_id) = match self.entries.read().get(id) {
             Some(entry) => {
                 if *entry.origin == *origin_in {
                     let old_refs = entry.refs.fetch_sub(1, Ordering::Release);
@@ -887,7 +825,7 @@ impl FileManagerStore {
         id: &Uuid,
         origin_in: &FileOrigin,
     ) -> Result<(), BlobURLStoreError> {
-        let (do_remove, opt_parent_id, res) = match self.entries.read().unwrap().get(id) {
+        let (do_remove, opt_parent_id, res) = match self.entries.read().get(id) {
             Some(entry) => {
                 if *entry.origin == *origin_in {
                     entry.is_valid_url.store(validity, Ordering::Release);

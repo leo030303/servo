@@ -7,9 +7,10 @@ use std::ptr::{self, NonNull};
 use std::slice;
 
 use devtools_traits::{
-    ConsoleMessage, ConsoleMessageArgument, ConsoleMessageBuilder, LogLevel,
+    ConsoleLogLevel, ConsoleMessage, ConsoleMessageArgument, ConsoleMessageBuilder,
     ScriptToDevtoolsControlMsg, StackFrame,
 };
+use embedder_traits::EmbedderMsg;
 use js::conversions::jsstr_to_string;
 use js::jsapi::{self, ESClass, PropertyDescriptor};
 use js::jsval::{Int32Value, UndefinedValue};
@@ -39,20 +40,20 @@ const MAX_LOG_CHILDREN: usize = 15;
 pub(crate) struct Console;
 
 impl Console {
-    #[allow(unsafe_code)]
-    fn build_message(level: LogLevel) -> ConsoleMessageBuilder {
+    #[expect(unsafe_code)]
+    fn build_message(level: ConsoleLogLevel) -> ConsoleMessageBuilder {
         let cx = GlobalScope::get_cx();
         let caller = unsafe { describe_scripted_caller(*cx) }.unwrap_or_default();
 
         ConsoleMessageBuilder::new(level, caller.filename, caller.line, caller.col)
     }
 
-    /// Helper to send a message that only consists of a single string to log,
-    /// console and stdout
-    fn send_string_message(global: &GlobalScope, level: LogLevel, message: String) {
-        let s = DOMString::from(message.clone());
-        log!(level.clone().into(), "{}", &s);
-        console_message_to_stdout(global, &s);
+    /// Helper to send a message that only consists of a single string
+    fn send_string_message(global: &GlobalScope, level: ConsoleLogLevel, message: String) {
+        let prefix = global.current_group_label().unwrap_or_default();
+        let formatted_message = format!("{prefix}{message}");
+
+        Self::send_to_embedder(global, level.clone(), formatted_message);
 
         let mut builder = Self::build_message(level);
         builder.add_argument(message.into());
@@ -63,7 +64,7 @@ impl Console {
 
     fn method(
         global: &GlobalScope,
-        level: LogLevel,
+        level: ConsoleLogLevel,
         messages: Vec<HandleValue>,
         include_stacktrace: IncludeStackTrace,
     ) {
@@ -80,60 +81,51 @@ impl Console {
 
         Console::send_to_devtools(global, log.finish());
 
+        let prefix = global.current_group_label().unwrap_or_default();
         let msgs = stringify_handle_values(&messages);
-        // Also log messages to stdout
-        console_message_to_stdout(global, &msgs);
+        let formatted_message = format!("{prefix}{msgs}");
 
-        // Also output to the logger which will be at script::dom::console
-        log!(level.into(), "{}", &msgs);
+        Self::send_to_embedder(global, level, formatted_message);
     }
 
     fn send_to_devtools(global: &GlobalScope, message: ConsoleMessage) {
         if let Some(chan) = global.devtools_chan() {
             let worker_id = global
                 .downcast::<WorkerGlobalScope>()
-                .map(|worker| worker.get_worker_id());
+                .map(|worker| worker.worker_id());
             let devtools_message =
                 ScriptToDevtoolsControlMsg::ConsoleAPI(global.pipeline_id(), message, worker_id);
             chan.send(devtools_message).unwrap();
         }
     }
 
+    fn send_to_embedder(global: &GlobalScope, level: ConsoleLogLevel, message: String) {
+        global.send_to_embedder(EmbedderMsg::ShowConsoleApiMessage(
+            global.webview_id(),
+            level,
+            message,
+        ));
+    }
+
     // Directly logs a DOMString, without processing the message
     pub(crate) fn internal_warn(global: &GlobalScope, message: DOMString) {
-        Console::send_string_message(global, LogLevel::Warn, String::from(message.clone()));
+        Console::send_string_message(global, ConsoleLogLevel::Warn, String::from(message.clone()));
     }
 }
 
-// In order to avoid interleaving the stdout output of the Console API methods
-// with stderr that could be in use on other threads, we lock stderr until
-// we're finished with stdout. Since the stderr lock is reentrant, there is
-// no risk of deadlock if the callback ends up trying to write to stderr for
-// any reason.
-#[cfg(not(any(target_os = "android", target_env = "ohos")))]
-fn with_stderr_lock<F>(f: F)
-where
-    F: FnOnce(),
-{
-    use std::io;
-    let stderr = io::stderr();
-    let _handle = stderr.lock();
-    f()
-}
-
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe fn handle_value_to_string(cx: *mut jsapi::JSContext, value: HandleValue) -> DOMString {
     rooted!(in(cx) let mut js_string = std::ptr::null_mut::<jsapi::JSString>());
-    match std::ptr::NonNull::new(JS_ValueToSource(cx, value)) {
+    match std::ptr::NonNull::new(unsafe { JS_ValueToSource(cx, value) }) {
         Some(js_str) => {
             js_string.set(js_str.as_ptr());
-            DOMString::from_string(jsstr_to_string(cx, js_str))
+            DOMString::from_string(unsafe { jsstr_to_string(cx, js_str) })
         },
         None => "<error converting value to string>".into(),
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn console_argument_from_handle_value(
     cx: JSContext,
     handle_value: HandleValue,
@@ -159,7 +151,7 @@ fn console_argument_from_handle_value(
     ConsoleMessageArgument::String(stringified_value.into())
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn stringify_handle_value(message: HandleValue) -> DOMString {
     let cx = GlobalScope::get_cx();
     unsafe {
@@ -174,16 +166,18 @@ fn stringify_handle_value(message: HandleValue) -> DOMString {
         ) -> DOMString {
             rooted!(in(cx) let mut obj = value.to_object());
             let mut object_class = ESClass::Other;
-            if !GetBuiltinClass(cx, obj.handle(), &mut object_class as *mut _) {
+            if !unsafe { GetBuiltinClass(cx, obj.handle(), &mut object_class as *mut _) } {
                 return DOMString::from("/* invalid */");
             }
-            let mut ids = IdVector::new(cx);
-            if !GetPropertyKeys(
-                cx,
-                obj.handle(),
-                jsapi::JSITER_OWNONLY | jsapi::JSITER_SYMBOLS,
-                ids.handle_mut(),
-            ) {
+            let mut ids = unsafe { IdVector::new(cx) };
+            if !unsafe {
+                GetPropertyKeys(
+                    cx,
+                    obj.handle(),
+                    jsapi::JSITER_OWNONLY | jsapi::JSITER_SYMBOLS,
+                    ids.handle_mut(),
+                )
+            } {
                 return DOMString::from("/* invalid */");
             }
             let truncate = ids.len() > MAX_LOG_CHILDREN;
@@ -191,7 +185,7 @@ fn stringify_handle_value(message: HandleValue) -> DOMString {
                 if truncate {
                     return DOMString::from("…");
                 } else {
-                    return handle_value_to_string(cx, value);
+                    return unsafe { handle_value_to_string(cx, value) };
                 }
             }
 
@@ -202,18 +196,22 @@ fn stringify_handle_value(message: HandleValue) -> DOMString {
                 rooted!(in(cx) let mut desc = PropertyDescriptor::default());
 
                 let mut is_none = false;
-                if !JS_GetOwnPropertyDescriptorById(
-                    cx,
-                    obj.handle(),
-                    id.handle(),
-                    desc.handle_mut(),
-                    &mut is_none,
-                ) {
+                if !unsafe {
+                    JS_GetOwnPropertyDescriptorById(
+                        cx,
+                        obj.handle(),
+                        id.handle(),
+                        desc.handle_mut(),
+                        &mut is_none,
+                    )
+                } {
                     return DOMString::from("/* invalid */");
                 }
 
                 rooted!(in(cx) let mut property = UndefinedValue());
-                if !JS_GetPropertyById(cx, obj.handle(), id.handle(), property.handle_mut()) {
+                if !unsafe {
+                    JS_GetPropertyById(cx, obj.handle(), id.handle(), property.handle_mut())
+                } {
                     return DOMString::from("/* invalid */");
                 }
 
@@ -228,16 +226,19 @@ fn stringify_handle_value(message: HandleValue) -> DOMString {
                         explicit_keys = false;
                     }
                 }
-                let value_string =
-                    stringify_inner(JSContext::from_ptr(cx), property.handle(), parents.clone());
+                let value_string = stringify_inner(
+                    unsafe { JSContext::from_ptr(cx) },
+                    property.handle(),
+                    parents.clone(),
+                );
                 if explicit_keys {
                     let key = if id.is_string() || id.is_symbol() || id.is_int() {
                         rooted!(in(cx) let mut key_value = UndefinedValue());
                         let raw_id: jsapi::HandleId = id.handle().into();
-                        if !JS_IdToValue(cx, *raw_id.ptr, key_value.handle_mut()) {
+                        if !unsafe { JS_IdToValue(cx, *raw_id.ptr, key_value.handle_mut()) } {
                             return DOMString::from("/* invalid */");
                         }
-                        handle_value_to_string(cx, key_value.handle())
+                        unsafe { handle_value_to_string(cx, key_value.handle()) }
                     } else {
                         return DOMString::from("/* invalid */");
                     };
@@ -282,7 +283,7 @@ fn stringify_handle_value(message: HandleValue) -> DOMString {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn maybe_stringify_dom_object(cx: JSContext, value: HandleValue) -> Option<DOMString> {
     // The standard object serialization is not effective for DOM objects,
     // since their properties generally live on the prototype object.
@@ -305,15 +306,15 @@ fn maybe_stringify_dom_object(cx: JSContext, value: HandleValue) -> Option<DOMSt
     let mut repr = format!("{} ", class_name);
     rooted!(in(*cx) let mut value = value.get());
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     unsafe extern "C" fn stringified(
         string: *const u16,
         len: u32,
         data: *mut std::ffi::c_void,
     ) -> bool {
         let s = data as *mut String;
-        let string_chars = slice::from_raw_parts(string, len as usize);
-        (*s).push_str(&String::from_utf16_lossy(string_chars));
+        let string_chars = unsafe { slice::from_raw_parts(string, len as usize) };
+        unsafe { (*s).push_str(&String::from_utf16_lossy(string_chars)) };
         true
     }
 
@@ -341,22 +342,6 @@ fn stringify_handle_values(messages: &[HandleValue]) -> DOMString {
     ))
 }
 
-/// On OHOS/ Android, stdout and stderr will be redirected to go
-/// to the logger. As `Console::method` and `Console::send_string_message`
-/// already forwards all messages to the logger with appropriate level
-/// this does not need to do anything for these targets.
-#[allow(unused_variables)]
-fn console_message_to_stdout(global: &GlobalScope, message: &DOMString) {
-    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
-    {
-        let prefix = global.current_group_label().unwrap_or_default();
-        let formatted_message = format!("{}{}", prefix, message);
-        with_stderr_lock(move || {
-            println!("{}", formatted_message);
-        });
-    }
-}
-
 #[derive(Debug, Eq, PartialEq)]
 enum IncludeStackTrace {
     Yes,
@@ -364,88 +349,126 @@ enum IncludeStackTrace {
 }
 
 impl consoleMethods<crate::DomTypeHolder> for Console {
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/log
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console/log>
     fn Log(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
-        Console::method(global, LogLevel::Log, messages, IncludeStackTrace::No);
+        Console::method(
+            global,
+            ConsoleLogLevel::Log,
+            messages,
+            IncludeStackTrace::No,
+        );
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/clear
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console/clear>
     fn Clear(global: &GlobalScope) {
-        let message = Console::build_message(LogLevel::Clear).finish();
-        Console::send_to_devtools(global, message);
+        if let Some(chan) = global.devtools_chan() {
+            let worker_id = global
+                .downcast::<WorkerGlobalScope>()
+                .map(|worker| worker.worker_id());
+            let devtools_message =
+                ScriptToDevtoolsControlMsg::ClearConsole(global.pipeline_id(), worker_id);
+            if let Err(error) = chan.send(devtools_message) {
+                log::warn!("Error sending clear message to devtools: {error:?}");
+            }
+        }
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console>
     fn Debug(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
-        Console::method(global, LogLevel::Debug, messages, IncludeStackTrace::No);
+        Console::method(
+            global,
+            ConsoleLogLevel::Debug,
+            messages,
+            IncludeStackTrace::No,
+        );
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/info
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console/info>
     fn Info(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
-        Console::method(global, LogLevel::Info, messages, IncludeStackTrace::No);
+        Console::method(
+            global,
+            ConsoleLogLevel::Info,
+            messages,
+            IncludeStackTrace::No,
+        );
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/warn
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console/warn>
     fn Warn(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
-        Console::method(global, LogLevel::Warn, messages, IncludeStackTrace::No);
+        Console::method(
+            global,
+            ConsoleLogLevel::Warn,
+            messages,
+            IncludeStackTrace::No,
+        );
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/error
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console/error>
     fn Error(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
-        Console::method(global, LogLevel::Error, messages, IncludeStackTrace::No);
+        Console::method(
+            global,
+            ConsoleLogLevel::Error,
+            messages,
+            IncludeStackTrace::No,
+        );
     }
 
     /// <https://console.spec.whatwg.org/#trace>
     fn Trace(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
-        Console::method(global, LogLevel::Trace, messages, IncludeStackTrace::Yes);
+        Console::method(
+            global,
+            ConsoleLogLevel::Trace,
+            messages,
+            IncludeStackTrace::Yes,
+        );
     }
 
-    // https://developer.mozilla.org/en-US/docs/Web/API/Console/assert
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console/assert>
     fn Assert(_cx: JSContext, global: &GlobalScope, condition: bool, messages: Vec<HandleValue>) {
         if !condition {
             let message = format!("Assertion failed: {}", stringify_handle_values(&messages));
 
-            Console::send_string_message(global, LogLevel::Log, message.clone());
+            Console::send_string_message(global, ConsoleLogLevel::Log, message.clone());
         }
     }
 
-    // https://console.spec.whatwg.org/#time
+    /// <https://console.spec.whatwg.org/#time>
     fn Time(global: &GlobalScope, label: DOMString) {
         if let Ok(()) = global.time(label.clone()) {
             let message = format!("{label}: timer started");
-            Console::send_string_message(global, LogLevel::Log, message.clone());
+            Console::send_string_message(global, ConsoleLogLevel::Log, message.clone());
         }
     }
 
-    // https://console.spec.whatwg.org/#timelog
+    /// <https://console.spec.whatwg.org/#timelog>
     fn TimeLog(_cx: JSContext, global: &GlobalScope, label: DOMString, data: Vec<HandleValue>) {
         if let Ok(delta) = global.time_log(&label) {
             let message = format!("{label}: {delta}ms {}", stringify_handle_values(&data));
 
-            Console::send_string_message(global, LogLevel::Log, message.clone());
+            Console::send_string_message(global, ConsoleLogLevel::Log, message.clone());
         }
     }
 
-    // https://console.spec.whatwg.org/#timeend
+    /// <https://console.spec.whatwg.org/#timeend>
     fn TimeEnd(global: &GlobalScope, label: DOMString) {
         if let Ok(delta) = global.time_end(&label) {
             let message = format!("{label}: {delta}ms");
 
-            Console::send_string_message(global, LogLevel::Log, message.clone());
+            Console::send_string_message(global, ConsoleLogLevel::Log, message.clone());
         }
     }
 
-    // https://console.spec.whatwg.org/#group
+    /// <https://console.spec.whatwg.org/#group>
     fn Group(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         global.push_console_group(stringify_handle_values(&messages));
     }
 
-    // https://console.spec.whatwg.org/#groupcollapsed
+    /// <https://console.spec.whatwg.org/#groupcollapsed>
     fn GroupCollapsed(_cx: JSContext, global: &GlobalScope, messages: Vec<HandleValue>) {
         global.push_console_group(stringify_handle_values(&messages));
     }
 
-    // https://console.spec.whatwg.org/#groupend
+    /// <https://console.spec.whatwg.org/#groupend>
     fn GroupEnd(global: &GlobalScope) {
         global.pop_console_group();
     }
@@ -455,7 +478,7 @@ impl consoleMethods<crate::DomTypeHolder> for Console {
         let count = global.increment_console_count(&label);
         let message = format!("{label}: {count}");
 
-        Console::send_string_message(global, LogLevel::Log, message.clone());
+        Console::send_string_message(global, ConsoleLogLevel::Log, message.clone());
     }
 
     /// <https://console.spec.whatwg.org/#countreset>
@@ -469,7 +492,7 @@ impl consoleMethods<crate::DomTypeHolder> for Console {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 fn get_js_stack(cx: *mut jsapi::JSContext) -> Vec<StackFrame> {
     const MAX_FRAME_COUNT: u32 = 128;
 

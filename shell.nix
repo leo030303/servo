@@ -5,12 +5,15 @@
   buildAndroid ? false
 }:
 with import (builtins.fetchTarball {
-  url = "https://github.com/NixOS/nixpkgs/archive/1e5b653dff12029333a6546c11e108ede13052eb.tar.gz";
+  # NixOS users: if servoshell crashes with an assertion failure in surfman’s x11/connection.rs,
+  # eglInitialize() may be failing, or you may be building with an incompatible version of glibc.
+  # Use your system nixpkgs here, change `llvmPackages` below if necessary, then do a clean build.
+  url = "https://github.com/NixOS/nixpkgs/archive/a8d610af3f1a5fb71e23e08434d8d61a466fc942.tar.gz";
 }) {
   overlays = [
     (import (builtins.fetchTarball {
       # Bumped the channel in rust-toolchain.toml? Bump this commit too!
-      url = "https://github.com/oxalica/rust-overlay/archive/95487740bb7ac11553445e9249041a6fa4b5eccf.tar.gz";
+      url = "https://github.com/oxalica/rust-overlay/archive/0881bcdf6c34cd3ba558b19d7a74d8ffc9e1fff0.tar.gz";
     }))
   ];
   config = {
@@ -28,11 +31,7 @@ let
       url = "https://github.com/NixOS/nixpkgs/archive/6adf48f53d819a7b6e15672817fa1e78e5f4e84f.tar.gz";
     }) {};
 
-    # We need clangStdenv with:
-    # - clang < 16 (#30587)
-    # - clang < 15 (#31059)
-    # - glibc 2.38 (#31054)
-    llvmPackages = llvmPackages_14;
+    llvmPackages = llvmPackages_20;
     stdenv = llvmPackages.stdenv;
 
     buildToolsVersion = "34.0.0";
@@ -45,7 +44,7 @@ let
       systemImageTypes = [ "google_apis" ];
       abiVersions = [ "x86" "armeabi-v7a" ];
       includeNDK = true;
-      ndkVersion = "26.2.11394342";
+      ndkVersion = "28.2.13676358";
       useGoogleAPIs = false;
       useGoogleTVAddOns = false;
       includeExtras = [
@@ -53,6 +52,19 @@ let
       ];
   };
   androidSdk = androidComposition.androidsdk;
+
+  # FHS wrappers for Python tools installed via venv (e.g ruff, pyrefly)
+  # These allow running dynamically linked binaries on NixOS without patching them.
+  # The wrappers provide an FHS environment at runtime.
+  mkVenvFhsWrapper =
+    name:
+    buildFHSEnv {
+      inherit name;
+      runScript = writeShellScript "${name}-fhs" ''
+        exec "${toString ./.}/.venv/bin/${name}" "$@"
+      '';
+    };
+
   # Required by ./mach build --android
   androidEnvironment = lib.optionalAttrs buildAndroid rec {
     ANDROID_SDK_ROOT = "${androidSdk}/libexec/android-sdk";
@@ -63,6 +75,9 @@ in
 stdenv.mkDerivation (androidEnvironment // {
   name = "servo-env";
 
+  # NOTE: tshark(1) for etc/devtools-parser.py can’t be installed here, because it requires
+  # CAP_NET_RAW and CAP_NET_ADMIN. Install Wireshark with your system package manager,
+  # or for NixOS, enable the option: `programs.wireshark.enable = true;`
   buildInputs = [
     # Native dependencies
     fontconfig freetype libunwind
@@ -78,10 +93,10 @@ stdenv.mkDerivation (androidEnvironment // {
     rustup
     taplo
     cargo-deny
+    cargo-nextest
     llvmPackages.bintools # provides lld
 
     udev # Needed by libudev-sys for GamePad API.
-    wireshark-cli  # for `tshark` in etc/devtools_parser.py
 
     # Build utilities
     cmake dbus gcc git pkg-config which llvm perl yasm m4
@@ -188,6 +203,15 @@ stdenv.mkDerivation (androidEnvironment // {
       # get patched in a way that makes them dependent on the Nix store.
       repo_root=$(git rev-parse --show-toplevel)
       export RUSTUP_HOME=$repo_root/.rustup
+    else
+      # On NixOS, export FHS wrapper paths so mach can prepend them to PATH at runtime
+      # This ensures the FHS-wrapped binaries take precedence over .venv/bin
+      export SERVO_NIX_BIN_DIR="${
+        lib.makeBinPath [
+          (mkVenvFhsWrapper "ruff")
+          (mkVenvFhsWrapper "pyrefly")
+        ]
+      }"
     fi
   '';
 })

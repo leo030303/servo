@@ -51,8 +51,9 @@ use std::collections::BinaryHeap;
 use std::hash::{BuildHasher, Hash};
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use resvg::usvg::fontdb::Source;
 use style::properties::ComputedValues;
 use style::values::generics::length::GenericLengthPercentageOrAuto;
 pub use stylo_malloc_size_of::MallocSizeOfOps;
@@ -247,6 +248,53 @@ impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for Vec<T> {
             n += elem.conditional_size_of(ops);
         }
         n
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for std::collections::VecDeque<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        let mut n = self.shallow_size_of(ops);
+        for elem in self.iter() {
+            n += elem.conditional_size_of(ops);
+        }
+        n
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for std::cell::RefCell<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.borrow().conditional_size_of(ops)
+    }
+}
+
+impl<T1, T2> MallocConditionalSizeOf for (T1, T2)
+where
+    T1: MallocConditionalSizeOf,
+    T2: MallocConditionalSizeOf,
+{
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.0.conditional_size_of(ops) + self.1.conditional_size_of(ops)
+    }
+}
+
+impl<T: MallocConditionalSizeOf + ?Sized> MallocConditionalSizeOf for Box<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.shallow_size_of(ops) + (**self).conditional_size_of(ops)
+    }
+}
+
+impl<T: MallocConditionalSizeOf, E: MallocSizeOf> MallocConditionalSizeOf for Result<T, E> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        match *self {
+            Ok(ref x) => x.conditional_size_of(ops),
+            Err(ref e) => e.size_of(ops),
+        }
+    }
+}
+
+impl MallocConditionalSizeOf for () {
+    fn conditional_size_of(&self, _ops: &mut MallocSizeOfOps) -> usize {
+        0
     }
 }
 
@@ -458,6 +506,22 @@ macro_rules! malloc_size_of_hash_map {
                 n
             }
         }
+
+        impl<K, V, S> MallocConditionalSizeOf for $ty
+        where
+            K: Eq + Hash + MallocSizeOf,
+            V: MallocConditionalSizeOf,
+            S: BuildHasher,
+        {
+            fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+                let mut n = self.shallow_size_of(ops);
+                for (k, v) in self.iter() {
+                    n += k.size_of(ops);
+                    n += v.conditional_size_of(ops);
+                }
+                n
+            }
+        }
     };
 }
 
@@ -504,6 +568,30 @@ impl<T: MallocSizeOf> MallocSizeOf for OnceCell<T> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         self.get()
             .map(|interior| interior.size_of(ops))
+            .unwrap_or_default()
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for OnceCell<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.get()
+            .map(|interior| interior.conditional_size_of(ops))
+            .unwrap_or_default()
+    }
+}
+
+impl<T: MallocSizeOf> MallocSizeOf for OnceLock<T> {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.get()
+            .map(|interior| interior.size_of(ops))
+            .unwrap_or_default()
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for OnceLock<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.get()
+            .map(|interior| interior.conditional_size_of(ops))
             .unwrap_or_default()
     }
 }
@@ -622,6 +710,12 @@ impl<T: MallocSizeOf> MallocSizeOf for parking_lot::Mutex<T> {
 impl<T: MallocSizeOf> MallocSizeOf for parking_lot::RwLock<T> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         (*self.read()).size_of(ops)
+    }
+}
+
+impl<T: MallocConditionalSizeOf> MallocConditionalSizeOf for parking_lot::RwLock<T> {
+    fn conditional_size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        (*self.read()).conditional_size_of(ops)
     }
 }
 
@@ -786,13 +880,19 @@ malloc_size_of_is_0!(u8, u16, u32, u64, u128, usize);
 malloc_size_of_is_0!(Range<f32>, Range<f64>);
 malloc_size_of_is_0!(Range<i8>, Range<i16>, Range<i32>, Range<i64>, Range<isize>);
 malloc_size_of_is_0!(Range<u8>, Range<u16>, Range<u32>, Range<u64>, Range<usize>);
-
 malloc_size_of_is_0!(Uuid);
-malloc_size_of_is_0!(content_security_policy::Destination);
-malloc_size_of_is_0!(http::StatusCode);
 malloc_size_of_is_0!(app_units::Au);
+malloc_size_of_is_0!(content_security_policy::Destination);
+malloc_size_of_is_0!(content_security_policy::sandboxing_directive::SandboxingFlagSet);
+malloc_size_of_is_0!(http::StatusCode);
 malloc_size_of_is_0!(keyboard_types::Modifiers);
 malloc_size_of_is_0!(mime::Mime);
+malloc_size_of_is_0!(resvg::usvg::Tree);
+malloc_size_of_is_0!(resvg::usvg::fontdb::ID);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Style);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Weight);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Stretch);
+malloc_size_of_is_0!(resvg::usvg::fontdb::Language);
 malloc_size_of_is_0!(std::num::NonZeroU16);
 malloc_size_of_is_0!(std::num::NonZeroU64);
 malloc_size_of_is_0!(std::num::NonZeroUsize);
@@ -802,18 +902,27 @@ malloc_size_of_is_0!(std::sync::atomic::AtomicUsize);
 malloc_size_of_is_0!(std::time::Duration);
 malloc_size_of_is_0!(std::time::Instant);
 malloc_size_of_is_0!(std::time::SystemTime);
-malloc_size_of_is_0!(resvg::usvg::Tree);
 malloc_size_of_is_0!(style::data::ElementData);
 malloc_size_of_is_0!(style::font_face::SourceList);
 malloc_size_of_is_0!(style::properties::ComputedValues);
 malloc_size_of_is_0!(style::properties::declaration_block::PropertyDeclarationBlock);
 malloc_size_of_is_0!(style::queries::values::PrefersColorScheme);
 malloc_size_of_is_0!(style::stylesheets::Stylesheet);
+malloc_size_of_is_0!(style::stylesheets::FontFaceRule);
 malloc_size_of_is_0!(style::values::specified::source_size_list::SourceSizeList);
 malloc_size_of_is_0!(taffy::Layout);
 malloc_size_of_is_0!(unicode_bidi::Level);
 malloc_size_of_is_0!(unicode_script::Script);
 malloc_size_of_is_0!(urlpattern::UrlPattern);
+malloc_size_of_is_0!(utf8::Incomplete);
+
+impl<S: tendril::TendrilSink<tendril::fmt::UTF8, A>, A: tendril::Atomicity> MallocSizeOf
+    for tendril::stream::LossyDecoder<S, A>
+{
+    fn size_of(&self, _: &mut MallocSizeOfOps) -> usize {
+        0
+    }
+}
 
 macro_rules! malloc_size_of_is_webrender_malloc_size_of(
     ($($ty:ty),+) => (
@@ -836,6 +945,7 @@ malloc_size_of_is_webrender_malloc_size_of!(webrender_api::Epoch);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExtendMode);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::ExternalScrollId);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontKey);
+malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceFlags);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::FontInstanceKey);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::GlyphInstance);
 malloc_size_of_is_webrender_malloc_size_of!(webrender_api::GradientStop);
@@ -925,16 +1035,18 @@ malloc_size_of_is_stylo_malloc_size_of!(style::selector_parser::Snapshot);
 malloc_size_of_is_stylo_malloc_size_of!(style::shared_lock::SharedRwLock);
 malloc_size_of_is_stylo_malloc_size_of!(style::stylesheets::DocumentStyleSheet);
 malloc_size_of_is_stylo_malloc_size_of!(style::stylist::Stylist);
-malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::AlignContent);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::BorderStyle);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::ContentDistribution);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontStretch);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontStyle);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::FontWeight);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::font::SingleFontFamily);
-malloc_size_of_is_stylo_malloc_size_of!(style::values::computed::JustifyContent);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::align::AlignFlags);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::box_::Overflow);
+malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::font::FontSynthesis);
 malloc_size_of_is_stylo_malloc_size_of!(style::values::specified::TextDecorationLine);
 malloc_size_of_is_stylo_malloc_size_of!(stylo_dom::ElementState);
+malloc_size_of_is_stylo_malloc_size_of!(style::computed_values::font_optical_sizing::T);
 
 impl<T> MallocSizeOf for GenericLengthPercentageOrAuto<T>
 where
@@ -942,5 +1054,33 @@ where
 {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         <GenericLengthPercentageOrAuto<T> as stylo_malloc_size_of::MallocSizeOf>::size_of(self, ops)
+    }
+}
+
+impl MallocSizeOf for resvg::usvg::fontdb::Source {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        match self {
+            Source::Binary(_) => 0,
+            Source::File(path) => path.size_of(ops),
+            Source::SharedFile(path, _) => path.size_of(ops),
+        }
+    }
+}
+
+impl MallocSizeOf for resvg::usvg::fontdb::FaceInfo {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.id.size_of(ops) +
+            self.source.size_of(ops) +
+            self.families.size_of(ops) +
+            self.post_script_name.size_of(ops) +
+            self.style.size_of(ops) +
+            self.weight.size_of(ops) +
+            self.stretch.size_of(ops)
+    }
+}
+
+impl MallocSizeOf for resvg::usvg::fontdb::Database {
+    fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
+        self.faces().map(|face| face.size_of(ops)).sum()
     }
 }

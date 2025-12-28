@@ -4,6 +4,7 @@
 
 use dom_struct::dom_struct;
 use js::rust::HandleObject;
+use rustc_hash::FxBuildHasher;
 use stylo_atoms::Atom;
 
 use super::bindings::trace::HashMapTracedValues;
@@ -17,7 +18,7 @@ use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::document::Document;
 use crate::dom::element::Element;
-use crate::dom::htmlcollection::HTMLCollection;
+use crate::dom::html::htmlcollection::HTMLCollection;
 use crate::dom::node::{Node, NodeTraits};
 use crate::dom::nodelist::NodeList;
 use crate::dom::virtualmethods::VirtualMethods;
@@ -29,7 +30,7 @@ use crate::script_runtime::CanGc;
 pub(crate) struct DocumentFragment {
     node: Node,
     /// Caches for the getElement methods
-    id_map: DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>>,
+    id_map: DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>, FxBuildHasher>>,
 }
 
 impl DocumentFragment {
@@ -37,7 +38,7 @@ impl DocumentFragment {
     pub(crate) fn new_inherited(document: &Document) -> DocumentFragment {
         DocumentFragment {
             node: Node::new_inherited(document),
-            id_map: DomRefCell::new(HashMapTracedValues::new()),
+            id_map: DomRefCell::new(HashMapTracedValues::new_fx()),
         }
     }
 
@@ -58,13 +59,15 @@ impl DocumentFragment {
         )
     }
 
-    pub(crate) fn id_map(&self) -> &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>>> {
+    pub(crate) fn id_map(
+        &self,
+    ) -> &DomRefCell<HashMapTracedValues<Atom, Vec<Dom<Element>>, FxBuildHasher>> {
         &self.id_map
     }
 }
 
 impl DocumentFragmentMethods<crate::DomTypeHolder> for DocumentFragment {
-    // https://dom.spec.whatwg.org/#dom-documentfragment-documentfragment
+    /// <https://dom.spec.whatwg.org/#dom-documentfragment-documentfragment>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -75,13 +78,13 @@ impl DocumentFragmentMethods<crate::DomTypeHolder> for DocumentFragment {
         Ok(DocumentFragment::new_with_proto(&document, proto, can_gc))
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-children
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-children>
     fn Children(&self, can_gc: CanGc) -> DomRoot<HTMLCollection> {
         let window = self.owner_window();
         HTMLCollection::children(&window, self.upcast(), can_gc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid
+    /// <https://dom.spec.whatwg.org/#dom-nonelementparentnode-getelementbyid>
     fn GetElementById(&self, id: DOMString) -> Option<DomRoot<Element>> {
         let id = Atom::from(id);
         self.id_map
@@ -90,45 +93,44 @@ impl DocumentFragmentMethods<crate::DomTypeHolder> for DocumentFragment {
             .map(|elements| DomRoot::from_ref(&*elements[0]))
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-firstelementchild>
     fn GetFirstElementChild(&self) -> Option<DomRoot<Element>> {
         self.upcast::<Node>().child_elements().next()
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-lastelementchild
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-lastelementchild>
     fn GetLastElementChild(&self) -> Option<DomRoot<Element>> {
         self.upcast::<Node>()
             .rev_children()
-            .filter_map(DomRoot::downcast::<Element>)
-            .next()
+            .find_map(DomRoot::downcast::<Element>)
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-childelementcount
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-childelementcount>
     fn ChildElementCount(&self) -> u32 {
         self.upcast::<Node>().child_elements().count() as u32
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-prepend
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-prepend>
     fn Prepend(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         self.upcast::<Node>().prepend(nodes, can_gc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-append
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-append>
     fn Append(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         self.upcast::<Node>().append(nodes, can_gc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-replacechildren
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-replacechildren>
     fn ReplaceChildren(&self, nodes: Vec<NodeOrString>, can_gc: CanGc) -> ErrorResult {
         self.upcast::<Node>().replace_children(nodes, can_gc)
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-queryselector
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-queryselector>
     fn QuerySelector(&self, selectors: DOMString) -> Fallible<Option<DomRoot<Element>>> {
         self.upcast::<Node>().query_selector(selectors)
     }
 
-    // https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall
+    /// <https://dom.spec.whatwg.org/#dom-parentnode-queryselectorall>
     fn QuerySelectorAll(&self, selectors: DOMString) -> Fallible<DomRoot<NodeList>> {
         self.upcast::<Node>().query_selector_all(selectors)
     }

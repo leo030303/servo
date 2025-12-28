@@ -146,6 +146,7 @@ impl KeyboardEvent {
         ev.is_composing.set(is_composing);
         ev.char_code.set(char_code);
         ev.key_code.set(key_code);
+        ev.uievent.set_which(key_code);
         ev
     }
 
@@ -186,15 +187,15 @@ impl KeyboardEventMethods<crate::DomTypeHolder> for KeyboardEvent {
             init.repeat,
             init.isComposing,
             modifiers,
-            0,
-            0,
+            init.charCode,
+            init.keyCode,
             can_gc,
         );
         *event.key.borrow_mut() = init.key.clone();
         Ok(event)
     }
 
-    // https://w3c.github.io/uievents/#widl-KeyboardEvent-initKeyboardEvent
+    /// <https://w3c.github.io/uievents/#widl-KeyboardEvent-initKeyboardEvent>
     fn InitKeyboardEvent(
         &self,
         type_arg: DOMString,
@@ -265,7 +266,7 @@ impl KeyboardEventMethods<crate::DomTypeHolder> for KeyboardEvent {
 
     /// <https://w3c.github.io/uievents/#dom-keyboardevent-getmodifierstate>
     fn GetModifierState(&self, key_arg: DOMString) -> bool {
-        self.modifiers.get().contains(match &*key_arg {
+        self.modifiers.get().contains(match &*key_arg.str() {
             "Alt" => Modifiers::ALT,
             "AltGraph" => Modifiers::ALT_GRAPH,
             "CapsLock" => Modifiers::CAPS_LOCK,
@@ -290,15 +291,6 @@ impl KeyboardEventMethods<crate::DomTypeHolder> for KeyboardEvent {
     /// <https://w3c.github.io/uievents/#dom-keyboardevent-keycode>
     fn KeyCode(&self) -> u32 {
         self.key_code.get()
-    }
-
-    /// <https://w3c.github.io/uievents/#dom-uievent-which>
-    fn Which(&self) -> u32 {
-        if self.char_code.get() != 0 {
-            self.char_code.get()
-        } else {
-            self.key_code.get()
-        }
     }
 
     /// <https://dom.spec.whatwg.org/#dom-event-istrusted>

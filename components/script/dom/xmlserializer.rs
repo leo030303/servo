@@ -12,6 +12,7 @@ use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::node::Node;
+use crate::dom::servoparser::html::HtmlSerialize;
 use crate::dom::window::Window;
 use crate::script_runtime::CanGc;
 
@@ -44,7 +45,7 @@ impl XMLSerializer {
 }
 
 impl XMLSerializerMethods<crate::DomTypeHolder> for XMLSerializer {
-    // https://w3c.github.io/DOM-Parsing/#dom-xmlserializer
+    /// <https://w3c.github.io/DOM-Parsing/#dom-xmlserializer>
     fn Constructor(
         window: &Window,
         proto: Option<HandleObject>,
@@ -53,12 +54,12 @@ impl XMLSerializerMethods<crate::DomTypeHolder> for XMLSerializer {
         Ok(XMLSerializer::new(window, proto, can_gc))
     }
 
-    // https://w3c.github.io/DOM-Parsing/#the-xmlserializer-interface
+    /// <https://w3c.github.io/DOM-Parsing/#the-xmlserializer-interface>
     fn SerializeToString(&self, root: &Node) -> Fallible<DOMString> {
         let mut writer = vec![];
         match serialize(
             &mut writer,
-            &root,
+            &HtmlSerialize::new(root),
             SerializeOpts {
                 traversal_scope: TraversalScope::IncludeNode,
             },

@@ -7,11 +7,14 @@ use std::rc::Rc;
 
 use app_units::Au;
 use compositing_traits::display_list::ScrollTree;
-use euclid::default::{Point2D, Rect};
-use euclid::{SideOffsets2D, Size2D};
+use euclid::default::{Point2D, Rect as UntypedRect};
+use euclid::{Rect, SideOffsets2D, Size2D};
 use itertools::Itertools;
 use layout_api::wrapper_traits::{LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
-use layout_api::{BoxAreaType, LayoutElementType, LayoutNodeType, OffsetParentResponse};
+use layout_api::{
+    AxesOverflow, BoxAreaType, LayoutElementType, LayoutNodeType, OffsetParentResponse,
+    PhysicalSides, ScrollContainerQueryFlags, ScrollContainerResponse,
+};
 use script::layout_dom::{ServoLayoutNode, ServoThreadSafeLayoutNode};
 use servo_arc::Arc as ServoArc;
 use servo_geometry::{FastLayoutTransform, au_rect_to_f32_rect, f32_rect_to_au_rect};
@@ -32,6 +35,7 @@ use style::shared_lock::SharedRwLock;
 use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
 use style::stylist::RuleInclusion;
 use style::traversal::resolve_style;
+use style::values::computed::transform::Matrix3D;
 use style::values::computed::{Float, Size};
 use style::values::generics::font::LineHeight;
 use style::values::generics::position::AspectRatio;
@@ -41,16 +45,17 @@ use style::values::specified::text::TextTransformCase;
 use style_traits::{ParsingMode, ToCss};
 
 use crate::ArcRefCell;
-use crate::display_list::StackingContextTree;
+use crate::display_list::{StackingContextTree, au_rect_to_length_rect};
 use crate::dom::NodeExt;
 use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, capitalize_string};
 use crate::fragment_tree::{
     BoxFragment, Fragment, FragmentFlags, FragmentTree, SpecificLayoutInfo,
 };
+use crate::style_ext::ComputedValuesExt;
 use crate::taffy::SpecificTaffyGridInfo;
 
 /// Get a scroll node that would represents this [`ServoLayoutNode`]'s transform and
-/// calculate its cumlative transform from its root scroll node to the scroll node.
+/// calculate its cumulative transform from its root scroll node to the scroll node.
 fn root_transform_for_layout_node(
     scroll_tree: &ScrollTree,
     node: ServoThreadSafeLayoutNode<'_>,
@@ -60,21 +65,44 @@ fn root_transform_for_layout_node(
         .first()
         .and_then(Fragment::retrieve_box_fragment)?
         .borrow();
-    let scroll_tree_node_id = box_fragment
-        .spatial_tree_node
-        .borrow()
-        .expect("Should always have a scroll tree node when querying bounding box.");
-    Some(scroll_tree.cumulative_node_to_root_transform(&scroll_tree_node_id))
+    let scroll_tree_node_id = box_fragment.spatial_tree_node()?;
+    Some(scroll_tree.cumulative_node_to_root_transform(scroll_tree_node_id))
+}
+
+pub(crate) fn process_padding_request(
+    node: ServoThreadSafeLayoutNode<'_>,
+) -> Option<PhysicalSides> {
+    let fragments = node.fragments_for_pseudo(None);
+    let fragment = fragments.first()?;
+    Some(match fragment {
+        Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
+            let padding = box_fragment.borrow().padding;
+            PhysicalSides {
+                top: padding.top,
+                left: padding.left,
+                bottom: padding.bottom,
+                right: padding.right,
+            }
+        },
+        _ => Default::default(),
+    })
 }
 
 pub(crate) fn process_box_area_request(
     stacking_context_tree: &StackingContextTree,
     node: ServoThreadSafeLayoutNode<'_>,
     area: BoxAreaType,
-) -> Option<Rect<Au>> {
+    exclude_transform_and_inline: bool,
+) -> Option<UntypedRect<Au>> {
     let rects: Vec<_> = node
         .fragments_for_pseudo(None)
         .iter()
+        .filter(|fragment| {
+            !exclude_transform_and_inline ||
+                fragment
+                    .retrieve_box_fragment()
+                    .is_none_or(|fragment| !fragment.borrow().is_inline_box())
+        })
         .filter_map(|node| node.cumulative_box_area_rect(area))
         .collect();
     if rects.is_empty() {
@@ -84,10 +112,14 @@ pub(crate) fn process_box_area_request(
         rect.to_untyped().union(&unioned_rect)
     });
 
-    let Some(transform) =
-        root_transform_for_layout_node(&stacking_context_tree.compositor_info.scroll_tree, node)
-    else {
+    if exclude_transform_and_inline {
         return Some(rect_union);
+    }
+
+    let Some(transform) =
+        root_transform_for_layout_node(&stacking_context_tree.paint_info.scroll_tree, node)
+    else {
+        return Some(Rect::new(rect_union.origin, Size2D::zero()));
     };
 
     transform_au_rectangle(rect_union, transform)
@@ -97,7 +129,7 @@ pub(crate) fn process_box_areas_request(
     stacking_context_tree: &StackingContextTree,
     node: ServoThreadSafeLayoutNode<'_>,
     area: BoxAreaType,
-) -> Vec<Rect<Au>> {
+) -> Vec<UntypedRect<Au>> {
     let fragments = node.fragments_for_pseudo(None);
     let box_areas = fragments
         .iter()
@@ -105,9 +137,11 @@ pub(crate) fn process_box_areas_request(
         .map(|rect| rect.to_untyped());
 
     let Some(transform) =
-        root_transform_for_layout_node(&stacking_context_tree.compositor_info.scroll_tree, node)
+        root_transform_for_layout_node(&stacking_context_tree.paint_info.scroll_tree, node)
     else {
-        return box_areas.collect();
+        return box_areas
+            .map(|rect| Rect::new(rect.origin, Size2D::zero()))
+            .collect();
     };
 
     box_areas
@@ -115,18 +149,37 @@ pub(crate) fn process_box_areas_request(
         .collect()
 }
 
-pub fn process_client_rect_request(node: ServoThreadSafeLayoutNode<'_>) -> Rect<i32> {
+pub fn process_client_rect_request(node: ServoThreadSafeLayoutNode<'_>) -> UntypedRect<i32> {
     node.fragments_for_pseudo(None)
         .first()
         .map(Fragment::client_rect)
         .unwrap_or_default()
 }
 
+/// Process a query for the current CSS zoom of an element.
+/// <https://drafts.csswg.org/cssom-view/#dom-element-currentcsszoom>
+///
+/// Returns the effective zoom of the element, which is the product of all zoom
+/// values from the element up to the root. Returns 1.0 if the element is not
+/// being rendered (has no associated box).
+pub fn process_current_css_zoom_query(node: ServoLayoutNode<'_>) -> f32 {
+    let Some(layout_data) = node.to_threadsafe().inner_layout_data() else {
+        return 1.0;
+    };
+    let layout_box = layout_data.self_box.borrow();
+    let Some(layout_box) = layout_box.as_ref() else {
+        return 1.0;
+    };
+    layout_box
+        .with_first_base(|base| base.style.effective_zoom.value())
+        .unwrap_or(1.0)
+}
+
 /// <https://drafts.csswg.org/cssom-view/#scrolling-area>
 pub fn process_node_scroll_area_request(
     requested_node: Option<ServoThreadSafeLayoutNode<'_>>,
     fragment_tree: Option<Rc<FragmentTree>>,
-) -> Rect<i32> {
+) -> UntypedRect<i32> {
     let Some(tree) = fragment_tree else {
         return Rect::zero();
     };
@@ -191,6 +244,37 @@ pub fn process_resolved_style_request(
     }
     .to_physical(style.writing_mode);
 
+    // From <https://drafts.csswg.org/css-transforms-2/#serialization-of-the-computed-value>
+    let serialize_transform_value = |box_fragment: Option<&BoxFragment>| -> Result<String, ()> {
+        let transform_list = &style.get_box().transform;
+
+        // > When the computed value is a <transform-list>, the resolved value is one
+        // > <matrix()> function or one <matrix3d()> function computed by the following
+        // > algorithm:
+        if transform_list.0.is_empty() {
+            return Ok("none".into());
+        }
+
+        // > 1. Let transform be a 4x4 matrix initialized to the identity matrix. The
+        // >    elements m11, m22, m33 and m44 of transform must be set to 1; all other
+        // >    elements of transform must be set to 0.
+        // > 2. Post-multiply all <transform-function>s in <transform-list> to transform.
+        let length_rect = box_fragment
+            .map(|box_fragment| au_rect_to_length_rect(&box_fragment.border_rect()).to_untyped());
+        let (transform, is_3d) = transform_list.to_transform_3d_matrix(length_rect.as_ref())?;
+
+        // > 3. Chose between <matrix()> or <matrix3d()> serialization:
+        // >   ↪ If transform is a 2D matrix: Serialize transform to a <matrix()> function.
+        // >   ↪ Otherwise: Serialize transform to a <matrix3d()> function. Chose between
+        // >     <matrix()> or <matrix3d()> serialization:
+        let matrix = Matrix3D::from(transform);
+        if !is_3d {
+            Ok(matrix.into_2d()?.to_css_string())
+        } else {
+            Ok(matrix.to_css_string())
+        }
+    };
+
     let computed_style = |fragment: Option<&Fragment>| match longhand_id {
         LonghandId::MinWidth
             if style.clone_min_width() == Size::Auto &&
@@ -203,6 +287,10 @@ pub fn process_resolved_style_request(
                 !should_honor_min_size_auto(fragment, style) =>
         {
             String::from("0px")
+        },
+        LonghandId::Transform => match serialize_transform_value(None) {
+            Ok(value) => value,
+            Err(..) => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
         },
         _ => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
     };
@@ -252,24 +340,28 @@ pub fn process_resolved_style_request(
                         LonghandId::Left => {
                             return resolved_insets().left.to_css_string();
                         },
+                        LonghandId::Transform => {
+                            // If we can compute the string do it, but otherwise fallback to a cruder serialization
+                            // of the value.
+                            if let Ok(string) = serialize_transform_value(Some(&*box_fragment)) {
+                                return string;
+                            }
+                        },
                         _ => {},
                     }
                 }
-                let content_rect = box_fragment.content_rect;
+                let content_rect = box_fragment.base.rect;
                 let margins = box_fragment.margin;
                 let padding = box_fragment.padding;
                 let specific_layout_info = box_fragment.specific_layout_info().cloned();
                 (content_rect, margins, padding, specific_layout_info)
             },
-            Fragment::Positioning(positioning_fragment) => {
-                let content_rect = positioning_fragment.borrow().rect;
-                (
-                    content_rect,
-                    SideOffsets2D::zero(),
-                    SideOffsets2D::zero(),
-                    None,
-                )
-            },
+            Fragment::Positioning(positioning_fragment) => (
+                positioning_fragment.borrow().base.rect,
+                SideOffsets2D::zero(),
+                SideOffsets2D::zero(),
+                None,
+            ),
             _ => return computed_style(Some(fragment)),
         };
 
@@ -356,7 +448,7 @@ fn resolve_grid_template(
     style: &ComputedValues,
     longhand_id: LonghandId,
 ) -> Option<String> {
-    // https://drafts.csswg.org/css-grid/#resolved-track-list-standalone
+    /// <https://drafts.csswg.org/css-grid/#resolved-track-list-standalone>
     fn serialize_standalone_non_subgrid_track_list(track_sizes: &[Au]) -> Option<String> {
         match track_sizes.is_empty() {
             // Standalone non subgrid grids with empty track lists should compute to `none`.
@@ -465,7 +557,13 @@ fn shorthand_to_css_string(
     let mut dest = String::new();
     for longhand in id.longhands() {
         block.push(
-            style.computed_or_resolved_declaration(longhand, Some(&Context { style })),
+            style.computed_or_resolved_declaration(
+                longhand,
+                Some(&Context {
+                    style,
+                    for_property: longhand.into(),
+                }),
+            ),
             Importance::Normal,
         );
     }
@@ -499,7 +597,7 @@ fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFrag
         return None;
     }
     if matches!(
-        fragment, Fragment::Box(fragment) if fragment.borrow().style.get_box().position == Position::Fixed
+        fragment, Fragment::Box(fragment) if fragment.borrow().style().get_box().position == Position::Fixed
     ) {
         return None;
     }
@@ -531,7 +629,7 @@ fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFrag
                     .cloned()
             });
 
-            if parent_fragment.borrow().style.get_box().position != Position::Static {
+            if parent_fragment.borrow().style().get_box().position != Position::Static {
                 return Some(OffsetParentFragments {
                     parent: parent_fragment.clone(),
                     grandparent: grandparent_fragment,
@@ -555,7 +653,10 @@ fn offset_parent_fragments(node: ServoLayoutNode<'_>) -> Option<OffsetParentFrag
 }
 
 #[inline]
-pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetParentResponse> {
+pub fn process_offset_parent_query(
+    scroll_tree: &ScrollTree,
+    node: ServoLayoutNode<'_>,
+) -> Option<OffsetParentResponse> {
     // Only consider the first fragment of the node found as per a
     // possible interpretation of the specification: "[...] return the
     // y-coordinate of the top border edge of the first CSS layout box
@@ -578,6 +679,16 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
         .first()
         .cloned()?;
     let mut border_box = fragment.cumulative_box_area_rect(BoxAreaType::Border)?;
+    let cumulative_sticky_offsets = fragment
+        .retrieve_box_fragment()
+        .and_then(|box_fragment| box_fragment.borrow().spatial_tree_node())
+        .map(|node_id| {
+            scroll_tree
+                .cumulative_sticky_offsets(node_id)
+                .map(Au::from_f32_px)
+                .cast_unit()
+        });
+    border_box = border_box.translate(cumulative_sticky_offsets.unwrap_or_default());
 
     // 2.  If the offsetParent of the element is null return the x-coordinate of the left
     //     border edge of the first CSS layout box associated with the element, relative to
@@ -595,7 +706,7 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
         .base
         .flags
         .contains(FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT) &&
-        parent_fragment.style.get_box().position == Position::Static;
+        parent_fragment.style().get_box().position == Position::Static;
 
     // For `offsetLeft`:
     // 3. Return the result of subtracting the y-coordinate of the top padding edge of the
@@ -628,7 +739,18 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
         }
     } else {
         parent_fragment.offset_by_containing_block(&parent_fragment.padding_rect())
-    };
+    }
+    .translate(
+        cumulative_sticky_offsets
+            .and_then(|_| parent_fragment.spatial_tree_node())
+            .map(|node_id| {
+                scroll_tree
+                    .cumulative_sticky_offsets(node_id)
+                    .map(Au::from_f32_px)
+                    .cast_unit()
+            })
+            .unwrap_or_default(),
+    );
 
     border_box = border_box.translate(-parent_offset_rect.origin.to_vector());
 
@@ -638,11 +760,125 @@ pub fn process_offset_parent_query(node: ServoLayoutNode<'_>) -> Option<OffsetPa
     })
 }
 
+/// An implementation of `scrollParent` that can also be used to for `scrollIntoView`:
+/// <https://drafts.csswg.org/cssom-view/#dom-htmlelement-scrollparent>.
+///
+#[inline]
+pub(crate) fn process_scroll_container_query(
+    node: Option<ServoLayoutNode<'_>>,
+    query_flags: ScrollContainerQueryFlags,
+    viewport_overflow: AxesOverflow,
+) -> Option<ScrollContainerResponse> {
+    let Some(node) = node else {
+        return Some(ScrollContainerResponse::Viewport(viewport_overflow));
+    };
+
+    let layout_data = node.to_threadsafe().inner_layout_data()?;
+
+    // 1. If any of the following holds true, return null and terminate this algorithm:
+    //  - The element does not have an associated box.
+    let layout_box = layout_data.self_box.borrow();
+    let layout_box = layout_box.as_ref()?;
+
+    let (style, flags) =
+        layout_box.with_first_base(|base| (base.style.clone(), base.base_fragment_info.flags))?;
+
+    // - The element is the root element.
+    // - The element is the body element.
+    //
+    // Note: We only do this for `scrollParent`, which needs to be null. But `scrollIntoView` on the
+    // `<body>` or root element should still bring it into view by scrolling the viewport.
+    if query_flags.contains(ScrollContainerQueryFlags::ForScrollParent) &&
+        flags.intersects(
+            FragmentFlags::IS_ROOT_ELEMENT | FragmentFlags::IS_BODY_ELEMENT_OF_HTML_ELEMENT_ROOT,
+        )
+    {
+        return None;
+    }
+
+    if query_flags.contains(ScrollContainerQueryFlags::Inclusive) &&
+        style.establishes_scroll_container(flags)
+    {
+        return Some(ScrollContainerResponse::Element(
+            node.opaque().into(),
+            style.effective_overflow(flags),
+        ));
+    }
+
+    // - The element’s computed value of the position property is fixed and no ancestor
+    //   establishes a fixed position containing block.
+    //
+    // This is handled below in step 2.
+
+    // 2. Let ancestor be the containing block of the element in the flat tree and repeat these substeps:
+    // - If ancestor is the initial containing block, return the scrollingElement for the
+    //   element’s document if it is not closed-shadow-hidden from the element, otherwise
+    //   return null.
+    // - If ancestor is not closed-shadow-hidden from the element, and is a scroll
+    //   container, terminate this algorithm and return ancestor.
+    // - If the computed value of the position property of ancestor is fixed, and no
+    //   ancestor establishes a fixed position containing block, terminate this algorithm
+    //   and return null.
+    // - Let ancestor be the containing block of ancestor in the flat tree.
+    //
+    // Notes: We don't follow the specification exactly below, but we follow the spirit.
+    //
+    // TODO: Handle the situation where the ancestor is "closed-shadow-hidden" from the element.
+    let mut current_position_value = style.clone_position();
+    let mut current_ancestor = node.as_element()?;
+    while let Some(ancestor) = current_ancestor.traversal_parent() {
+        current_ancestor = ancestor;
+
+        let Some(layout_data) = ancestor.as_node().to_threadsafe().inner_layout_data() else {
+            continue;
+        };
+        let ancestor_layout_box = layout_data.self_box.borrow();
+        let Some(ancestor_layout_box) = ancestor_layout_box.as_ref() else {
+            continue;
+        };
+
+        let Some((ancestor_style, ancestor_flags)) = ancestor_layout_box
+            .with_first_base(|base| (base.style.clone(), base.base_fragment_info.flags))
+        else {
+            continue;
+        };
+
+        let is_containing_block = match current_position_value {
+            Position::Static | Position::Relative | Position::Sticky => {
+                !ancestor_style.is_inline_box(ancestor_flags)
+            },
+            Position::Absolute => {
+                ancestor_style.establishes_containing_block_for_absolute_descendants(ancestor_flags)
+            },
+            Position::Fixed => {
+                ancestor_style.establishes_containing_block_for_all_descendants(ancestor_flags)
+            },
+        };
+        if !is_containing_block {
+            continue;
+        }
+
+        if ancestor_style.establishes_scroll_container(ancestor_flags) {
+            return Some(ScrollContainerResponse::Element(
+                ancestor.as_node().opaque().into(),
+                ancestor_style.effective_overflow(ancestor_flags),
+            ));
+        }
+
+        current_position_value = ancestor_style.clone_position();
+    }
+
+    match current_position_value {
+        Position::Fixed => None,
+        _ => Some(ScrollContainerResponse::Viewport(viewport_overflow)),
+    }
+}
+
 /// <https://html.spec.whatwg.org/multipage/#get-the-text-steps>
 pub fn get_the_text_steps(node: ServoLayoutNode<'_>) -> String {
     // Step 1: If element is not being rendered or if the user agent is a non-CSS user agent, then
     // return element's descendant text content.
-    // This is taken care of in HTMLElemnent code
+    // This is taken care of in HTMLElement code
 
     // Step 2: Let results be a new empty list.
     let mut results = Vec::new();
@@ -915,7 +1151,7 @@ fn rendered_text_collection_steps(
             let inherited_box = style.get_inherited_box();
 
             if inherited_box.visibility != Visibility::Visible {
-                // If the element is not visible then we'll immediatly render all children,
+                // If the element is not visible, then we'll immediately render all children,
                 // skipping all other processing.
                 // We can't just stop here since a child can override a parents visibility.
                 for child in node.dom_children() {
@@ -1168,10 +1404,10 @@ where
     Some(computed_values.clone_font())
 }
 
-fn transform_au_rectangle(
-    rect_to_transform: Rect<Au>,
+pub(crate) fn transform_au_rectangle(
+    rect_to_transform: UntypedRect<Au>,
     transform: FastLayoutTransform,
-) -> Option<Rect<Au>> {
+) -> Option<UntypedRect<Au>> {
     let rect_to_transform = &au_rect_to_f32_rect(rect_to_transform).cast_unit();
     let outer_transformed_rect = match transform {
         FastLayoutTransform::Offset(offset) => Some(rect_to_transform.translate(offset)),

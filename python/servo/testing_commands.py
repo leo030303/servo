@@ -8,19 +8,18 @@
 # except according to those terms.
 
 import argparse
-from argparse import ArgumentParser
 import json
 import logging
 import os
 import os.path as path
-import platform
 import re
 import shutil
 import subprocess
 import sys
 import textwrap
-from time import sleep
-from typing import Any
+from argparse import ArgumentParser
+from pathlib import Path
+from typing import Any, List, Optional
 
 import tidy
 import wpt
@@ -161,14 +160,22 @@ class MachCommands(CommandBase):
     @CommandArgument(
         "--nocapture", default=False, action="store_true", help="Run tests with nocapture ( show test stdout )"
     )
+    @CommandArgument("--code-coverage", default=False, action="store_true", help="Run in code coverage mode")
+    @CommandArgument("--llvm-cov-option", default=None, action="append", help="Additional options for llvm-cov")
+    @CommandArgument("--nextest-profile", default=None, help="Specify the Nextest profile to use")
+    @CommandArgument("params", nargs="...", help="Command-line arguments to be passed through to Cargo nextest")
     @CommandBase.common_command_arguments(build_configuration=True, build_type=True)
     def test_unit(
         self,
         build_type: BuildType,
         test_name: list[str] | None = None,
+        params: list[str] | None = None,
         package: str | None = None,
         bench: bool = False,
+        code_coverage: bool = False,
+        llvm_cov_option: Optional[List[str]] = None,
         nocapture: bool = False,
+        nextest_profile: str | None = None,
         **kwargs: Any,
     ) -> int:
         if test_name is None:
@@ -217,10 +224,14 @@ class MachCommands(CommandBase):
             "net_traits",
             "pixels",
             "script_traits",
+            "script_bindings",
             "selectors",
             "servo_config",
             "servoshell",
-            "stylo_config",
+            "servo_url",
+            "storage",
+            "storage_traits",
+            "xpath",
         ]
         if not packages:
             packages = set(os.listdir(path.join(self.context.topdir, "tests", "unit"))) - set([".DS_Store"])
@@ -234,21 +245,21 @@ class MachCommands(CommandBase):
             except KeyError:
                 pass
 
-        packages.discard("stylo")
-
         # Return if there is nothing to do.
         if len(packages) == 0 and len(in_crate_packages) == 0:
             return 0
 
-        # Gather Cargo build timings (https://doc.rust-lang.org/cargo/reference/timings.html).
-        args: list[str] = ["--timings"]
+        args: list[str] = params or []
 
         if build_type.is_release():
             args += ["--release"]
         elif build_type.is_dev():
             pass  # there is no argument for debug
         else:
-            args += ["--profile", build_type.profile]
+            args += ["--cargo-profile", build_type.profile]
+
+        if nextest_profile is not None:
+            args += ["--profile", nextest_profile]
 
         for crate in packages:
             args += ["-p", "%s_tests" % crate]
@@ -257,20 +268,38 @@ class MachCommands(CommandBase):
         args += test_patterns
 
         if nocapture:
-            args += ["--", "--nocapture"]
+            args += ["--nocapture"]
+        args += ["--no-fail-fast"]
 
         env = self.build_env()
-        result = call(["cargo", "bench" if bench else "test"], cwd="support/crown")
+
+        crown_cargo_command: List[str] = ["cargo"]
+        cargo_command: str
+        if bench:
+            cargo_command = "bench"
+            if code_coverage:
+                print(
+                    "Error: Invalid argument combination for `./mach test-unit`. "
+                    "`--bench` and `--code-coverage` are mutually exclusive."
+                )
+                exit(1)
+        elif code_coverage:
+            cargo_llvm_cov_options: List[str] = llvm_cov_option or []
+            crown_cargo_command.extend(["llvm-cov", "nextest"])
+            crown_cargo_command.extend(cargo_llvm_cov_options)
+            cargo_command = "llvm-cov"
+            args.insert(0, "nextest")
+            args.extend(cargo_llvm_cov_options)
+        else:
+            crown_cargo_command.extend(["nextest", "run"])
+            cargo_command = "nextest"
+            args.insert(0, "run")
+        result = call(crown_cargo_command, cwd="support/crown")
         if result != 0:
             return result
-        result = self.run_cargo_build_like_command("bench" if bench else "test", args, env=env, **kwargs)
+        result = self.run_cargo_build_like_command(cargo_command, args, env=env, **kwargs)
         assert isinstance(result, int)
         return result
-
-    @Command("test-content", description="Run the content tests", category="testing")
-    def test_content(self) -> int:
-        print("Content tests have been replaced by web-platform-tests under tests/wpt/mozilla/.")
-        return 0
 
     @Command("test-tidy", description="Run the source code tidiness check", category="testing")
     @CommandArgument(
@@ -343,11 +372,10 @@ class MachCommands(CommandBase):
         passed = wpt.run_tests() and passed
 
         print("Running devtools parser tests...")
-        # TODO: Enable these tests on other platforms once mach bootstrap installs tshark(1) for them
-        if platform.system() == "Linux":
+        if shutil.which("tshark"):
             try:
                 result = subprocess.run(
-                    ["etc/devtools_parser.py", "--json", "--use", "etc/devtools_parser_test.pcap"],
+                    ["etc/devtools_parser.py", "--json", "--read-file", "etc/devtools_parser_test.pcap"],
                     check=True,
                     capture_output=True,
                 )
@@ -361,7 +389,7 @@ class MachCommands(CommandBase):
                 print(f"stderr: {repr(e.stderr)}", file=sys.stderr)
                 raise e
         else:
-            print("SKIP")
+            print("SKIP: Install tshark manually")
 
         if all or tests:
             print("Running WebIDL tests...")
@@ -440,6 +468,37 @@ class MachCommands(CommandBase):
             return 1
         return wpt.update.update_tests(**kwargs)
 
+    @Command("test-ohos-wpt", description="Run a single WPT test on OHOS device using WebDriver", category="testing")
+    @CommandArgument("--test", required=True, help="Path to WPT test (relative to tests/wpt/tests/)")
+    @CommandArgument("--webdriver-port", type=int, default=7000, help="WebDriver server port on OHOS device")
+    @CommandArgument("--wpt-server-port", type=int, default=8000, help="WPT server port on desktop")
+    @CommandArgument("--verbose", action="store_true", help="Enable verbose logging")
+    def test_ohos_wpt(self, **kwargs: Any) -> int:
+        """Run a single WPT test on OHOS device."""
+        script_path = Path(__file__).parent.parent / "wpt" / "ohos_webdriver_test.py"
+
+        cmd = [
+            sys.executable,
+            str(script_path),
+            "--test",
+            kwargs["test"],
+            "--webdriver-port",
+            str(kwargs["webdriver_port"]),
+            "--wpt-server-port",
+            str(kwargs["wpt_server_port"]),
+        ]
+
+        if kwargs.get("verbose"):
+            cmd.append("--verbose")
+
+        print(f"Running OHOS WPT test: {kwargs['test']}")
+        print("Make sure:")
+        print("1. OHOS device is connected and running Servo with WebDriver enabled")
+        print("2. WPT server is running on desktop")
+        print("3. HDC is available in PATH")
+
+        return subprocess.call(cmd)
+
     @Command("test-jquery", description="Run the jQuery test suite", category="testing")
     @CommandBase.common_command_arguments(binary_selection=True)
     def test_jquery(self, servo_binary: str) -> int:
@@ -448,23 +507,19 @@ class MachCommands(CommandBase):
     @Command("test-dromaeo", description="Run the Dromaeo test suite", category="testing")
     @CommandArgument("tests", default=["recommended"], nargs="...", help="Specific tests to run")
     @CommandArgument("--bmf-output", default=None, help="Specify BMF JSON output file")
-    @CommandBase.common_command_arguments(binary_selection=True)
-    def test_dromaeo(self, tests: list[str], servo_binary: str, bmf_output: str | None = None) -> None:
-        return self.dromaeo_test_runner(tests, servo_binary, bmf_output)
+    @CommandBase.common_command_arguments(build_type=True, binary_selection=True)
+    def test_dromaeo(
+        self, tests: list[str], build_type: BuildType, servo_binary: str, bmf_output: str | None = None, **kwargs: Any
+    ) -> None:
+        return self.dromaeo_test_runner(tests, servo_binary, bmf_output, build_type.profile)
 
     @Command("test-speedometer", description="Run servo's speedometer", category="testing")
     @CommandArgument("--bmf-output", default=None, help="Specify BMF JSON output file")
-    @CommandBase.common_command_arguments(binary_selection=True)
-    def test_speedometer(self, servo_binary: str, bmf_output: str | None = None) -> None:
-        return self.speedometer_runner(servo_binary, bmf_output)
-
-    @Command("test-speedometer-ohos", description="Run servo's speedometer on a ohos device", category="testing")
-    @CommandArgument("--bmf-output", default=None, help="Specifcy BMF JSON output file")
-    @CommandArgument("--profile", default=None, help="Specify a profile which will be prepended to the output")
-    # This needs to be a separate command because we do not need a binary locally
-
-    def test_speedometer_ohos(self, bmf_output: str | None = None, profile: str | None = None) -> None:
-        return self.speedometer_runner_ohos(bmf_output, profile)
+    @CommandBase.common_command_arguments(build_type=True, binary_selection=True)
+    def test_speedometer(
+        self, build_type: BuildType, servo_binary: str, bmf_output: str | None = None, **kwargs: Any
+    ) -> None:
+        return self.speedometer_runner(servo_binary, bmf_output, build_type.profile)
 
     @Command("update-jquery", description="Update the jQuery test suite expected results", category="testing")
     @CommandBase.common_command_arguments(binary_selection=True)
@@ -574,7 +629,7 @@ class MachCommands(CommandBase):
 
         return call([run_file, cmd, bin_path, base_dir])
 
-    def dromaeo_test_runner(self, tests: list[str], binary: str, bmf_output: str | None) -> None:
+    def dromaeo_test_runner(self, tests: list[str], binary: str, bmf_output: str | None, profile: str) -> None:
         base_dir = path.abspath(path.join("tests", "dromaeo"))
         dromaeo_dir = path.join(base_dir, "dromaeo")
         run_file = path.join(base_dir, "run_dromaeo.py")
@@ -598,7 +653,12 @@ class MachCommands(CommandBase):
         # Check that a release servo build exists
         bin_path = path.abspath(binary)
 
-        return check_call([run_file, "|".join(tests), bin_path, base_dir, bmf_output])
+        args = [run_file, "|".join(tests), bin_path, base_dir]
+        if bmf_output is not None:
+            args.append(bmf_output)
+            args.append(profile)
+
+        return check_call(args)
 
     def speedometer_to_bmf(self, speedometer: dict[str, Any], bmf_output: str, profile: str | None = None) -> None:
         output = dict()
@@ -632,7 +692,7 @@ class MachCommands(CommandBase):
         with open(bmf_output, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=4)
 
-    def speedometer_runner(self, binary: str, bmf_output: str | None) -> None:
+    def speedometer_runner(self, binary: str, bmf_output: str | None, profile: str) -> None:
         output = subprocess.check_output(
             [
                 binary,
@@ -655,80 +715,6 @@ class MachCommands(CommandBase):
 
         print(f"Score: {speedometer['Score']['mean']} ± {speedometer['Score']['delta']}")
 
-        if bmf_output:
-            self.speedometer_to_bmf(speedometer, bmf_output)
-
-    def speedometer_runner_ohos(self, bmf_output: str | None, profile: str | None) -> None:
-        hdc_path = shutil.which("hdc")
-        log_path: str = "/data/app/el2/100/base/org.servo.servo/cache/servo.log"
-
-        if hdc_path is None:
-            ohos_sdk_native = os.getenv("OHOS_SDK_NATIVE")
-            assert ohos_sdk_native
-            hdc_path = path.join(ohos_sdk_native, "../", "toolchains", "hdc")
-
-        def read_log_file(hdc_path: str) -> str:
-            subprocess.call([hdc_path, "file", "recv", log_path, "servo.log"])
-            file = ""
-            try:
-                with open("servo.log") as file:
-                    return file.read()
-            except OSError:
-                return ""
-
-        subprocess.call([hdc_path, "shell", "aa", "force-stop", "org.servo.servo"])
-
-        subprocess.call([hdc_path, "shell", "rm", log_path])
-        subprocess.call(
-            [
-                hdc_path,
-                "shell",
-                "aa",
-                "start",
-                "-a",
-                "EntryAbility",
-                "-b",
-                "org.servo.servo",
-                "-U",
-                "https://servospeedometer.netlify.app?headless=1",
-                "--ps=--pref",
-                "js_disable_jit=true",
-                "--ps",
-                "--log-filter",
-                "script::dom::console",
-                "--psn",
-                "--log-to-file",
-            ]
-        )
-
-        # A current (2025-06-23) run took 3m 49s = 229s. We keep a safety margin
-        # but we will exit earlier if we see "{"
-        whole_file: str = ""
-        for i in range(10):
-            sleep(30)
-            whole_file = read_log_file(hdc_path)
-            if "[INFO script::dom::console]" in whole_file:
-                # technically the file could not have been written completely yet
-                # on devices with slow flash, we might want to wait a bit more
-                sleep(2)
-                whole_file = read_log_file(hdc_path)
-                break
-        else:
-            print("Error failed to find console logs in log file")
-            print(f"log-file contents: `{whole_file}`")
-            exit(1)
-        start_index: int = whole_file.index("[INFO script::dom::console]") + len("[INFO script::dom::console]") + 1
-        json_string = whole_file[start_index:]
-        try:
-            speedometer = json.loads(json_string)
-        except json.decoder.JSONDecodeError as e:
-            print(f"Error: Failed to convert log output to JSON: {e}")
-            pretty_print_json_decode_error(e)
-            print("Error: Failed to parse speedometer results")
-            print("This can happen if other log messages are printed while running servo...")
-            exit(1)
-
-        print(f"Score: {speedometer['Score']['mean']} ± {speedometer['Score']['delta']}")
         if bmf_output:
             self.speedometer_to_bmf(speedometer, bmf_output, profile)
 
@@ -860,7 +846,19 @@ class MachCommands(CommandBase):
         commit_message = subprocess.check_output(["git", "show", "-s", "--format=%s"]).decode().strip()
         commit_message = f"{commit_message} ({try_string})"
 
-        result = call(["git", "commit", "--quiet", "--allow-empty", "-m", commit_message, "-m", f"{config.to_json()}"])
+        result = call(
+            [
+                "git",
+                "commit",
+                "--no-verify",
+                "--quiet",
+                "--allow-empty",
+                "-m",
+                commit_message,
+                "-m",
+                f"{config.to_json()}",
+            ]
+        )
         if result != 0:
             return result
 

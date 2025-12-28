@@ -38,12 +38,16 @@ pub struct TrustedTypePolicyFactory {
 
 pub(crate) static DEFAULT_SCRIPT_SINK_GROUP: &str = "'script'";
 
+// We currently always clone the result, so keep the `clone()` in the trait
+// for now to keep the caller side clean
 impl Convert<DOMString> for TrustedTypeOrString {
     fn convert(self) -> DOMString {
         match self {
-            TrustedTypeOrString::TrustedHTML(trusted_html) => trusted_html.data(),
-            TrustedTypeOrString::TrustedScript(trusted_script) => trusted_script.data(),
-            TrustedTypeOrString::TrustedScriptURL(trusted_script_url) => trusted_script_url.data(),
+            TrustedTypeOrString::TrustedHTML(trusted_html) => trusted_html.data().clone(),
+            TrustedTypeOrString::TrustedScript(trusted_script) => trusted_script.data().clone(),
+            TrustedTypeOrString::TrustedScriptURL(trusted_script_url) => {
+                trusted_script_url.data().clone()
+            },
             TrustedTypeOrString::String(str_) => str_,
         }
     }
@@ -71,19 +75,20 @@ impl TrustedTypePolicyFactory {
         global: &GlobalScope,
         can_gc: CanGc,
     ) -> Fallible<DomRoot<TrustedTypePolicy>> {
-        // Step 1: Let allowedByCSP be the result of executing Should Trusted Type policy creation be blocked by
-        // Content Security Policy? algorithm with global, policyName and factory’s created policy names value.
-        let allowed_by_csp = global
-            .get_csp_list()
-            .is_trusted_type_policy_creation_allowed(
-                global,
-                policy_name.clone(),
-                self.policy_names.borrow().clone(),
-            );
+        // Avoid double borrow on policy_names
+        {
+            // Step 1: Let allowedByCSP be the result of executing Should Trusted Type policy creation be blocked by
+            // Content Security Policy? algorithm with global, policyName and factory’s created policy names value.
+            let policy_names = self.policy_names.borrow();
+            let policy_names: Vec<&str> = policy_names.iter().map(String::as_ref).collect();
+            let allowed_by_csp = global
+                .get_csp_list()
+                .is_trusted_type_policy_creation_allowed(global, &policy_name, &policy_names);
 
-        // Step 2: If allowedByCSP is "Blocked", throw a TypeError and abort further steps.
-        if !allowed_by_csp {
-            return Err(Error::Type("Not allowed by CSP".to_string()));
+            // Step 2: If allowedByCSP is "Blocked", throw a TypeError and abort further steps.
+            if !allowed_by_csp {
+                return Err(Error::Type("Not allowed by CSP".to_string()));
+            }
         }
 
         // Step 3: If policyName is default and the factory’s default policy value is not null, throw a TypeError
@@ -250,13 +255,14 @@ impl TrustedTypePolicyFactory {
         // Step 2: Let policyValue be the result of executing Get Trusted Type policy value,
         // with the following arguments:
         rooted!(in(*cx) let mut trusted_type_name_value = NullValue());
-        expected_type
-            .clone()
-            .as_ref()
-            .safe_to_jsval(cx, trusted_type_name_value.handle_mut());
+        expected_type.clone().as_ref().safe_to_jsval(
+            cx,
+            trusted_type_name_value.handle_mut(),
+            can_gc,
+        );
 
         rooted!(in(*cx) let mut sink_value = NullValue());
-        sink.safe_to_jsval(cx, sink_value.handle_mut());
+        sink.safe_to_jsval(cx, sink_value.handle_mut(), can_gc);
 
         let arguments = vec![trusted_type_name_value.handle(), sink_value.handle()];
         let policy_value = default_policy.get_trusted_type_policy_value(
@@ -316,7 +322,10 @@ impl TrustedTypePolicyFactory {
                 let is_blocked = global
                     .get_csp_list()
                     .should_sink_type_mismatch_violation_be_blocked_by_csp(
-                        global, sink, sink_group, &input,
+                        global,
+                        sink,
+                        sink_group,
+                        &input.str(),
                     );
                 // Step 6.2: If disposition is “Allowed”, return stringified input and abort further steps.
                 if !is_blocked {
@@ -336,12 +345,11 @@ impl TrustedTypePolicyFactory {
     }
 
     /// <https://www.w3.org/TR/trusted-types/#dom-trustedtypepolicyfactory-isscript>
-    #[allow(unsafe_code)]
     pub(crate) fn is_trusted_script(
         cx: JSContext,
         value: HandleValue,
     ) -> Result<DomRoot<TrustedScript>, ()> {
-        unsafe { root_from_handlevalue::<TrustedScript>(value, *cx) }
+        root_from_handlevalue::<TrustedScript>(value, cx)
     }
 }
 
@@ -356,19 +364,16 @@ impl TrustedTypePolicyFactoryMethods<crate::DomTypeHolder> for TrustedTypePolicy
         self.create_trusted_type_policy(policy_name.to_string(), options, &self.global(), can_gc)
     }
     /// <https://www.w3.org/TR/trusted-types/#dom-trustedtypepolicyfactory-ishtml>
-    #[allow(unsafe_code)]
     fn IsHTML(&self, cx: JSContext, value: HandleValue) -> bool {
-        unsafe { root_from_handlevalue::<TrustedHTML>(value, *cx).is_ok() }
+        root_from_handlevalue::<TrustedHTML>(value, cx).is_ok()
     }
     /// <https://www.w3.org/TR/trusted-types/#dom-trustedtypepolicyfactory-isscript>
-    #[allow(unsafe_code)]
     fn IsScript(&self, cx: JSContext, value: HandleValue) -> bool {
         TrustedTypePolicyFactory::is_trusted_script(cx, value).is_ok()
     }
     /// <https://www.w3.org/TR/trusted-types/#dom-trustedtypepolicyfactory-isscripturl>
-    #[allow(unsafe_code)]
     fn IsScriptURL(&self, cx: JSContext, value: HandleValue) -> bool {
-        unsafe { root_from_handlevalue::<TrustedScriptURL>(value, *cx).is_ok() }
+        root_from_handlevalue::<TrustedScriptURL>(value, cx).is_ok()
     }
     /// <https://www.w3.org/TR/trusted-types/#dom-trustedtypepolicyfactory-emptyhtml>
     fn EmptyHTML(&self, can_gc: CanGc) -> DomRoot<TrustedHTML> {

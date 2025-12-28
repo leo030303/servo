@@ -3,22 +3,30 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::path::PathBuf;
+use std::rc::Rc;
 
+use base::generic_channel::GenericSender;
 use base::id::PipelineId;
+use compositing_traits::rendering_context::RenderingContext;
 use constellation_traits::EmbedderToConstellationMessage;
+#[cfg(feature = "gamepad")]
+use embedder_traits::GamepadHapticEffectType;
 use embedder_traits::{
-    AllowOrDeny, AuthenticationResponse, ContextMenuResult, Cursor, FilterPattern, FocusId,
-    GamepadHapticEffectType, InputMethodType, KeyboardEvent, LoadStatus, MediaSessionEvent,
-    Notification, PermissionFeature, RgbColor, ScreenGeometry, SelectElementOptionOrOptgroup,
-    SimpleDialog, TraversalId, WebResourceRequest, WebResourceResponse, WebResourceResponseMsg,
+    AlertResponse, AllowOrDeny, AuthenticationResponse, ConfirmResponse, ConsoleLogLevel,
+    ContextMenuAction, ContextMenuElementInformation, ContextMenuItem, Cursor, EmbedderControlId,
+    EmbedderControlResponse, FilePickerRequest, FilterPattern, InputEventId, InputEventResult,
+    InputMethodType, LoadStatus, MediaSessionEvent, NewWebViewDetails, Notification,
+    PermissionFeature, PromptResponse, RgbColor, ScreenGeometry, SelectElementOptionOrOptgroup,
+    SimpleDialogRequest, TraversalId, WebResourceRequest, WebResourceResponse,
+    WebResourceResponseMsg,
 };
 use ipc_channel::ipc::IpcSender;
-use serde::Serialize;
 use url::Url;
 use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 
-use crate::responders::ServoErrorSender;
-use crate::{ConstellationProxy, WebView};
+use crate::proxies::ConstellationProxy;
+use crate::responders::{IpcResponder, ServoErrorSender};
+use crate::{RegisterOrUnregister, Servo, WebView, WebViewBuilder};
 
 /// A request to navigate a [`WebView`] or one of its inner frames. This can be handled
 /// asynchronously. If not handled, the request will automatically be allowed.
@@ -61,48 +69,6 @@ impl Drop for NavigationRequest {
     }
 }
 
-/// Sends a response over an IPC channel, or a default response on [`Drop`] if no response was sent.
-pub(crate) struct IpcResponder<T: Serialize> {
-    response_sender: IpcSender<T>,
-    response_sent: bool,
-    /// Always present, except when taken by [`Drop`].
-    default_response: Option<T>,
-}
-
-impl<T: Serialize> IpcResponder<T> {
-    pub(crate) fn new(response_sender: IpcSender<T>, default_response: T) -> Self {
-        Self {
-            response_sender,
-            response_sent: false,
-            default_response: Some(default_response),
-        }
-    }
-
-    pub(crate) fn send(&mut self, response: T) -> bincode::Result<()> {
-        let result = self.response_sender.send(response);
-        self.response_sent = true;
-        result
-    }
-
-    pub(crate) fn into_inner(self) -> IpcSender<T> {
-        self.response_sender.clone()
-    }
-}
-
-impl<T: Serialize> Drop for IpcResponder<T> {
-    fn drop(&mut self) {
-        if !self.response_sent {
-            let response = self
-                .default_response
-                .take()
-                .expect("Guaranteed by inherent impl");
-            // Don’t notify embedder about send errors for the default response,
-            // since they didn’t send anything and probably don’t care.
-            let _ = self.response_sender.send(response);
-        }
-    }
-}
-
 /// A permissions request for a [`WebView`] The embedder should allow or deny the request,
 /// either by reading a cached value or querying the user for permission via the user
 /// interface.
@@ -129,7 +95,7 @@ pub struct AllowOrDenyRequest(IpcResponder<AllowOrDeny>, ServoErrorSender);
 
 impl AllowOrDenyRequest {
     pub(crate) fn new(
-        response_sender: IpcSender<AllowOrDeny>,
+        response_sender: GenericSender<AllowOrDeny>,
         default_response: AllowOrDeny,
         error_sender: ServoErrorSender,
     ) -> Self {
@@ -152,6 +118,13 @@ impl AllowOrDenyRequest {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolHandlerRegistration {
+    pub scheme: String,
+    pub url: Url,
+    pub register_or_unregister: RegisterOrUnregister,
+}
+
 /// A request to authenticate a [`WebView`] navigation. Embedders may choose to prompt
 /// the user to enter credentials or simply ignore this request (in which case credentials
 /// will not be used).
@@ -166,7 +139,7 @@ impl AuthenticationRequest {
     pub(crate) fn new(
         url: Url,
         for_proxy: bool,
-        response_sender: IpcSender<Option<AuthenticationResponse>>,
+        response_sender: GenericSender<Option<AuthenticationResponse>>,
         error_sender: ServoErrorSender,
     ) -> Self {
         Self {
@@ -208,7 +181,7 @@ pub struct WebResourceLoad {
 impl WebResourceLoad {
     pub(crate) fn new(
         web_resource_request: WebResourceRequest,
-        response_sender: IpcSender<WebResourceResponseMsg>,
+        response_sender: GenericSender<WebResourceResponseMsg>,
         error_sender: ServoErrorSender,
     ) -> Self {
         Self {
@@ -244,7 +217,7 @@ impl WebResourceLoad {
 /// this interception will automatically be finished when dropped.
 pub struct InterceptedWebResourceLoad {
     pub request: WebResourceRequest,
-    pub(crate) response_sender: IpcSender<WebResourceResponseMsg>,
+    pub(crate) response_sender: GenericSender<WebResourceResponseMsg>,
     pub(crate) finished: bool,
     pub(crate) error_sender: ServoErrorSender,
 }
@@ -296,34 +269,121 @@ impl Drop for InterceptedWebResourceLoad {
 }
 
 /// The controls of an interactive form element.
-pub enum FormControl {
+pub enum EmbedderControl {
     /// The picker of a `<select>` element.
     SelectElement(SelectElement),
     /// The picker of a `<input type=color>` element.
     ColorPicker(ColorPicker),
+    /// The picker of a `<input type=file>` element.
+    FilePicker(FilePicker),
+    /// Request to present an input method (IME) interface to the user when an
+    /// editable element is focused.
+    InputMethod(InputMethodControl),
+    /// A [simple dialog](https://html.spec.whatwg.org/multipage/#simple-dialogs) initiated by
+    /// script (`alert()`, `confirm()`, or `prompt()`). Since their messages are controlled by web
+    /// content, they should be presented to the user in a way that makes them impossible to
+    /// mistake for browser UI.
+    SimpleDialog(SimpleDialog),
+    /// A context menu. This can be triggered by things like right-clicking on web content.
+    /// The menu that is actually shown the user may be customized, but custom menu entries
+    /// must be handled by the embedder.
+    ContextMenu(ContextMenu),
+}
+
+impl EmbedderControl {
+    pub fn id(&self) -> EmbedderControlId {
+        match self {
+            EmbedderControl::SelectElement(select_element) => select_element.id,
+            EmbedderControl::ColorPicker(color_picker) => color_picker.id,
+            EmbedderControl::FilePicker(file_picker) => file_picker.id,
+            EmbedderControl::InputMethod(input_method) => input_method.id,
+            EmbedderControl::SimpleDialog(simple_dialog) => simple_dialog.id(),
+            EmbedderControl::ContextMenu(context_menu) => context_menu.id,
+        }
+    }
+}
+
+/// Represents a context menu opened on web content.
+pub struct ContextMenu {
+    pub(crate) id: EmbedderControlId,
+    pub(crate) position: DeviceIntRect,
+    pub(crate) items: Vec<ContextMenuItem>,
+    pub(crate) element_info: ContextMenuElementInformation,
+    pub(crate) response_sent: bool,
+    pub(crate) constellation_proxy: ConstellationProxy,
+}
+
+impl ContextMenu {
+    /// Return the [`EmbedderControlId`] associated with this element.
+    pub fn id(&self) -> EmbedderControlId {
+        self.id
+    }
+
+    /// Return the area occupied by the element on which this context menu was triggered.
+    ///
+    /// The embedder should use this value to position the prompt that is shown to the user.
+    pub fn position(&self) -> DeviceIntRect {
+        self.position
+    }
+
+    /// A [`ContextMenuElementInformation`] giving details about the element that this [`ContextMenu`]
+    /// was activated on.
+    pub fn element_info(&self) -> &ContextMenuElementInformation {
+        &self.element_info
+    }
+
+    /// Resolve the context menu by activating the given context menu action.
+    pub fn items(&self) -> &[ContextMenuItem] {
+        &self.items
+    }
+
+    /// Resolve the context menu by activating the given context menu action.
+    pub fn select(mut self, action: ContextMenuAction) {
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                self.id,
+                EmbedderControlResponse::ContextMenu(Some(action)),
+            ));
+        self.response_sent = true;
+    }
+
+    /// Tell Servo that the context menu was dismissed with no selection.
+    pub fn dismiss(mut self) {
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                self.id,
+                EmbedderControlResponse::ContextMenu(None),
+            ));
+        self.response_sent = true;
+    }
+}
+
+impl Drop for ContextMenu {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            self.constellation_proxy
+                .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                    self.id,
+                    EmbedderControlResponse::ContextMenu(None),
+                ));
+        }
+    }
 }
 
 /// Represents a dialog triggered by clicking a `<select>` element.
 pub struct SelectElement {
+    pub(crate) id: EmbedderControlId,
     pub(crate) options: Vec<SelectElementOptionOrOptgroup>,
     pub(crate) selected_option: Option<usize>,
     pub(crate) position: DeviceIntRect,
-    pub(crate) responder: IpcResponder<Option<usize>>,
+    pub(crate) constellation_proxy: ConstellationProxy,
+    pub(crate) response_sent: bool,
 }
 
 impl SelectElement {
-    pub(crate) fn new(
-        options: Vec<SelectElementOptionOrOptgroup>,
-        selected_option: Option<usize>,
-        position: DeviceIntRect,
-        ipc_sender: IpcSender<Option<usize>>,
-    ) -> Self {
-        Self {
-            options,
-            selected_option,
-            position,
-            responder: IpcResponder::new(ipc_sender, None),
-        }
+    /// Return the [`EmbedderControlId`] associated with this element.
+    pub fn id(&self) -> EmbedderControlId {
+        self.id
     }
 
     /// Return the area occupied by the `<select>` element that triggered the prompt.
@@ -353,31 +413,40 @@ impl SelectElement {
 
     /// Resolve the prompt with the options that have been selected by calling [select] previously.
     pub fn submit(mut self) {
-        let _ = self.responder.send(self.selected_option);
+        self.response_sent = true;
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                self.id,
+                EmbedderControlResponse::SelectElement(self.selected_option()),
+            ));
+    }
+}
+
+impl Drop for SelectElement {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            self.constellation_proxy
+                .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                    self.id,
+                    EmbedderControlResponse::SelectElement(self.selected_option()),
+                ));
+        }
     }
 }
 
 /// Represents a dialog triggered by clicking a `<input type=color>` element.
 pub struct ColorPicker {
-    pub(crate) current_color: RgbColor,
+    pub(crate) id: EmbedderControlId,
+    pub(crate) current_color: Option<RgbColor>,
     pub(crate) position: DeviceIntRect,
-    pub(crate) responder: IpcResponder<Option<RgbColor>>,
-    pub(crate) error_sender: ServoErrorSender,
+    pub(crate) constellation_proxy: ConstellationProxy,
+    pub(crate) response_sent: bool,
 }
 
 impl ColorPicker {
-    pub(crate) fn new(
-        current_color: RgbColor,
-        position: DeviceIntRect,
-        ipc_sender: IpcSender<Option<RgbColor>>,
-        error_sender: ServoErrorSender,
-    ) -> Self {
-        Self {
-            current_color,
-            position,
-            responder: IpcResponder::new(ipc_sender, None),
-            error_sender,
-        }
+    /// Return the [`EmbedderControlId`] associated with this element.
+    pub fn id(&self) -> EmbedderControlId {
+        self.id
     }
 
     /// Get the area occupied by the `<input>` element that triggered the prompt.
@@ -387,15 +456,348 @@ impl ColorPicker {
         self.position
     }
 
-    /// Get the color that was selected before the prompt was opened.
-    pub fn current_color(&self) -> RgbColor {
+    /// Get the currently selected color for this [`ColorPicker`]. This is initially the selected color
+    /// before the picker is opened.
+    pub fn current_color(&self) -> Option<RgbColor> {
         self.current_color
     }
 
     pub fn select(&mut self, color: Option<RgbColor>) {
-        if let Err(error) = self.responder.send(color) {
-            self.error_sender.raise_response_send_error(error);
+        self.current_color = color;
+    }
+
+    /// Resolve the prompt with the options that have been selected by calling [select] previously.
+    pub fn submit(mut self) {
+        self.response_sent = true;
+        self.constellation_proxy
+            .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                self.id,
+                EmbedderControlResponse::ColorPicker(self.current_color),
+            ));
+    }
+}
+
+impl Drop for ColorPicker {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            self.constellation_proxy
+                .send(EmbedderToConstellationMessage::EmbedderControlResponse(
+                    self.id,
+                    EmbedderControlResponse::ColorPicker(self.current_color),
+                ));
         }
+    }
+}
+
+/// Represents a dialog triggered by clicking a `<input type=color>` element.
+pub struct FilePicker {
+    pub(crate) id: EmbedderControlId,
+    pub(crate) file_picker_request: FilePickerRequest,
+    pub(crate) response_sender: GenericSender<Option<Vec<PathBuf>>>,
+    pub(crate) response_sent: bool,
+}
+
+impl FilePicker {
+    /// Return the [`EmbedderControlId`] associated with this element.
+    pub fn id(&self) -> EmbedderControlId {
+        self.id
+    }
+
+    pub fn filter_patterns(&self) -> &[FilterPattern] {
+        &self.file_picker_request.filter_patterns
+    }
+
+    pub fn allow_select_multiple(&self) -> bool {
+        self.file_picker_request.allow_select_multiple
+    }
+
+    /// Get the currently selected files in this [`FilePicker`]. This is initially the files that
+    /// were previously selected before the picker is opened.
+    pub fn current_paths(&self) -> &[PathBuf] {
+        &self.file_picker_request.current_paths
+    }
+
+    pub fn select(&mut self, paths: &[PathBuf]) {
+        self.file_picker_request.current_paths = paths.to_owned();
+    }
+
+    /// Resolve the prompt with the options that have been selected by calling [select] previously.
+    pub fn submit(mut self) {
+        let _ = self.response_sender.send(Some(std::mem::take(
+            &mut self.file_picker_request.current_paths,
+        )));
+        self.response_sent = true;
+    }
+
+    /// Tell Servo that the file picker was dismissed with no selection.
+    pub fn dismiss(mut self) {
+        let _ = self.response_sender.send(None);
+        self.response_sent = true;
+    }
+}
+
+impl Drop for FilePicker {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            let _ = self.response_sender.send(None);
+        }
+    }
+}
+
+/// Represents a request to enable the system input method interface.
+pub struct InputMethodControl {
+    pub(crate) id: EmbedderControlId,
+    pub(crate) input_method_type: InputMethodType,
+    pub(crate) text: String,
+    pub(crate) insertion_point: Option<u32>,
+    pub(crate) position: DeviceIntRect,
+    pub(crate) multiline: bool,
+}
+
+impl InputMethodControl {
+    /// Return the type of input method that initated this request.
+    pub fn input_method_type(&self) -> InputMethodType {
+        self.input_method_type
+    }
+
+    /// Return the current string value of the input field.
+    pub fn text(&self) -> String {
+        self.text.clone()
+    }
+
+    /// The current zero-based insertion point / cursor position if it is within the field or `None`
+    /// if it is not.
+    pub fn insertion_point(&self) -> Option<u32> {
+        self.insertion_point
+    }
+
+    /// Get the area occupied by the `<input>` element that triggered the input method.
+    ///
+    /// The embedder should use this value to position the input method interface that is
+    /// shown to the user.
+    pub fn position(&self) -> DeviceIntRect {
+        self.position
+    }
+
+    /// Whether or not this field is a multiline field.
+    pub fn multiline(&self) -> bool {
+        self.multiline
+    }
+}
+
+/// [Simple dialogs](https://html.spec.whatwg.org/multipage/#simple-dialogs) are synchronous dialogs
+/// that can be opened by web content. Since their messages are controlled by web content, they
+/// should be presented to the user in a way that makes them impossible to mistake for browser UI.
+pub enum SimpleDialog {
+    Alert(AlertDialog),
+    Confirm(ConfirmDialog),
+    Prompt(PromptDialog),
+}
+
+impl SimpleDialog {
+    pub fn message(&self) -> &str {
+        match self {
+            SimpleDialog::Alert(alert_dialog) => alert_dialog.message(),
+            SimpleDialog::Confirm(confirm_dialog) => confirm_dialog.message(),
+            SimpleDialog::Prompt(prompt_dialog) => prompt_dialog.message(),
+        }
+    }
+
+    pub fn confirm(self) {
+        match self {
+            SimpleDialog::Alert(alert_dialog) => alert_dialog.confirm(),
+            SimpleDialog::Confirm(confirm_dialog) => confirm_dialog.confirm(),
+            SimpleDialog::Prompt(prompt_dialog) => prompt_dialog.confirm(),
+        }
+    }
+
+    pub fn dismiss(self) {
+        match self {
+            SimpleDialog::Alert(alert_dialog) => alert_dialog.confirm(),
+            SimpleDialog::Confirm(confirm_dialog) => confirm_dialog.dismiss(),
+            SimpleDialog::Prompt(prompt_dialog) => prompt_dialog.dismiss(),
+        }
+    }
+}
+
+impl SimpleDialog {
+    fn id(&self) -> EmbedderControlId {
+        match self {
+            SimpleDialog::Alert(alert_dialog) => alert_dialog.id,
+            SimpleDialog::Confirm(confirm_dialog) => confirm_dialog.id,
+            SimpleDialog::Prompt(prompt_dialog) => prompt_dialog.id,
+        }
+    }
+}
+
+impl From<SimpleDialogRequest> for SimpleDialog {
+    fn from(simple_dialog_request: SimpleDialogRequest) -> Self {
+        match simple_dialog_request {
+            SimpleDialogRequest::Alert {
+                id,
+                message,
+                response_sender,
+            } => Self::Alert(AlertDialog {
+                id,
+                message,
+                response_sender,
+                response_sent: false,
+            }),
+            SimpleDialogRequest::Confirm {
+                id,
+                message,
+                response_sender,
+            } => Self::Confirm(ConfirmDialog {
+                id,
+                message,
+                response_sender,
+                response_sent: false,
+            }),
+            SimpleDialogRequest::Prompt {
+                id,
+                message,
+                default,
+                response_sender,
+            } => Self::Prompt(PromptDialog {
+                id,
+                message,
+                current_value: default,
+                response_sender,
+                response_sent: false,
+            }),
+        }
+    }
+}
+
+/// [`alert()`](https://html.spec.whatwg.org/multipage/#dom-alert).
+///
+/// The confirm dialog is expected to be represented by a message and an "Ok" button.
+/// Pressing "Ok" always causes the DOM API to return `undefined`.
+pub struct AlertDialog {
+    id: EmbedderControlId,
+    message: String,
+    response_sender: GenericSender<AlertResponse>,
+    response_sent: bool,
+}
+
+impl Drop for AlertDialog {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            let _ = self.response_sender.send(AlertResponse::Ok);
+        }
+    }
+}
+
+impl AlertDialog {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// This should be called when the dialog button is pressed.
+    pub fn confirm(self) {
+        // The result will be send via the `Drop` implementation.
+    }
+}
+
+/// [`confirm()`](https://html.spec.whatwg.org/multipage/#dom-confirm).
+///
+/// The confirm dialog is expected to be represented by a message and "Ok" and "Cancel"
+/// buttons. When "Ok" is selected `true` is sent as a response to the DOM API, while
+/// "Cancel" will send `false`.
+pub struct ConfirmDialog {
+    id: EmbedderControlId,
+    message: String,
+    response_sender: GenericSender<ConfirmResponse>,
+    response_sent: bool,
+}
+
+impl ConfirmDialog {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// This should be called when the dialog "Cancel" button is pressed.
+    pub fn dismiss(mut self) {
+        let _ = self.response_sender.send(ConfirmResponse::Cancel);
+        self.response_sent = true;
+    }
+
+    /// This should be called when the dialog "Ok" button is pressed.
+    pub fn confirm(mut self) {
+        let _ = self.response_sender.send(ConfirmResponse::Ok);
+        self.response_sent = true;
+    }
+}
+
+impl Drop for ConfirmDialog {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            let _ = self.response_sender.send(ConfirmResponse::Cancel);
+        }
+    }
+}
+
+/// A [`prompt()`](https://html.spec.whatwg.org/multipage/#dom-prompt).
+///
+/// The prompt dialog is expected to be represented by a mesage, a text entry field, and
+/// an "Ok" and "Cancel" buttons. When "Ok" is selected the current prompt value is sent
+/// as the response to the DOM API. A default value may be sent with the [`PromptDialog`],
+/// which be be retrieved by calling [`Self::current_value`]. Before calling [`Self::ok`]
+/// or as the prompt field changes, the embedder is expected to call
+/// [`Self::set_current_value`].
+pub struct PromptDialog {
+    id: EmbedderControlId,
+    message: String,
+    current_value: String,
+    response_sender: GenericSender<PromptResponse>,
+    response_sent: bool,
+}
+
+impl Drop for PromptDialog {
+    fn drop(&mut self) {
+        if !self.response_sent {
+            let _ = self.response_sender.send(PromptResponse::Cancel);
+        }
+    }
+}
+
+impl PromptDialog {
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    pub fn current_value(&self) -> &str {
+        &self.current_value
+    }
+
+    pub fn set_current_value(&mut self, new_value: &str) {
+        self.current_value = new_value.to_owned()
+    }
+
+    /// This should be called when the dialog "Cancel" button is pressed.
+    pub fn dismiss(mut self) {
+        let _ = self.response_sender.send(PromptResponse::Cancel);
+        self.response_sent = true;
+    }
+
+    /// This should be called when the dialog "Ok" button is pressed, the current prompt value will
+    /// be sent to web content.
+    pub fn confirm(mut self) {
+        let _ = self
+            .response_sender
+            .send(PromptResponse::Ok(self.current_value.clone()));
+        self.response_sent = true;
+    }
+}
+
+pub struct CreateNewWebViewRequest {
+    pub(crate) servo: Servo,
+    pub(crate) responder: IpcResponder<Option<NewWebViewDetails>>,
+}
+
+impl CreateNewWebViewRequest {
+    pub fn builder(self, rendering_context: Rc<dyn RenderingContext>) -> WebViewBuilder {
+        WebViewBuilder::new_for_create_request(&self.servo, rendering_context, self.responder)
     }
 }
 
@@ -418,9 +820,6 @@ pub trait WebViewDelegate {
     /// This [`WebView`] has either become focused or lost focus. Whether or not the
     /// [`WebView`] is focused can be accessed via [`WebView::focused`].
     fn notify_focus_changed(&self, _webview: WebView, _focused: bool) {}
-    /// A focus operation that was initiated by this webview has completed.
-    /// The current focus status of this [`WebView`] can be accessed via [`WebView::focused`].
-    fn notify_focus_complete(&self, _webview: WebView, _focus_id: FocusId) {}
     /// This [`WebView`] has either started to animate or stopped animating. When a
     /// [`WebView`] is animating, it is up to the embedding application ensure that
     /// `Servo::spin_event_loop` is called at regular intervals in order to update the
@@ -435,12 +834,12 @@ pub trait WebViewDelegate {
     /// The favicon of the currently loaded page in this [`WebView`] has changed. The new
     /// favicon [`Image`] can accessed via [`WebView::favicon`].
     fn notify_favicon_changed(&self, _webview: WebView) {}
-
     /// Notify the embedder that it needs to present a new frame.
     fn notify_new_frame_ready(&self, _webview: WebView) {}
-    /// The history state has changed.
-    // changed pattern; maybe wasteful if embedder doesn’t care?
-    fn notify_history_changed(&self, _webview: WebView, _: Vec<Url>, _: usize) {}
+    /// The navigation history of this [`WebView`] has changed. The navigation history is represented
+    /// as a `Vec<Url>` and `_current` denotes the current index in the history. New navigations,
+    /// back navigation, and forward navigation modify this index.
+    fn notify_history_changed(&self, _webview: WebView, _entries: Vec<Url>, _current: usize) {}
     /// A history traversal operation is complete.
     fn notify_traversal_complete(&self, _webview: WebView, _: TraversalId) {}
     /// Page content has closed this [`WebView`] via `window.close()`. It's the embedder's
@@ -448,11 +847,10 @@ pub trait WebViewDelegate {
     /// occurs.
     fn notify_closed(&self, _webview: WebView) {}
 
-    /// A keyboard event has been sent to Servo, but remains unprocessed. This allows the
-    /// embedding application to handle key events while first letting the [`WebView`]
-    /// have an opportunity to handle it first. Apart from builtin keybindings, page
-    /// content may expose custom keybindings as well.
-    fn notify_keyboard_event(&self, _webview: WebView, _: KeyboardEvent) {}
+    /// An input event passed to this [`WebView`] via [`WebView::notify_input_event`] has been handled
+    /// by Servo. This allows post-procesing of input events, such as chaining up unhandled events
+    /// to parent UI elements.
+    fn notify_input_event_handled(&self, _webview: WebView, _: InputEventId, _: InputEventResult) {}
     /// A pipeline in the webview panicked. First string is the reason, second one is the backtrace.
     fn notify_crashed(&self, _webview: WebView, _reason: String, _backtrace: Option<String>) {}
     /// Notifies the embedder about media session events
@@ -473,14 +871,44 @@ pub trait WebViewDelegate {
     fn request_unload(&self, _webview: WebView, _unload_request: AllowOrDenyRequest) {}
     /// Move the window to a point.
     fn request_move_to(&self, _webview: WebView, _: DeviceIntPoint) {}
-    /// Try to resize the window that contains this [`WebView`] to the provided outer size.
-    fn request_resize_to(&self, _webview: WebView, _requested_outer_size: DeviceIntSize) {}
-    /// Whether or not to allow script to open a new `WebView`. If not handled by the
-    /// embedder, these requests are automatically denied.
-    fn request_open_auxiliary_webview(&self, _parent_webview: WebView) -> Option<WebView> {
-        None
+    /// Whether or not to allow a [`WebView`] to (un)register a protocol handler (e.g. `mailto:`).
+    /// Typically an embedder application will show a permissions prompt when this happens
+    /// to confirm a protocol handler is allowed. By default, requests are denied.
+    /// For more information, see the specification:
+    /// <https://html.spec.whatwg.org/multipage/#custom-handlers>
+    fn request_protocol_handler(
+        &self,
+        _webview: WebView,
+        _protocol_handler_registration: ProtocolHandlerRegistration,
+        _allow_deny_request: AllowOrDenyRequest,
+    ) {
     }
-
+    /// Try to resize the window that contains this [`WebView`] to the provided outer
+    /// size. These resize requests can come from page content. Servo will ensure that the
+    /// values are greater than zero, but it is up to the embedder to limit the maximum
+    /// size. For instance, a reasonable limitation might be that the final size is no
+    /// larger than the screen size.
+    fn request_resize_to(&self, _webview: WebView, _requested_outer_size: DeviceIntSize) {}
+    /// This method is called when web content makes a request to open a new
+    /// `WebView`, such as via the [`window.open`] DOM API. If this request is
+    /// ignored, no new `WebView` will be opened. Embedders can handle this method by
+    /// using the provided [`CreateNewWebViewRequest`] to build a new `WebView`.
+    ///
+    /// ```rust
+    /// fn request_create_new(&self, parent_webview: WebView, request: CreateNewWebViewRequest) {
+    ///     let webview = request
+    ///         .builder(self.rendering_context())
+    ///         .delegate(parent_webview.delegate())
+    ///         .build();
+    ///     self.register_webview(webview);
+    /// }
+    /// ```
+    ///
+    /// **Important:** It is important to keep a live handle to the new `WebView` in the application or
+    /// it will be immediately destroyed.
+    ///
+    /// [`window.open`]: https://developer.mozilla.org/en-US/docs/Web/API/Window/open
+    fn request_create_new(&self, _parent_webview: WebView, _: CreateNewWebViewRequest) {}
     /// Content in a [`WebView`] is requesting permission to access a feature requiring
     /// permission from the user. The embedder should allow or deny the request, either by
     /// reading a cached value or querying the user for permission via the user interface.
@@ -493,80 +921,29 @@ pub trait WebViewDelegate {
     ) {
     }
 
-    /// Show the user a [simple dialog](https://html.spec.whatwg.org/multipage/#simple-dialogs) (`alert()`, `confirm()`,
-    /// or `prompt()`). Since their messages are controlled by web content, they should be presented to the user in a
-    /// way that makes them impossible to mistake for browser UI.
-    /// TODO: This API needs to be reworked to match the new model of how responses are sent.
-    fn show_simple_dialog(&self, _webview: WebView, dialog: SimpleDialog) {
-        // Return the DOM-specified default value for when we **cannot show simple dialogs**.
-        let _ = match dialog {
-            SimpleDialog::Alert {
-                response_sender, ..
-            } => response_sender.send(Default::default()),
-            SimpleDialog::Confirm {
-                response_sender, ..
-            } => response_sender.send(Default::default()),
-            SimpleDialog::Prompt {
-                response_sender, ..
-            } => response_sender.send(Default::default()),
-        };
-    }
-
-    /// Show a context menu to the user
-    fn show_context_menu(
-        &self,
-        _webview: WebView,
-        result_sender: IpcSender<ContextMenuResult>,
-        _: Option<String>,
-        _: Vec<String>,
-    ) {
-        let _ = result_sender.send(ContextMenuResult::Ignored);
-    }
-
     /// Open dialog to select bluetooth device.
     /// TODO: This API needs to be reworked to match the new model of how responses are sent.
     fn show_bluetooth_device_dialog(
         &self,
         _webview: WebView,
         _: Vec<String>,
-        response_sender: IpcSender<Option<String>>,
+        response_sender: GenericSender<Option<String>>,
     ) {
         let _ = response_sender.send(None);
     }
-
-    /// Open file dialog to select files. Set boolean flag to true allows to select multiple files.
-    fn show_file_selection_dialog(
-        &self,
-        _webview: WebView,
-        _filter_pattern: Vec<FilterPattern>,
-        _allow_select_mutiple: bool,
-        response_sender: IpcSender<Option<Vec<PathBuf>>>,
-    ) {
-        let _ = response_sender.send(None);
-    }
-
-    /// Request to present an IME to the user when an editable element is focused.
-    /// If `type` is [`InputMethodType::Text`], then the `text` parameter specifies
-    /// the pre-existing text content and the zero-based index into the string
-    /// of the insertion point.
-    fn show_ime(
-        &self,
-        _webview: WebView,
-        _type: InputMethodType,
-        _text: Option<(String, i32)>,
-        _multiline: bool,
-        _position: DeviceIntRect,
-    ) {
-    }
-
-    /// Request to hide the IME when the editable element is blurred.
-    fn hide_ime(&self, _webview: WebView) {}
 
     /// Request that the embedder show UI elements for form controls that are not integrated
     /// into page content, such as dropdowns for `<select>` elements.
-    fn show_form_control(&self, _webview: WebView, _form_control: FormControl) {}
+    fn show_embedder_control(&self, _webview: WebView, _embedder_control: EmbedderControl) {}
+
+    /// Request that the embedder hide and ignore a previous [`EmbedderControl`] request, if it hasn’t
+    /// already responded to it.
+    ///
+    /// After this point, any further responses to that request will be ignored.
+    fn hide_embedder_control(&self, _webview: WebView, _control_id: EmbedderControlId) {}
 
     /// Request to play a haptic effect on a connected gamepad.
+    #[cfg(feature = "gamepad")]
     fn play_gamepad_haptic_effect(
         &self,
         _webview: WebView,
@@ -576,6 +953,7 @@ pub trait WebViewDelegate {
     ) {
     }
     /// Request to stop a haptic effect on a connected gamepad.
+    #[cfg(feature = "gamepad")]
     fn stop_gamepad_haptic_effect(&self, _webview: WebView, _: usize, _: IpcSender<bool>) {}
 
     /// Triggered when this [`WebView`] will load a web (HTTP/HTTPS) resource. The load may be
@@ -589,204 +967,221 @@ pub trait WebViewDelegate {
 
     /// Request to display a notification.
     fn show_notification(&self, _webview: WebView, _notification: Notification) {}
+
+    /// A console message was logged by content in this [`WebView`].
+    /// <https://developer.mozilla.org/en-US/docs/Web/API/Console_API>
+    fn show_console_message(&self, _webview: WebView, _level: ConsoleLogLevel, _message: String) {}
 }
 
 pub(crate) struct DefaultWebViewDelegate;
 impl WebViewDelegate for DefaultWebViewDelegate {}
 
-#[test]
-fn test_allow_deny_request() {
-    use ipc_channel::ipc;
+#[cfg(test)]
+mod test {
+    use super::*;
 
-    use crate::ServoErrorChannel;
+    #[test]
+    fn test_allow_deny_request() {
+        use base::generic_channel;
 
-    for default_response in [AllowOrDeny::Allow, AllowOrDeny::Deny] {
-        // Explicit allow yields allow and nothing else
+        use crate::responders::ServoErrorChannel;
+
+        for default_response in [AllowOrDeny::Allow, AllowOrDeny::Deny] {
+            // Explicit allow yields allow and nothing else
+            let errors = ServoErrorChannel::default();
+            let (sender, receiver) =
+                generic_channel::channel().expect("Failed to create IPC channel");
+            let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+            request.allow();
+            assert_eq!(receiver.try_recv().ok(), Some(AllowOrDeny::Allow));
+            assert_eq!(receiver.try_recv().ok(), None);
+            assert!(errors.try_recv().is_none());
+
+            // Explicit deny yields deny and nothing else
+            let errors = ServoErrorChannel::default();
+            let (sender, receiver) =
+                generic_channel::channel().expect("Failed to create IPC channel");
+            let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+            request.deny();
+            assert_eq!(receiver.try_recv().ok(), Some(AllowOrDeny::Deny));
+            assert_eq!(receiver.try_recv().ok(), None);
+            assert!(errors.try_recv().is_none());
+
+            // No response yields default response and nothing else
+            let errors = ServoErrorChannel::default();
+            let (sender, receiver) =
+                generic_channel::channel().expect("Failed to create IPC channel");
+            let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+            drop(request);
+            assert_eq!(receiver.try_recv().ok(), Some(default_response));
+            assert_eq!(receiver.try_recv().ok(), None);
+            assert!(errors.try_recv().is_none());
+
+            // Explicit allow when receiver disconnected yields error
+            let errors = ServoErrorChannel::default();
+            let (sender, receiver) =
+                generic_channel::channel().expect("Failed to create IPC channel");
+            let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+            drop(receiver);
+            request.allow();
+            assert!(errors.try_recv().is_some());
+
+            // Explicit deny when receiver disconnected yields error
+            let errors = ServoErrorChannel::default();
+            let (sender, receiver) =
+                generic_channel::channel().expect("Failed to create IPC channel");
+            let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+            drop(receiver);
+            request.deny();
+            assert!(errors.try_recv().is_some());
+
+            // No response when receiver disconnected yields no error
+            let errors = ServoErrorChannel::default();
+            let (sender, receiver) =
+                generic_channel::channel().expect("Failed to create IPC channel");
+            let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+            drop(receiver);
+            drop(request);
+            assert!(errors.try_recv().is_none());
+        }
+    }
+
+    #[test]
+    fn test_authentication_request() {
+        use base::generic_channel;
+
+        use crate::responders::ServoErrorChannel;
+
+        let url = Url::parse("https://example.com").expect("Guaranteed by argument");
+
+        // Explicit response yields that response and nothing else
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-        let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
-        request.allow();
-        assert_eq!(receiver.try_recv().ok(), Some(AllowOrDeny::Allow));
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
+        request.authenticate("diffie".to_owned(), "hunter2".to_owned());
+        assert_eq!(
+            receiver.try_recv().ok(),
+            Some(Some(AuthenticationResponse {
+                username: "diffie".to_owned(),
+                password: "hunter2".to_owned(),
+            }))
+        );
         assert_eq!(receiver.try_recv().ok(), None);
         assert!(errors.try_recv().is_none());
 
-        // Explicit deny yields deny and nothing else
+        // No response yields None response and nothing else
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-        let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
-        request.deny();
-        assert_eq!(receiver.try_recv().ok(), Some(AllowOrDeny::Deny));
-        assert_eq!(receiver.try_recv().ok(), None);
-        assert!(errors.try_recv().is_none());
-
-        // No response yields default response and nothing else
-        let errors = ServoErrorChannel::default();
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-        let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
         drop(request);
-        assert_eq!(receiver.try_recv().ok(), Some(default_response));
+        assert_eq!(receiver.try_recv().ok(), Some(None));
         assert_eq!(receiver.try_recv().ok(), None);
         assert!(errors.try_recv().is_none());
 
-        // Explicit allow when receiver disconnected yields error
+        // Explicit response when receiver disconnected yields error
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-        let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
         drop(receiver);
-        request.allow();
-        assert!(errors.try_recv().is_some());
-
-        // Explicit deny when receiver disconnected yields error
-        let errors = ServoErrorChannel::default();
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-        let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
-        drop(receiver);
-        request.deny();
+        request.authenticate("diffie".to_owned(), "hunter2".to_owned());
         assert!(errors.try_recv().is_some());
 
         // No response when receiver disconnected yields no error
         let errors = ServoErrorChannel::default();
-        let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-        let request = AllowOrDenyRequest::new(sender, default_response, errors.sender());
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
         drop(receiver);
         drop(request);
         assert!(errors.try_recv().is_none());
     }
-}
 
-#[test]
-fn test_authentication_request() {
-    use ipc_channel::ipc;
+    #[test]
+    fn test_web_resource_load() {
+        use base::generic_channel;
+        use http::{HeaderMap, Method, StatusCode};
 
-    use crate::ServoErrorChannel;
+        use crate::responders::ServoErrorChannel;
 
-    let url = Url::parse("https://example.com").expect("Guaranteed by argument");
-
-    // Explicit response yields that response and nothing else
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
-    request.authenticate("diffie".to_owned(), "hunter2".to_owned());
-    assert_eq!(
-        receiver.try_recv().ok(),
-        Some(Some(AuthenticationResponse {
-            username: "diffie".to_owned(),
-            password: "hunter2".to_owned(),
-        }))
-    );
-    assert_eq!(receiver.try_recv().ok(), None);
-    assert!(errors.try_recv().is_none());
-
-    // No response yields None response and nothing else
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
-    drop(request);
-    assert_eq!(receiver.try_recv().ok(), Some(None));
-    assert_eq!(receiver.try_recv().ok(), None);
-    assert!(errors.try_recv().is_none());
-
-    // Explicit response when receiver disconnected yields error
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
-    drop(receiver);
-    request.authenticate("diffie".to_owned(), "hunter2".to_owned());
-    assert!(errors.try_recv().is_some());
-
-    // No response when receiver disconnected yields no error
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = AuthenticationRequest::new(url.clone(), false, sender, errors.sender());
-    drop(receiver);
-    drop(request);
-    assert!(errors.try_recv().is_none());
-}
-
-#[test]
-fn test_web_resource_load() {
-    use http::{HeaderMap, Method, StatusCode};
-    use ipc_channel::ipc;
-
-    use crate::ServoErrorChannel;
-
-    let web_resource_request = || WebResourceRequest {
-        method: Method::GET,
-        headers: HeaderMap::default(),
-        url: Url::parse("https://example.com").expect("Guaranteed by argument"),
-        is_for_main_frame: false,
-        is_redirect: false,
-    };
-    let web_resource_response = || {
-        WebResourceResponse::new(Url::parse("https://diffie.test").expect("Guaranteed by argument"))
+        let web_resource_request = || WebResourceRequest {
+            method: Method::GET,
+            headers: HeaderMap::default(),
+            url: Url::parse("https://example.com").expect("Guaranteed by argument"),
+            is_for_main_frame: false,
+            is_redirect: false,
+        };
+        let web_resource_response = || {
+            WebResourceResponse::new(
+                Url::parse("https://diffie.test").expect("Guaranteed by argument"),
+            )
             .status_code(StatusCode::IM_A_TEAPOT)
-    };
+        };
 
-    // Explicit intercept with explicit cancel yields Start and Cancel and nothing else
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
-    request.intercept(web_resource_response()).cancel();
-    assert!(matches!(
-        receiver.try_recv(),
-        Ok(WebResourceResponseMsg::Start(_))
-    ));
-    assert!(matches!(
-        receiver.try_recv(),
-        Ok(WebResourceResponseMsg::CancelLoad)
-    ));
-    assert!(matches!(receiver.try_recv(), Err(_)));
-    assert!(errors.try_recv().is_none());
+        // Explicit intercept with explicit cancel yields Start and Cancel and nothing else
+        let errors = ServoErrorChannel::default();
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
+        request.intercept(web_resource_response()).cancel();
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WebResourceResponseMsg::Start(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WebResourceResponseMsg::CancelLoad)
+        ));
+        assert!(matches!(receiver.try_recv(), Err(_)));
+        assert!(errors.try_recv().is_none());
 
-    // Explicit intercept with no further action yields Start and FinishLoad and nothing else
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
-    drop(request.intercept(web_resource_response()));
-    assert!(matches!(
-        receiver.try_recv(),
-        Ok(WebResourceResponseMsg::Start(_))
-    ));
-    assert!(matches!(
-        receiver.try_recv(),
-        Ok(WebResourceResponseMsg::FinishLoad)
-    ));
-    assert!(matches!(receiver.try_recv(), Err(_)));
-    assert!(errors.try_recv().is_none());
+        // Explicit intercept with no further action yields Start and FinishLoad and nothing else
+        let errors = ServoErrorChannel::default();
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
+        drop(request.intercept(web_resource_response()));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WebResourceResponseMsg::Start(_))
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WebResourceResponseMsg::FinishLoad)
+        ));
+        assert!(matches!(receiver.try_recv(), Err(_)));
+        assert!(errors.try_recv().is_none());
 
-    // No response yields DoNotIntercept and nothing else
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
-    drop(request);
-    assert!(matches!(
-        receiver.try_recv(),
-        Ok(WebResourceResponseMsg::DoNotIntercept)
-    ));
-    assert!(matches!(receiver.try_recv(), Err(_)));
-    assert!(errors.try_recv().is_none());
+        // No response yields DoNotIntercept and nothing else
+        let errors = ServoErrorChannel::default();
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
+        drop(request);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(WebResourceResponseMsg::DoNotIntercept)
+        ));
+        assert!(matches!(receiver.try_recv(), Err(_)));
+        assert!(errors.try_recv().is_none());
 
-    // Explicit intercept with explicit cancel when receiver disconnected yields error
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
-    drop(receiver);
-    request.intercept(web_resource_response()).cancel();
-    assert!(errors.try_recv().is_some());
+        // Explicit intercept with explicit cancel when receiver disconnected yields error
+        let errors = ServoErrorChannel::default();
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
+        drop(receiver);
+        request.intercept(web_resource_response()).cancel();
+        assert!(errors.try_recv().is_some());
 
-    // Explicit intercept with no further action when receiver disconnected yields error
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
-    drop(receiver);
-    drop(request.intercept(web_resource_response()));
-    assert!(errors.try_recv().is_some());
+        // Explicit intercept with no further action when receiver disconnected yields error
+        let errors = ServoErrorChannel::default();
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
+        drop(receiver);
+        drop(request.intercept(web_resource_response()));
+        assert!(errors.try_recv().is_some());
 
-    // No response when receiver disconnected yields no error
-    let errors = ServoErrorChannel::default();
-    let (sender, receiver) = ipc::channel().expect("Failed to create IPC channel");
-    let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
-    drop(receiver);
-    drop(request);
-    assert!(errors.try_recv().is_none());
+        // No response when receiver disconnected yields no error
+        let errors = ServoErrorChannel::default();
+        let (sender, receiver) = generic_channel::channel().expect("Failed to create IPC channel");
+        let request = WebResourceLoad::new(web_resource_request(), sender, errors.sender());
+        drop(receiver);
+        drop(request);
+        assert!(errors.try_recv().is_none());
+    }
 }

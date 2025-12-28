@@ -9,13 +9,13 @@
 use std::time::Duration;
 use std::{fmt, mem};
 
-use base::id::PipelineId;
+use base::id::ScriptEventLoopId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 /// The equivalent of script::script_runtime::ScriptEventCategory
 pub enum ScriptHangAnnotation {
-    AttachLayout,
+    SpawnPipeline,
     ConstellationMsg,
     DatabaseAccessEvent,
     DevtoolsMsg,
@@ -23,6 +23,7 @@ pub enum ScriptHangAnnotation {
     FileRead,
     FontLoading,
     FormPlannedNavigation,
+    GeolocationEvent,
     ImageCacheMsg,
     InputEvent,
     HistoryEvent,
@@ -157,7 +158,7 @@ pub enum MonitoredComponentType {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-pub struct MonitoredComponentId(pub PipelineId, pub MonitoredComponentType);
+pub struct MonitoredComponentId(pub ScriptEventLoopId, pub MonitoredComponentType);
 
 /// A handle to register components for hang monitoring,
 /// and to receive a means to communicate with the underlying hang monitor worker.
@@ -203,7 +204,7 @@ pub trait BackgroundHangMonitorExitSignal: Send {
 }
 
 /// Messages to control the sampling profiler.
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum BackgroundHangMonitorControlMsg {
     /// Toggle the sampler, with a given sampling rate and max total sampling duration.
     ToggleSampler(Duration, Duration),

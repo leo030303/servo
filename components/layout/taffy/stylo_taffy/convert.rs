@@ -14,8 +14,10 @@ pub fn length_percentage(val: &stylo::LengthPercentage) -> taffy::LengthPercenta
     match val.unpack() {
         stylo::UnpackedLengthPercentage::Length(len) => length(len.px()),
         stylo::UnpackedLengthPercentage::Percentage(percentage) => percent(percentage.0),
-        // TODO: Support calc
-        stylo::UnpackedLengthPercentage::Calc(_) => percent(0.0),
+        stylo::UnpackedLengthPercentage::Calc(calc_ref) => {
+            let calc_ptr = calc_ref as *const stylo::CalcLengthPercentage as *const ();
+            taffy::LengthPercentage::calc(calc_ptr)
+        },
     }
 }
 
@@ -30,7 +32,7 @@ pub fn dimension(val: &stylo::Size) -> taffy::Dimension {
         stylo::Size::MinContent => taffy::Dimension::AUTO,
         stylo::Size::FitContent => taffy::Dimension::AUTO,
         stylo::Size::FitContentFunction(_) => taffy::Dimension::AUTO,
-        stylo::Size::Stretch => taffy::Dimension::AUTO,
+        stylo::Size::Stretch | stylo::Size::WebkitFillAvailable => taffy::Dimension::AUTO,
 
         // Anchor positioning will be flagged off for time being
         stylo::Size::AnchorSizeFunction(_) => unreachable!(),
@@ -49,7 +51,7 @@ pub fn max_size_dimension(val: &stylo::MaxSize) -> taffy::Dimension {
         stylo::MaxSize::MinContent => taffy::Dimension::AUTO,
         stylo::MaxSize::FitContent => taffy::Dimension::AUTO,
         stylo::MaxSize::FitContentFunction(_) => taffy::Dimension::AUTO,
-        stylo::MaxSize::Stretch => taffy::Dimension::AUTO,
+        stylo::MaxSize::Stretch | stylo::MaxSize::WebkitFillAvailable => taffy::Dimension::AUTO,
 
         // Anchor positioning will be flagged off for time being
         stylo::MaxSize::AnchorSizeFunction(_) => unreachable!(),

@@ -18,29 +18,26 @@ use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base::generic_channel::{self, GenericSender};
 use base::id::{BrowsingContextId, PipelineId, WebViewId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use devtools_traits::{
-    ChromeToDevtoolsControlMsg, ConsoleMessage, ConsoleMessageBuilder, DevtoolScriptControlMsg,
-    DevtoolsControlMsg, DevtoolsPageInfo, LogLevel, NavigationState, NetworkEvent, PageError,
-    ScriptToDevtoolsControlMsg, SourceInfo, WorkerId,
+    ChromeToDevtoolsControlMsg, ConsoleLogLevel, ConsoleMessage, ConsoleMessageBuilder,
+    DevtoolScriptControlMsg, DevtoolsControlMsg, DevtoolsPageInfo, NavigationState, NetworkEvent,
+    PageError, ScriptToDevtoolsControlMsg, SourceInfo, WorkerId,
 };
 use embedder_traits::{AllowOrDeny, EmbedderMsg, EmbedderProxy};
-use ipc_channel::ipc::{self, IpcSender};
 use log::{trace, warn};
+use rand::{RngCore, rng};
 use resource::{ResourceArrayType, ResourceAvailable};
+use rustc_hash::FxHashMap;
 use serde::Serialize;
-use servo_rand::RngCore;
 
 use crate::actor::{Actor, ActorRegistry};
 use crate::actors::browsing_context::BrowsingContextActor;
 use crate::actors::console::{ConsoleActor, Root};
-use crate::actors::device::DeviceActor;
 use crate::actors::framerate::FramerateActor;
 use crate::actors::network_event::NetworkEventActor;
-use crate::actors::performance::PerformanceActor;
-use crate::actors::preference::PreferenceActor;
-use crate::actors::process::ProcessActor;
 use crate::actors::root::RootActor;
 use crate::actors::source::SourceActor;
 use crate::actors::thread::ThreadActor;
@@ -57,12 +54,15 @@ mod actors {
     pub mod browsing_context;
     pub mod console;
     pub mod device;
+    pub mod environment;
+    pub mod frame;
     pub mod framerate;
     pub mod inspector;
     pub mod long_string;
     pub mod memory;
     pub mod network_event;
     pub mod object;
+    pub mod pause;
     pub mod performance;
     pub mod preference;
     pub mod process;
@@ -92,6 +92,11 @@ pub struct EmptyReplyMsg {
     pub from: String,
 }
 
+#[derive(Serialize)]
+pub struct ActorMsg {
+    pub actor: String,
+}
+
 /// Spin up a devtools server that listens for connections on the specified port.
 pub fn start_server(port: u16, embedder: EmbedderProxy) -> Sender<DevtoolsControlMsg> {
     let (sender, receiver) = unbounded();
@@ -115,12 +120,12 @@ pub(crate) struct StreamId(u32);
 struct DevtoolsInstance {
     actors: Arc<Mutex<ActorRegistry>>,
     id_map: Arc<Mutex<IdMap>>,
-    browsing_contexts: HashMap<BrowsingContextId, String>,
+    browsing_contexts: FxHashMap<BrowsingContextId, String>,
     receiver: Receiver<DevtoolsControlMsg>,
-    pipelines: HashMap<PipelineId, BrowsingContextId>,
-    actor_workers: HashMap<WorkerId, String>,
+    pipelines: FxHashMap<PipelineId, BrowsingContextId>,
+    actor_workers: FxHashMap<WorkerId, String>,
     actor_requests: HashMap<String, String>,
-    connections: HashMap<StreamId, TcpStream>,
+    connections: FxHashMap<StreamId, TcpStream>,
     next_resource_id: u64,
 }
 
@@ -140,7 +145,7 @@ impl DevtoolsInstance {
 
         // A token shared with the embedder to bypass permission prompt.
         let port = if bound.is_some() { Ok(port) } else { Err(()) };
-        let token = format!("{:X}", servo_rand::ServoRng::default().next_u32());
+        let token = format!("{:X}", rng().next_u32());
         embedder.send(EmbedderMsg::OnDevtoolsStarted(port, token.clone()));
 
         let listener = match bound {
@@ -152,38 +157,20 @@ impl DevtoolsInstance {
 
         // Create basic actors
         let mut registry = ActorRegistry::new();
-        let performance = PerformanceActor::new(registry.new_name("performance"));
-        let device = DeviceActor::new(registry.new_name("device"));
-        let preference = PreferenceActor::new(registry.new_name("preference"));
-        let process = ProcessActor::new(registry.new_name("process"));
-        let root = Box::new(RootActor {
-            tabs: vec![],
-            workers: vec![],
-            device: device.name(),
-            performance: performance.name(),
-            preference: preference.name(),
-            process: process.name(),
-            active_tab: None.into(),
-        });
 
-        registry.register(root);
-        registry.register(Box::new(performance));
-        registry.register(Box::new(device));
-        registry.register(Box::new(preference));
-        registry.register(Box::new(process));
-        registry.find::<RootActor>("root");
+        RootActor::register(&mut registry);
 
         let actors = registry.create_shareable();
 
         let instance = Self {
             actors,
             id_map: Arc::new(Mutex::new(IdMap::default())),
-            browsing_contexts: HashMap::new(),
-            pipelines: HashMap::new(),
+            browsing_contexts: FxHashMap::default(),
+            pipelines: FxHashMap::default(),
             receiver,
             actor_requests: HashMap::new(),
-            actor_workers: HashMap::new(),
-            connections: HashMap::new(),
+            actor_workers: FxHashMap::default(),
+            connections: FxHashMap::default(),
             next_resource_id: 1,
         };
 
@@ -255,6 +242,10 @@ impl DevtoolsInstance {
                     console_message,
                     worker_id,
                 )) => self.handle_console_message(pipeline_id, worker_id, console_message),
+                DevtoolsControlMsg::FromScript(ScriptToDevtoolsControlMsg::ClearConsole(
+                    pipeline_id,
+                    worker_id,
+                )) => self.handle_clear_console(pipeline_id, worker_id),
                 DevtoolsControlMsg::FromScript(ScriptToDevtoolsControlMsg::CreateSourceActor(
                     script_sender,
                     pipeline_id,
@@ -272,7 +263,7 @@ impl DevtoolsInstance {
                     css_error,
                 )) => {
                     let mut console_message = ConsoleMessageBuilder::new(
-                        LogLevel::Warn,
+                        ConsoleLogLevel::Warn,
                         css_error.filename,
                         css_error.line,
                         css_error.column,
@@ -336,7 +327,7 @@ impl DevtoolsInstance {
     fn handle_new_global(
         &mut self,
         ids: (BrowsingContextId, PipelineId, Option<WorkerId>, WebViewId),
-        script_sender: IpcSender<DevtoolScriptControlMsg>,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
         page_info: DevtoolsPageInfo,
     ) {
         let mut actors = self.actors.lock().unwrap();
@@ -355,7 +346,7 @@ impl DevtoolsInstance {
 
             let thread = ThreadActor::new(actors.new_name("thread"));
             let thread_name = thread.name();
-            actors.register(Box::new(thread));
+            actors.register(thread);
 
             let worker_name = actors.new_name("worker");
             let worker = WorkerActor {
@@ -372,7 +363,7 @@ impl DevtoolsInstance {
             root.workers.push(worker.name.clone());
 
             self.actor_workers.insert(id, worker_name.clone());
-            actors.register(Box::new(worker));
+            actors.register(worker);
 
             Root::DedicatedWorker(worker_name)
         } else {
@@ -392,7 +383,7 @@ impl DevtoolsInstance {
                         &mut actors,
                     );
                     let name = browsing_context_actor.name();
-                    actors.register(Box::new(browsing_context_actor));
+                    actors.register(browsing_context_actor);
                     name
                 });
 
@@ -412,7 +403,7 @@ impl DevtoolsInstance {
             root: parent_actor,
         };
 
-        actors.register(Box::new(console));
+        actors.register(console);
     }
 
     fn handle_title_changed(&self, pipeline_id: PipelineId, title: String) {
@@ -465,6 +456,19 @@ impl DevtoolsInstance {
         }
     }
 
+    fn handle_clear_console(&mut self, pipeline_id: PipelineId, worker_id: Option<WorkerId>) {
+        let console_actor_name = match self.find_console_actor(pipeline_id, worker_id) {
+            Some(name) => name,
+            None => return,
+        };
+        let actors = self.actors.lock().unwrap();
+        let console_actor = actors.find::<ConsoleActor>(&console_actor_name);
+        let id = worker_id.map_or(UniqueId::Pipeline(pipeline_id), UniqueId::Worker);
+        for stream in self.connections.values_mut() {
+            console_actor.send_clear_message(id.clone(), &actors, stream);
+        }
+    }
+
     fn find_console_actor(
         &self,
         pipeline_id: PipelineId,
@@ -496,6 +500,7 @@ impl DevtoolsInstance {
             NetworkEvent::HttpRequest(req) => req.browsing_context_id,
             NetworkEvent::HttpRequestUpdate(req) => req.browsing_context_id,
             NetworkEvent::HttpResponse(resp) => resp.browsing_context_id,
+            NetworkEvent::SecurityInfo(update) => update.browsing_context_id,
         };
 
         let Some(browsing_context_actor_name) = self.browsing_contexts.get(&browsing_context_id)
@@ -533,14 +538,14 @@ impl DevtoolsInstance {
         let actor = NetworkEventActor::new(actor_name.clone(), resource_id, watcher_name);
 
         self.actor_requests.insert(request_id, actor_name.clone());
-        actors.register(Box::new(actor));
+        actors.register(actor);
 
         actor_name
     }
 
     fn handle_create_source_actor(
         &mut self,
-        script_sender: IpcSender<DevtoolScriptControlMsg>,
+        script_sender: GenericSender<DevtoolScriptControlMsg>,
         pipeline_id: PipelineId,
         source_info: SourceInfo,
     ) {
@@ -651,7 +656,8 @@ fn allow_devtools_client(stream: &mut TcpStream, embedder: &EmbedderProxy, token
     };
 
     // No token found. Prompt user
-    let (request_sender, request_receiver) = ipc::channel().expect("Failed to create IPC channel!");
+    let (request_sender, request_receiver) =
+        generic_channel::channel().expect("Failed to create IPC channel!");
     embedder.send(EmbedderMsg::RequestDevtoolsConnection(request_sender));
     request_receiver.recv().unwrap() == AllowOrDeny::Allow
 }
@@ -659,7 +665,10 @@ fn allow_devtools_client(stream: &mut TcpStream, embedder: &EmbedderProxy, token
 /// Process the input from a single devtools client until EOF.
 fn handle_client(actors: Arc<Mutex<ActorRegistry>>, mut stream: TcpStream, stream_id: StreamId) {
     log::info!("Connection established to {}", stream.peer_addr().unwrap());
-    let msg = actors.lock().unwrap().find::<RootActor>("root").encodable();
+    let msg = {
+        let actors = actors.lock().unwrap();
+        actors.encode::<RootActor, _>("root")
+    };
     if let Err(error) = stream.write_json_packet(&msg) {
         warn!("Failed to send initial packet from root actor: {error:?}");
         return;

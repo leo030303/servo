@@ -5,6 +5,8 @@
 use app_units::Au;
 use atomic_refcell::{AtomicRef, AtomicRefCell};
 use style::properties::ComputedValues;
+use style::values::computed::CSSPixelLength;
+use style::values::computed::length_percentage::CalcLengthPercentage;
 use style::values::specified::align::AlignFlags;
 use style::values::specified::box_::DisplayInside;
 use style::{Atom, Zero};
@@ -114,6 +116,19 @@ impl taffy::LayoutPartialTree for TaffyContainerContext<'_> {
         (*self.source_child_nodes[id]).borrow_mut().taffy_layout = *layout;
     }
 
+    #[expect(unsafe_code)]
+    fn resolve_calc_value(&self, val: *const (), basis: f32) -> f32 {
+        // SAFETY:
+        // - The calc `val` here is the same pointer we return to Taffy in `convert::length_percentage`
+        //   so it is safe to cast the type back to `*const CalcLengthPercentage`
+        // - Taffy guarantees that it never retains style values beyond the scope of it's style
+        //   computation methods, so we can be sure that the pointer we have passed it is still valid.
+        // - The reference we create here has a lifetime that does not escape this function, so it does
+        //   not matter if the pointer is later destroyed.
+        let calc = unsafe { &*(val as *const CalcLengthPercentage) };
+        calc.resolve(CSSPixelLength::new(basis)).px()
+    }
+
     fn compute_child_layout(
         &mut self,
         node_id: taffy::NodeId,
@@ -128,7 +143,6 @@ impl taffy::LayoutPartialTree for TaffyContainerContext<'_> {
                 // TODO: re-evaluate sizing constraint conversions in light of recent layout changes
                 let containing_block = &self.content_box_size_override;
                 let style = independent_context.style();
-                let writing_mode = style.writing_mode;
 
                 // Adjust known_dimensions from border box to content box
                 let pbm = independent_context
@@ -160,7 +174,7 @@ impl taffy::LayoutPartialTree for TaffyContainerContext<'_> {
                 let inline_size = content_box_known_dimensions.width.unwrap_or_else(|| {
                     let constraint_space = ConstraintSpace {
                         block_size: tentative_block_size,
-                        writing_mode,
+                        style,
                         preferred_aspect_ratio,
                     };
 
@@ -506,7 +520,7 @@ impl TaffyContainer {
                         child
                             .positioning_context
                             .adjust_static_position_of_hoisted_fragments_with_offset(
-                                &box_fragment.content_rect.origin.to_vector(),
+                                &box_fragment.content_rect().origin.to_vector(),
                                 PositioningContextLength::zero(),
                             );
                         container_ctx
@@ -532,12 +546,12 @@ impl TaffyContainer {
                             )),
                             LogicalVec2 {
                                 inline: resolve_alignment(
-                                    child.style.clone_align_self().0.0,
+                                    child.style.clone_align_self().0,
                                     align_items.0,
                                 ),
                                 block: resolve_alignment(
-                                    child.style.clone_justify_self().0.0,
-                                    justify_items.computed.0,
+                                    child.style.clone_justify_self().0,
+                                    justify_items.computed.0.0,
                                 ),
                             },
                             container_ctx.style.writing_mode,

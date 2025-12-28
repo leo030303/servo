@@ -15,7 +15,7 @@ use crate::dom::bindings::error::{Error, Fallible};
 /// interface in the WebIDL, this also performs decoding.
 ///
 /// <https://encoding.spec.whatwg.org/#textdecodercommon>
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 #[derive(JSTraceable, MallocSizeOf)]
 pub(crate) struct TextDecoderCommon {
     /// <https://encoding.spec.whatwg.org/#dom-textdecoder-encoding>
@@ -39,7 +39,7 @@ pub(crate) struct TextDecoderCommon {
     io_queue: RefCell<Vec<u8>>,
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 impl TextDecoderCommon {
     pub(crate) fn new_inherited(
         encoding: &'static Encoding,
@@ -90,7 +90,7 @@ impl TextDecoderCommon {
     ///
     /// <https://encoding.spec.whatwg.org/#dom-textdecoder-decode>
     /// <https://encoding.spec.whatwg.org/#decode-and-enqueue-a-chunk>
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn decode(
         &self,
         input: Option<&ArrayBufferViewOrArrayBuffer>,

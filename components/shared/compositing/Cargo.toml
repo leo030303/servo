@@ -18,8 +18,9 @@ no-wgl = ["surfman/sm-angle-default"]
 base = { workspace = true }
 bincode = { workspace = true }
 bitflags = { workspace = true }
+canvas_traits = { workspace = true }
 crossbeam-channel = { workspace = true }
-dpi = { version = "0.1" }
+dpi = { workspace = true }
 embedder_traits = { workspace = true }
 euclid = { workspace = true }
 gleam = { workspace = true }
@@ -29,12 +30,14 @@ ipc-channel = { workspace = true }
 log = { workspace = true }
 malloc_size_of = { workspace = true }
 malloc_size_of_derive = { workspace = true }
+parking_lot = { workspace = true }
 profile_traits = { path = '../profile' }
-raw-window-handle = { version = "0.6" }
+raw-window-handle = { workspace = true }
+rustc-hash = { workspace = true }
 serde = { workspace = true }
 servo_geometry = { path = "../../geometry" }
 smallvec = { workspace = true }
-strum_macros = { workspace = true }
+strum = { workspace = true }
 stylo = { workspace = true }
 stylo_traits = { workspace = true }
 surfman = { workspace = true, features = ["sm-x11"] }

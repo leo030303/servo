@@ -22,6 +22,7 @@ extern crate stylo_atoms;
 
 mod animation_timeline;
 mod animations;
+mod script_window_proxies;
 #[macro_use]
 mod task;
 mod body;
@@ -31,10 +32,9 @@ mod devtools;
 pub(crate) mod document_loader;
 #[macro_use]
 mod dom;
-mod canvas_context;
-mod canvas_state;
+pub(crate) use dom::canvas_context;
 pub(crate) mod fetch;
-pub(crate) mod indexed_db;
+pub(crate) mod indexeddb;
 mod init;
 mod layout_image;
 
@@ -42,7 +42,6 @@ pub(crate) mod document_collection;
 pub(crate) mod iframe_collection;
 pub(crate) mod image_animation;
 pub mod layout_dom;
-#[allow(unsafe_code)]
 pub(crate) mod messaging;
 mod microtask;
 pub(crate) mod mime;
@@ -50,10 +49,11 @@ mod navigation;
 mod network_listener;
 mod realms;
 mod routed_promise;
-#[allow(dead_code)]
+#[expect(dead_code)]
 mod script_module;
+mod script_mutation_observers;
 pub(crate) mod script_runtime;
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) mod script_thread;
 pub(crate) mod security_manager;
 pub(crate) mod serviceworker_manager;
@@ -63,17 +63,16 @@ mod task_manager;
 mod task_queue;
 mod task_source;
 pub mod test;
-#[allow(dead_code)]
 pub mod textinput;
 mod timers;
 mod webdriver_handlers;
 mod window_named_properties;
+mod xpath;
 
 mod unminify;
 
 mod drag_data_store;
 mod links;
-mod xpath;
 
 pub use init::init;
 pub(crate) use script_bindings::DomTypes;

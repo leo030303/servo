@@ -8,14 +8,17 @@ use std::sync::Arc;
 use app_units::{AU_PER_PX, Au};
 use base::id::ScrollTreeNodeId;
 use clip::{Clip, ClipId};
-use compositing_traits::display_list::{CompositorDisplayListInfo, SpatialTreeNodeInfo};
+use compositing_traits::display_list::{PaintDisplayListInfo, SpatialTreeNodeInfo};
+use compositing_traits::largest_contentful_paint_candidate::{
+    LCPCandidateID, LargestContentfulPaintType,
+};
 use euclid::{Point2D, Scale, SideOffsets2D, Size2D, UnknownUnit, Vector2D};
 use fonts::GlyphStore;
 use gradient::WebRenderGradient;
 use net_traits::image_cache::Image as CachedImage;
 use range::Range as ServoRange;
 use servo_arc::Arc as ServoArc;
-use servo_config::opts::DebugOptions;
+use servo_config::opts::DiagnosticsLogging;
 use servo_geometry::MaxRect;
 use style::Zero;
 use style::color::{AbsoluteColor, ColorSpace};
@@ -35,11 +38,14 @@ use style::values::generics::NonNegative;
 use style::values::generics::rect::Rect;
 use style::values::specified::text::TextDecorationLine;
 use style_traits::{CSSPixel as StyloCSSPixel, DevicePixel as StyloDevicePixel};
-use webrender_api::units::{DeviceIntSize, DevicePixel, LayoutPixel, LayoutRect, LayoutSize};
+use webrender_api::units::{
+    DeviceIntSize, DevicePixel, LayoutPixel, LayoutRect, LayoutSideOffsets, LayoutSize,
+};
 use webrender_api::{
-    self as wr, BorderDetails, BorderRadius, BoxShadowClipMode, BuiltDisplayList, ClipChainId,
-    ClipMode, CommonItemProperties, ComplexClipRegion, NinePatchBorder, NinePatchBorderSource,
-    PrimitiveFlags, PropertyBinding, SpatialId, SpatialTreeItemKey, units,
+    self as wr, BorderDetails, BorderRadius, BorderSide, BoxShadowClipMode, BuiltDisplayList,
+    ClipChainId, ClipMode, ColorF, CommonItemProperties, ComplexClipRegion, NinePatchBorder,
+    NinePatchBorderSource, NormalBorder, PrimitiveFlags, PropertyBinding, SpatialId,
+    SpatialTreeItemKey, units,
 };
 use wr::units::LayoutVector2D;
 
@@ -62,10 +68,12 @@ mod clip;
 mod conversions;
 mod gradient;
 mod hit_test;
+mod largest_contenful_paint_candidate_collector;
 mod stacking_context;
 
 use background::BackgroundPainter;
 pub(crate) use hit_test::HitTest;
+pub(crate) use largest_contenful_paint_candidate_collector::LargestContentfulPaintCandidateCollector;
 pub(crate) use stacking_context::*;
 
 const INSERTION_POINT_LOGICAL_WIDTH: Au = Au(AU_PER_PX);
@@ -91,8 +99,8 @@ pub(crate) struct DisplayListBuilder<'a> {
     /// The [`wr::DisplayListBuilder`] for this Servo [`DisplayListBuilder`].
     pub webrender_display_list_builder: &'a mut wr::DisplayListBuilder,
 
-    /// The [`CompositorDisplayListInfo`] used to collect display list items and metadata.
-    pub compositor_info: &'a mut CompositorDisplayListInfo,
+    /// The [`PaintDisplayListInfo`] used to collect display list items and metadata.
+    pub paint_info: &'a mut PaintDisplayListInfo,
 
     /// Data about the fragments that are highlighted by the inspector, if any.
     ///
@@ -114,6 +122,9 @@ pub(crate) struct DisplayListBuilder<'a> {
 
     /// The device pixel ratio used for this `Document`'s display list.
     device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
+
+    /// The collector for calculating Largest Contentful Paint
+    lcp_candidate_collector: Option<&'a mut LargestContentfulPaintCandidateCollector>,
 }
 
 struct InspectorHighlight {
@@ -161,11 +172,12 @@ impl DisplayListBuilder<'_> {
         image_resolver: Arc<ImageResolver>,
         device_pixel_ratio: Scale<f32, StyloCSSPixel, StyloDevicePixel>,
         highlighted_dom_node: Option<OpaqueNode>,
-        debug: &DebugOptions,
+        debug: &DiagnosticsLogging,
+        lcp_candidate_collector: Option<&mut LargestContentfulPaintCandidateCollector>,
     ) -> BuiltDisplayList {
         // Build the rest of the display list which inclues all of the WebRender primitives.
-        let compositor_info = &mut stacking_context_tree.compositor_info;
-        let pipeline_id = compositor_info.pipeline_id;
+        let paint_info = &mut stacking_context_tree.paint_info;
+        let pipeline_id = paint_info.pipeline_id;
         let mut webrender_display_list_builder =
             webrender_api::DisplayListBuilder::new(pipeline_id);
         webrender_display_list_builder.begin();
@@ -174,24 +186,23 @@ impl DisplayListBuilder<'_> {
         // the display list for printing the serialized version when `finalize()` is called.
         // We need to call this before adding any display items so that they are printed
         // during `finalize()`.
-        if debug.dump_display_list {
+        if debug.display_list {
             webrender_display_list_builder.dump_serialized_display_list();
         }
 
-        #[cfg(feature = "tracing")]
-        let _span =
-            tracing::trace_span!("DisplayListBuilder::build", servo_profiling = true).entered();
+        let _span = profile_traits::trace_span!("DisplayListBuilder::build").entered();
         let mut builder = DisplayListBuilder {
-            current_scroll_node_id: compositor_info.root_reference_frame_id,
-            current_reference_frame_scroll_node_id: compositor_info.root_reference_frame_id,
+            current_scroll_node_id: paint_info.root_reference_frame_id,
+            current_reference_frame_scroll_node_id: paint_info.root_reference_frame_id,
             current_clip_id: ClipId::INVALID,
             webrender_display_list_builder: &mut webrender_display_list_builder,
-            compositor_info,
+            paint_info,
             inspector_highlight: highlighted_dom_node.map(InspectorHighlight::for_node),
             paint_body_background: true,
             clip_map: Default::default(),
             image_resolver,
             device_pixel_ratio,
+            lcp_candidate_collector,
         };
 
         builder.add_all_spatial_nodes();
@@ -200,7 +211,18 @@ impl DisplayListBuilder<'_> {
             builder.add_clip_to_display_list(clip);
         }
 
-        builder.push_hit_tests_for_scrollable_areas(&stacking_context_tree.hit_test_items);
+        // Add a single hit test that covers the entire viewport, so that WebRender knows
+        // which pipeline it hits when doing hit testing.
+        let pipeline_id = builder.paint_info.pipeline_id;
+        let viewport_size = builder.paint_info.viewport_details.size;
+        let viewport_rect = LayoutRect::from_size(viewport_size.cast_unit());
+        builder.wr().push_hit_test(
+            viewport_rect,
+            ClipChainId::INVALID,
+            SpatialId::root_reference_frame(pipeline_id),
+            PrimitiveFlags::default(),
+            (0, 0), /* tag */
+        );
 
         // Paint the canvas’ background (if any) before/under everything else
         stacking_context_tree
@@ -219,15 +241,15 @@ impl DisplayListBuilder<'_> {
     }
 
     fn pipeline_id(&mut self) -> wr::PipelineId {
-        self.compositor_info.pipeline_id
+        self.paint_info.pipeline_id
     }
 
     fn mark_is_contentful(&mut self) {
-        self.compositor_info.is_contentful = true;
+        self.paint_info.is_contentful = true;
     }
 
     fn spatial_id(&self, id: ScrollTreeNodeId) -> SpatialId {
-        self.compositor_info.scroll_tree.webrender_id(&id)
+        self.paint_info.scroll_tree.webrender_id(id)
     }
 
     fn clip_chain_id(&self, id: ClipId) -> ClipChainId {
@@ -245,7 +267,7 @@ impl DisplayListBuilder<'_> {
         // list. This is merely to ensure that the currently-unused SpatialTreeItemKey
         // produced for every SpatialTree node is unique.
         let mut spatial_tree_count = 0;
-        let mut scroll_tree = std::mem::take(&mut self.compositor_info.scroll_tree);
+        let mut scroll_tree = std::mem::take(&mut self.paint_info.scroll_tree);
         let mut mapping = Vec::with_capacity(scroll_tree.nodes.len());
 
         mapping.push(SpatialId::root_reference_frame(self.pipeline_id()));
@@ -308,40 +330,7 @@ impl DisplayListBuilder<'_> {
         }
 
         scroll_tree.update_mapping(mapping);
-        self.compositor_info.scroll_tree = scroll_tree;
-    }
-
-    fn push_hit_tests_for_scrollable_areas(
-        &mut self,
-        scroll_frame_hit_test_items: &[ScrollFrameHitTestItem],
-    ) {
-        // Add a single hit test that covers the entire viewport, so that WebRender knows
-        // which pipeline it hits when doing hit testing.
-        let pipeline_id = self.compositor_info.pipeline_id;
-        let viewport_size = self.compositor_info.viewport_details.size;
-        let viewport_rect = LayoutRect::from_size(viewport_size.cast_unit());
-        self.wr().push_hit_test(
-            viewport_rect,
-            ClipChainId::INVALID,
-            SpatialId::root_reference_frame(pipeline_id),
-            PrimitiveFlags::default(),
-            (0, 0), /* tag */
-        );
-
-        for item in scroll_frame_hit_test_items {
-            let spatial_id = self
-                .compositor_info
-                .scroll_tree
-                .webrender_id(&item.scroll_node_id);
-            let clip_chain_id = self.clip_chain_id(item.clip_id);
-            self.wr().push_hit_test(
-                item.rect,
-                clip_chain_id,
-                spatial_id,
-                PrimitiveFlags::default(),
-                (item.external_scroll_id.0, 0), /* tag */
-            );
-        }
+        self.paint_info.scroll_tree = scroll_tree;
     }
 
     /// Add the given [`Clip`] to the WebRender display list and create a mapping from
@@ -493,7 +482,7 @@ impl DisplayListBuilder<'_> {
                     // We paint each highlighted area as if it was a border for simplicity
                     let border_style = wr::BorderSide {
                         color,
-                        style: webrender_api::BorderStyle::Solid,
+                        style: wr::BorderStyle::Solid,
                     };
 
                     let details = wr::BorderDetails::Normal(wr::NormalBorder {
@@ -532,6 +521,29 @@ impl DisplayListBuilder<'_> {
             );
         }
     }
+
+    #[inline]
+    fn collect_lcp_candidate(
+        &mut self,
+        lcp_type: LargestContentfulPaintType,
+        lcp_candidate_id: LCPCandidateID,
+        clip_rect: LayoutRect,
+        bounds: LayoutRect,
+    ) {
+        if let Some(lcp_collector) = &mut self.lcp_candidate_collector {
+            let transform = self
+                .paint_info
+                .scroll_tree
+                .cumulative_node_to_root_transform(self.current_scroll_node_id);
+            lcp_collector.add_or_update_candidate(
+                lcp_type,
+                lcp_candidate_id,
+                clip_rect,
+                bounds,
+                transform,
+            );
+        }
+    }
 }
 
 impl InspectorHighlight {
@@ -558,17 +570,12 @@ impl InspectorHighlight {
             );
         }
 
-        let fragment_relative_rect = match fragment {
-            Fragment::Box(fragment) | Fragment::Float(fragment) => {
-                state.maybe_box_fragment = Some(fragment.clone());
-
-                fragment.borrow().content_rect
-            },
-            Fragment::Positioning(fragment) => fragment.borrow().rect,
-            Fragment::Text(fragment) => fragment.borrow().rect,
-            Fragment::Image(image_fragment) => image_fragment.borrow().rect,
-            Fragment::AbsoluteOrFixedPositioned(_) => return,
-            Fragment::IFrame(iframe_fragment) => iframe_fragment.borrow().rect,
+        let Some(fragment_relative_rect) = fragment.base().map(|base| base.rect) else {
+            return;
+        };
+        state.maybe_box_fragment = match fragment {
+            Fragment::Box(fragment) | Fragment::Float(fragment) => Some(fragment.clone()),
+            _ => None,
         };
 
         state.content_box = state
@@ -583,6 +590,7 @@ impl Fragment {
         builder: &mut DisplayListBuilder,
         containing_block: &PhysicalRect<Au>,
         section: StackingContextSection,
+        is_hit_test_for_scrollable_overflow: bool,
         is_collapsed_table_borders: bool,
         text_decorations: &Arc<Vec<FragmentTextDecoration>>,
     ) {
@@ -602,10 +610,11 @@ impl Fragment {
         match self {
             Fragment::Box(box_fragment) | Fragment::Float(box_fragment) => {
                 let box_fragment = &*box_fragment.borrow();
-                match box_fragment.style.get_inherited_box().visibility {
+                match box_fragment.style().get_inherited_box().visibility {
                     Visibility::Visible => BuilderForBoxFragment::new(
                         box_fragment,
                         containing_block,
+                        is_hit_test_for_scrollable_overflow,
                         is_collapsed_table_borders,
                     )
                     .build(builder, section),
@@ -616,16 +625,15 @@ impl Fragment {
             Fragment::AbsoluteOrFixedPositioned(_) | Fragment::Positioning(_) => {},
             Fragment::Image(image) => {
                 let image = image.borrow();
-                match image.style.get_inherited_box().visibility {
+                let style = image.base.style();
+                match style.get_inherited_box().visibility {
                     Visibility::Visible => {
                         builder.mark_is_contentful();
 
-                        let image_rendering = image
-                            .style
-                            .get_inherited_box()
-                            .image_rendering
-                            .to_webrender();
+                        let image_rendering =
+                            style.get_inherited_box().image_rendering.to_webrender();
                         let rect = image
+                            .base
                             .rect
                             .translate(containing_block.origin.to_vector())
                             .to_webrender();
@@ -633,7 +641,7 @@ impl Fragment {
                             .clip
                             .translate(containing_block.origin.to_vector())
                             .to_webrender();
-                        let common = builder.common_properties(clip, &image.style);
+                        let common = builder.common_properties(clip, &style);
 
                         if let Some(image_key) = image.image_key {
                             builder.wr().push_image(
@@ -645,6 +653,26 @@ impl Fragment {
                                 wr::ColorF::WHITE,
                             );
                         }
+
+                        if image.showing_broken_image_icon {
+                            self.build_display_list_for_broken_image_border(
+                                builder,
+                                containing_block,
+                                &common,
+                            );
+                        }
+
+                        let lcp_candidate_id = image
+                            .base
+                            .tag
+                            .map(|tag| LCPCandidateID(tag.node.id()))
+                            .unwrap_or(LCPCandidateID(0));
+                        builder.collect_lcp_candidate(
+                            LargestContentfulPaintType::Image,
+                            lcp_candidate_id,
+                            common.clip_rect,
+                            rect,
+                        );
                     },
                     Visibility::Hidden => (),
                     Visibility::Collapse => (),
@@ -652,12 +680,16 @@ impl Fragment {
             },
             Fragment::IFrame(iframe) => {
                 let iframe = iframe.borrow();
-                match iframe.style.get_inherited_box().visibility {
+                let style = iframe.base.style();
+                match style.get_inherited_box().visibility {
                     Visibility::Visible => {
                         builder.mark_is_contentful();
-                        let rect = iframe.rect.translate(containing_block.origin.to_vector());
+                        let rect = iframe
+                            .base
+                            .rect
+                            .translate(containing_block.origin.to_vector());
 
-                        let common = builder.common_properties(rect.to_webrender(), &iframe.style);
+                        let common = builder.common_properties(rect.to_webrender(), &style);
                         builder.wr().push_iframe(
                             rect.to_webrender(),
                             common.clip_rect,
@@ -675,13 +707,7 @@ impl Fragment {
             },
             Fragment::Text(text) => {
                 let text = &*text.borrow();
-                match text
-                    .inline_styles
-                    .style
-                    .borrow()
-                    .get_inherited_box()
-                    .visibility
-                {
+                match text.base.style().get_inherited_box().visibility {
                     Visibility::Visible => self.build_display_list_for_text_fragment(
                         text,
                         builder,
@@ -707,7 +733,10 @@ impl Fragment {
 
         builder.mark_is_contentful();
 
-        let rect = fragment.rect.translate(containing_block.origin.to_vector());
+        let rect = fragment
+            .base
+            .rect
+            .translate(containing_block.origin.to_vector());
         let mut baseline_origin = rect.origin;
         baseline_origin.y += fragment.font_metrics.ascent;
         let include_whitespace =
@@ -723,7 +752,7 @@ impl Fragment {
             return;
         }
 
-        let parent_style = fragment.inline_styles.style.borrow();
+        let parent_style = fragment.base.style();
         let color = parent_style.clone_color();
         let font_metrics = &fragment.font_metrics;
         let dppx = builder.device_pixel_ratio.get();
@@ -803,8 +832,7 @@ impl Fragment {
                     Point2D::new(end.x.to_f32_px(), containing_block.max_y().to_f32_px()),
                 );
                 if let Some(selection_color) = fragment
-                    .inline_styles
-                    .selected
+                    .selected_style
                     .borrow()
                     .clone_background_color()
                     .as_absolute()
@@ -924,6 +952,31 @@ impl Fragment {
             );
         }
     }
+
+    fn build_display_list_for_broken_image_border(
+        &self,
+        builder: &mut DisplayListBuilder,
+        containing_block: &PhysicalRect<Au>,
+        common: &CommonItemProperties,
+    ) {
+        let border_side = BorderSide {
+            color: ColorF::BLACK,
+            style: wr::BorderStyle::Inset,
+        };
+        builder.wr().push_border(
+            common,
+            containing_block.to_webrender(),
+            LayoutSideOffsets::new_all_same(1.0),
+            BorderDetails::Normal(NormalBorder {
+                left: border_side,
+                right: border_side,
+                top: border_side,
+                bottom: border_side,
+                radius: BorderRadius::zero(),
+                do_aa: true,
+            }),
+        );
+    }
 }
 
 struct BuilderForBoxFragment<'a> {
@@ -937,6 +990,7 @@ struct BuilderForBoxFragment<'a> {
     border_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     padding_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
     content_edge_clip_chain_id: RefCell<Option<ClipChainId>>,
+    is_hit_test_for_scrollable_overflow: bool,
     is_collapsed_table_borders: bool,
 }
 
@@ -944,6 +998,7 @@ impl<'a> BuilderForBoxFragment<'a> {
     fn new(
         fragment: &'a BoxFragment,
         containing_block: &'a PhysicalRect<Au>,
+        is_hit_test_for_scrollable_overflow: bool,
         is_collapsed_table_borders: bool,
     ) -> Self {
         let border_rect = fragment
@@ -960,6 +1015,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             border_edge_clip_chain_id: RefCell::new(None),
             padding_edge_clip_chain_id: RefCell::new(None),
             content_edge_clip_chain_id: RefCell::new(None),
+            is_hit_test_for_scrollable_overflow,
             is_collapsed_table_borders,
         }
     }
@@ -967,7 +1023,7 @@ impl<'a> BuilderForBoxFragment<'a> {
     fn content_rect(&self) -> &units::LayoutRect {
         self.content_rect.get_or_init(|| {
             self.fragment
-                .content_rect
+                .content_rect()
                 .translate(self.containing_block.origin.to_vector())
                 .to_webrender()
         })
@@ -1042,6 +1098,13 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 
     fn build(&mut self, builder: &mut DisplayListBuilder, section: StackingContextSection) {
+        if self.is_hit_test_for_scrollable_overflow &&
+            self.fragment.style().get_inherited_ui().pointer_events !=
+                style::computed_values::pointer_events::T::None
+        {
+            self.build_hit_test(builder, self.fragment.scrollable_overflow().to_webrender());
+            return;
+        }
         if self.is_collapsed_table_borders {
             self.build_collapsed_table_borders(builder);
             return;
@@ -1064,6 +1127,24 @@ impl<'a> BuilderForBoxFragment<'a> {
         self.build_background(builder);
         self.build_box_shadow(builder);
         self.build_border(builder);
+    }
+
+    fn build_hit_test(&self, builder: &mut DisplayListBuilder, rect: LayoutRect) {
+        let external_scroll_node_id = builder
+            .paint_info
+            .external_scroll_id_for_scroll_tree_node(builder.current_scroll_node_id);
+
+        let mut common = builder.common_properties(rect, &self.fragment.style());
+        if let Some(clip_chain_id) = self.border_edge_clip(builder, false) {
+            common.clip_chain_id = clip_chain_id;
+        }
+        builder.wr().push_hit_test(
+            common.clip_rect,
+            common.clip_chain_id,
+            common.spatial_id,
+            common.flags,
+            (external_scroll_node_id.0, 0), /* tag */
+        );
     }
 
     fn build_background_for_painter(
@@ -1128,7 +1209,7 @@ impl<'a> BuilderForBoxFragment<'a> {
         }
 
         let painter = BackgroundPainter {
-            style: &self.fragment.style,
+            style: &self.fragment.style(),
             painting_area_override: None,
             positioning_area_override: None,
         };
@@ -1241,6 +1322,19 @@ impl<'a> BuilderForBoxFragment<'a> {
                                 wr::ColorF::WHITE,
                             )
                         }
+
+                        let lcp_candidate_id = self
+                            .fragment
+                            .base
+                            .tag
+                            .map(|tag| LCPCandidateID(tag.node.id()))
+                            .unwrap_or(LCPCandidateID(0));
+                        builder.collect_lcp_candidate(
+                            LargestContentfulPaintType::BackgroundImage,
+                            lcp_candidate_id,
+                            layer.common.clip_rect,
+                            layer.bounds,
+                        );
                     }
                 },
             }
@@ -1272,7 +1366,7 @@ impl<'a> BuilderForBoxFragment<'a> {
             return;
         };
         let mut common =
-            builder.common_properties(units::LayoutRect::default(), &self.fragment.style);
+            builder.common_properties(units::LayoutRect::default(), &self.fragment.style());
         let radius = wr::BorderRadius::default();
         let mut column_sum = Au::zero();
         for (x, column_size) in table_info.track_sizes.x.iter().enumerate() {
@@ -1313,7 +1407,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                     *row_size - top_adjustment + border_widths.bottom / 2,
                 );
                 let border_rect = PhysicalRect::new(origin, size)
-                    .translate(self.fragment.content_rect.origin.to_vector())
+                    .translate(self.fragment.content_rect().origin.to_vector())
                     .translate(self.containing_block.origin.to_vector())
                     .to_webrender();
                 common.clip_rect = border_rect;
@@ -1336,7 +1430,8 @@ impl<'a> BuilderForBoxFragment<'a> {
             return;
         }
 
-        let border = self.fragment.style.get_border();
+        let style = self.fragment.style();
+        let border = style.get_border();
         let border_widths = self.fragment.border.to_webrender();
 
         if border_widths == SideOffsets2D::zero() {
@@ -1344,12 +1439,12 @@ impl<'a> BuilderForBoxFragment<'a> {
         }
 
         // `border-image` replaces an element's border entirely.
-        let common = builder.common_properties(self.border_rect, &self.fragment.style);
+        let common = builder.common_properties(self.border_rect, &style);
         if self.build_border_image(builder, &common, border, border_widths) {
             return;
         }
 
-        let current_color = self.fragment.style.get_inherited_text().clone_color();
+        let current_color = style.get_inherited_text().clone_color();
         let style_color = BorderStyleColor::from_border(border, &current_color);
         let details = wr::BorderDetails::Normal(wr::NormalBorder {
             top: self.build_border_side(style_color.top),
@@ -1372,7 +1467,8 @@ impl<'a> BuilderForBoxFragment<'a> {
         border: &Border,
         border_widths: SideOffsets2D<f32, LayoutPixel>,
     ) -> bool {
-        let border_style_struct = self.fragment.style.get_border();
+        let style = self.fragment.style();
+        let border_style_struct = style.get_border();
         let border_image_outset =
             resolve_border_image_outset(border_style_struct.border_image_outset, border_widths);
         let border_image_area = self.border_rect.to_rect().outer_rect(border_image_outset);
@@ -1406,11 +1502,11 @@ impl<'a> BuilderForBoxFragment<'a> {
 
                 width = size.width;
                 height = size.height;
-                let image_rendering = self.fragment.style.clone_image_rendering().to_webrender();
+                let image_rendering = style.clone_image_rendering().to_webrender();
                 NinePatchBorderSource::Image(key, image_rendering)
             },
             Ok(ResolvedImage::Gradient(gradient)) => {
-                match gradient::build(&self.fragment.style, gradient, border_image_size, builder) {
+                match gradient::build(&style, gradient, border_image_size, builder) {
                     WebRenderGradient::Linear(gradient) => {
                         NinePatchBorderSource::Gradient(gradient)
                     },
@@ -1452,7 +1548,7 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 
     fn build_outline(&mut self, builder: &mut DisplayListBuilder) {
-        let style = &self.fragment.style;
+        let style = self.fragment.style();
         let outline = style.get_outline();
         let width = outline.outline_width.to_f32_px();
         if width == 0.0 {
@@ -1466,12 +1562,12 @@ impl<'a> BuilderForBoxFragment<'a> {
         // > negative values. User agents should apply this constraint independently in
         // > each dimension. If the outline is drawn as multiple disconnected shapes, this
         // > constraint applies to each shape separately.
-        let offset = outline.outline_offset.px() + width;
+        let offset = outline.outline_offset.to_f32_px() + width;
         let outline_rect = self.border_rect.inflate(
             offset.max(-self.border_rect.width() / 2.0 + width),
             offset.max(-self.border_rect.height() / 2.0 + width),
         );
-        let common = builder.common_properties(outline_rect, &self.fragment.style);
+        let common = builder.common_properties(outline_rect, &style);
         let widths = SideOffsets2D::new_all_same(width);
         let border_style = match outline.outline_style {
             // TODO: treating 'auto' as 'solid' is allowed by the spec,
@@ -1497,13 +1593,14 @@ impl<'a> BuilderForBoxFragment<'a> {
     }
 
     fn build_box_shadow(&self, builder: &mut DisplayListBuilder<'_>) {
-        let box_shadows = &self.fragment.style.get_effects().box_shadow.0;
+        let style = self.fragment.style();
+        let box_shadows = &style.get_effects().box_shadow.0;
         if box_shadows.is_empty() {
             return;
         }
 
         // NB: According to CSS-BACKGROUNDS, box shadows render in *reverse* order (front to back).
-        let common = builder.common_properties(MaxRect::max_rect(), &self.fragment.style);
+        let common = builder.common_properties(MaxRect::max_rect(), &style);
         for box_shadow in box_shadows.iter().rev() {
             let (rect, clip_mode) = if box_shadow.inset {
                 (*self.padding_rect(), BoxShadowClipMode::Inset)
@@ -1518,7 +1615,7 @@ impl<'a> BuilderForBoxFragment<'a> {
                     box_shadow.base.horizontal.px(),
                     box_shadow.base.vertical.px(),
                 ),
-                rgba(self.fragment.style.resolve_color(&box_shadow.base.color)),
+                rgba(style.resolve_color(&box_shadow.base.color)),
                 box_shadow.base.blur.px(),
                 box_shadow.spread.px(),
                 self.border_radius,
@@ -1593,20 +1690,20 @@ fn glyphs_advance_by_index(
 /// Radii for the padding edge or content edge
 fn inner_radii(mut radii: wr::BorderRadius, insets: units::LayoutSideOffsets) -> wr::BorderRadius {
     assert!(insets.left >= 0.0, "left inset must not be negative");
-    radii.top_left.width -= insets.left;
-    radii.bottom_left.width -= insets.left;
+    radii.top_left.width = (radii.top_left.width - insets.left).max(0.0);
+    radii.bottom_left.width = (radii.bottom_left.width - insets.left).max(0.0);
 
     assert!(insets.right >= 0.0, "left inset must not be negative");
-    radii.top_right.width -= insets.right;
-    radii.bottom_right.width -= insets.right;
+    radii.top_right.width = (radii.top_right.width - insets.right).max(0.0);
+    radii.bottom_right.width = (radii.bottom_right.width - insets.right).max(0.0);
 
     assert!(insets.top >= 0.0, "top inset must not be negative");
-    radii.top_left.height -= insets.top;
-    radii.top_right.height -= insets.top;
+    radii.top_left.height = (radii.top_left.height - insets.top).max(0.0);
+    radii.top_right.height = (radii.top_right.height - insets.top).max(0.0);
 
     assert!(insets.bottom >= 0.0, "bottom inset must not be negative");
-    radii.bottom_left.height -= insets.bottom;
-    radii.bottom_right.height -= insets.bottom;
+    radii.bottom_left.height = (radii.bottom_left.height - insets.bottom).max(0.0);
+    radii.bottom_right.height = (radii.bottom_right.height - insets.bottom).max(0.0);
     radii
 }
 
@@ -1736,7 +1833,8 @@ pub(super) fn compute_margin_box_radius(
     layout_rect: LayoutSize,
     fragment: &BoxFragment,
 ) -> wr::BorderRadius {
-    let margin = fragment.style.physical_margin();
+    let style = fragment.style();
+    let margin = style.physical_margin();
     let adjust_radius = |radius: f32, margin: f32| -> f32 {
         if margin <= 0. || (radius / margin) >= 1. {
             (radius + margin).max(0.)
@@ -1788,7 +1886,8 @@ pub(super) fn compute_margin_box_radius(
 
 impl BoxFragment {
     fn border_radius(&self) -> BorderRadius {
-        let border = self.style.get_border();
+        let style = self.style();
+        let border = style.get_border();
         if border.border_top_left_radius.0.is_zero() &&
             border.border_top_right_radius.0.is_zero() &&
             border.border_bottom_right_radius.0.is_zero() &&

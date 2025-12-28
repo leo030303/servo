@@ -2,30 +2,35 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use egui::Modal;
+use egui::{
+    Area, Button, CornerRadius, Frame, Id, Modal, Order, RichText, Sense, Stroke, Vec2, pos2,
+};
 use egui_file_dialog::{DialogState, FileDialog as EguiFileDialog};
 use euclid::Length;
 use log::warn;
-use servo::ipc_channel::ipc::IpcSender;
-use servo::servo_geometry::DeviceIndependentPixel;
 use servo::{
-    AlertResponse, AuthenticationRequest, ColorPicker, ConfirmResponse, FilterPattern,
-    PermissionRequest, PromptResponse, RgbColor, SelectElement, SelectElementOption,
-    SelectElementOptionOrOptgroup, SimpleDialog, WebDriverUserPrompt,
+    AlertDialog, AuthenticationRequest, ColorPicker, ConfirmDialog, ContextMenu, ContextMenuItem,
+    DeviceIndependentPixel, EmbedderControlId, FilePicker, GenericSender, PermissionRequest,
+    PromptDialog, RgbColor, SelectElement, SelectElementOption, SelectElementOptionOrOptgroup,
+    SimpleDialog,
 };
+
+/// The minimum width of many UI elements including dialog boxes and menus,
+/// for the sake of consistency.
+const MINIMUM_UI_ELEMENT_WIDTH: f32 = 150.0;
 
 #[allow(clippy::large_enum_variant)]
 pub enum Dialog {
     File {
         dialog: EguiFileDialog,
-        multiple: bool,
-        response_sender: IpcSender<Option<Vec<PathBuf>>>,
+        maybe_picker: Option<FilePicker>,
     },
-    #[allow(clippy::enum_variant_names, reason = "spec terminology")]
-    SimpleDialog(SimpleDialog),
+    Alert(Option<AlertDialog>),
+    Confirm(Option<ConfirmDialog>),
+    Prompt(Option<PromptDialog>),
     Authentication {
         username: String,
         password: String,
@@ -38,7 +43,7 @@ pub enum Dialog {
     SelectDevice {
         devices: Vec<String>,
         selected_device_index: usize,
-        response_sender: IpcSender<Option<String>>,
+        response_sender: GenericSender<Option<String>>,
     },
     SelectElement {
         maybe_prompt: Option<SelectElement>,
@@ -49,16 +54,17 @@ pub enum Dialog {
         maybe_prompt: Option<ColorPicker>,
         toolbar_offset: Length<f32, DeviceIndependentPixel>,
     },
+    ContextMenu {
+        menu: Option<ContextMenu>,
+        toolbar_offset: Length<f32, DeviceIndependentPixel>,
+    },
 }
 
 impl Dialog {
-    pub fn new_file_dialog(
-        multiple: bool,
-        response_sender: IpcSender<Option<Vec<PathBuf>>>,
-        patterns: Vec<FilterPattern>,
-    ) -> Self {
+    pub fn new_file_dialog(file_picker: FilePicker) -> Self {
         let mut dialog = EguiFileDialog::new();
-        if !patterns.is_empty() {
+        if !file_picker.filter_patterns().is_empty() {
+            let filter_patterns = file_picker.filter_patterns().to_owned();
             dialog = dialog
                 .add_file_filter(
                     "All Supported Types",
@@ -67,7 +73,7 @@ impl Dialog {
                             .and_then(|e| e.to_str())
                             .is_some_and(|ext| {
                                 let ext = ext.to_lowercase();
-                                patterns.iter().any(|pattern| ext == pattern.0)
+                                filter_patterns.iter().any(|pattern| ext == pattern.0)
                             })
                     }),
                 )
@@ -76,13 +82,16 @@ impl Dialog {
 
         Dialog::File {
             dialog,
-            multiple,
-            response_sender,
+            maybe_picker: Some(file_picker),
         }
     }
 
     pub fn new_simple_dialog(dialog: SimpleDialog) -> Self {
-        Self::SimpleDialog(dialog)
+        match dialog {
+            SimpleDialog::Alert(alert_dialog) => Self::Alert(Some(alert_dialog)),
+            SimpleDialog::Confirm(confirm_dialog) => Self::Confirm(Some(confirm_dialog)),
+            SimpleDialog::Prompt(prompt_dialog) => Self::Prompt(Some(prompt_dialog)),
+        }
     }
 
     pub fn new_authentication_dialog(authentication_request: AuthenticationRequest) -> Self {
@@ -106,7 +115,7 @@ impl Dialog {
 
     pub fn new_device_selection_dialog(
         devices: Vec<String>,
-        response_sender: IpcSender<Option<String>>,
+        response_sender: GenericSender<Option<String>>,
     ) -> Self {
         Dialog::SelectDevice {
             devices,
@@ -129,11 +138,10 @@ impl Dialog {
         prompt: ColorPicker,
         toolbar_offset: Length<f32, DeviceIndependentPixel>,
     ) -> Self {
-        let current_color = egui::Color32::from_rgb(
-            prompt.current_color().red,
-            prompt.current_color().green,
-            prompt.current_color().blue,
-        );
+        let current_color = prompt
+            .current_color()
+            .map(|color| egui::Color32::from_rgb(color.red, color.green, color.blue))
+            .unwrap_or_default();
         Dialog::ColorPicker {
             current_color,
             maybe_prompt: Some(prompt),
@@ -141,87 +149,70 @@ impl Dialog {
         }
     }
 
-    pub fn accept(&self) {
-        #[allow(clippy::single_match)]
-        match self {
-            Dialog::SimpleDialog(dialog) => {
-                dialog.accept();
-            },
-            _ => {},
-        }
-    }
-
-    pub fn dismiss(&self) {
-        #[allow(clippy::single_match)]
-        match self {
-            Dialog::SimpleDialog(dialog) => {
-                dialog.dismiss();
-            },
-            _ => {},
-        }
-    }
-
-    pub fn message(&self) -> Option<String> {
-        #[allow(clippy::single_match)]
-        match self {
-            Dialog::SimpleDialog(dialog) => Some(dialog.message().to_string()),
-            _ => None,
-        }
-    }
-
-    pub fn set_message(&mut self, text: String) {
-        if let Dialog::SimpleDialog(dialog) = self {
-            dialog.set_message(text);
-        }
-    }
-
+    /// Returns false if the dialog has been closed, or true otherwise.
     pub fn update(&mut self, ctx: &egui::Context) -> bool {
+        enum DialogAction {
+            Dismiss,
+            Submit,
+            Continue,
+        }
+
         match self {
             Dialog::File {
                 dialog,
-                multiple,
-                response_sender,
+                maybe_picker,
             } => {
-                if dialog.state() == DialogState::Closed {
-                    if *multiple {
-                        dialog.pick_multiple();
-                    } else {
-                        dialog.pick_file();
-                    }
-                }
+                let action = maybe_picker
+                    .as_mut()
+                    .map(|picker| {
+                        if *dialog.state() == DialogState::Closed {
+                            if picker.allow_select_multiple() {
+                                dialog.pick_multiple();
+                            } else {
+                                dialog.pick_file();
+                            }
+                        }
 
-                let state = dialog.update(ctx).state();
-                match state {
-                    DialogState::Open => true,
-                    DialogState::Picked(path) => {
-                        if let Err(e) = response_sender.send(Some(vec![path])) {
-                            warn!("Failed to send file selection response: {}", e);
+                        let state = dialog.update(ctx).state();
+                        match state {
+                            DialogState::Open => DialogAction::Continue,
+                            DialogState::Picked(path) => {
+                                let paths = std::slice::from_ref(path);
+                                picker.select(paths);
+                                DialogAction::Submit
+                            },
+                            DialogState::PickedMultiple(paths) => {
+                                picker.select(paths);
+                                DialogAction::Submit
+                            },
+                            DialogState::Cancelled | DialogState::Closed => DialogAction::Dismiss,
                         }
-                        false
-                    },
-                    DialogState::PickedMultiple(paths) => {
-                        if let Err(e) = response_sender.send(Some(paths)) {
-                            warn!("Failed to send file selection response: {}", e);
+                    })
+                    .unwrap_or(DialogAction::Dismiss);
+
+                match action {
+                    DialogAction::Dismiss => {
+                        if let Some(picker) = maybe_picker.take() {
+                            picker.dismiss();
                         }
-                        false
                     },
-                    DialogState::Cancelled => {
-                        if let Err(e) = response_sender.send(None) {
-                            warn!("Failed to send cancellation response: {}", e);
+                    DialogAction::Submit => {
+                        if let Some(picker) = maybe_picker.take() {
+                            picker.submit();
                         }
-                        false
                     },
-                    DialogState::Closed => false,
+                    DialogAction::Continue => {},
                 }
+                matches!(action, DialogAction::Continue)
             },
-            Dialog::SimpleDialog(SimpleDialog::Alert {
-                message,
-                response_sender,
-            }) => {
+            Dialog::Alert(maybe_alert_dialog) => {
+                let Some(alert_dialog) = maybe_alert_dialog else {
+                    return false;
+                };
+
                 let mut is_open = true;
-                let modal = Modal::new("Alert".into());
-                modal.show(ctx, |ui| {
-                    make_dialog_label(message, ui, None);
+                Modal::new("Alert".into()).show(ctx, |ui| {
+                    make_dialog_label(alert_dialog.message(), ui, None);
                     egui::Sides::new().show(
                         ui,
                         |_ui| {},
@@ -230,23 +221,26 @@ impl Dialog {
                                 ui.input(|i| i.key_pressed(egui::Key::Escape))
                             {
                                 is_open = false;
-                                if let Err(e) = response_sender.send(AlertResponse::Ok) {
-                                    warn!("Failed to send alert dialog response: {}", e);
-                                }
                             }
                         },
                     );
                 });
+
+                if !is_open {
+                    if let Some(alert_dialog) = maybe_alert_dialog.take() {
+                        alert_dialog.confirm();
+                    }
+                }
                 is_open
             },
-            Dialog::SimpleDialog(SimpleDialog::Confirm {
-                message,
-                response_sender,
-            }) => {
-                let mut is_open = true;
-                let modal = Modal::new("Confirm".into());
-                modal.show(ctx, |ui| {
-                    make_dialog_label(message, ui, None);
+            Dialog::Confirm(maybe_confirm_dialog) => {
+                let Some(confirm_dialog) = maybe_confirm_dialog else {
+                    return false;
+                };
+
+                let mut dialog_action = DialogAction::Continue;
+                Modal::new("Confirm".into()).show(ctx, |ui| {
+                    make_dialog_label(confirm_dialog.message(), ui, None);
                     egui::Sides::new().show(
                         ui,
                         |_ui| {},
@@ -254,33 +248,42 @@ impl Dialog {
                             if ui.button("Ok").clicked() ||
                                 ui.input(|i| i.key_pressed(egui::Key::Enter))
                             {
-                                is_open = false;
-                                if let Err(e) = response_sender.send(ConfirmResponse::Ok) {
-                                    warn!("Failed to send alert dialog response: {}", e);
-                                }
+                                dialog_action = DialogAction::Submit;
                             }
                             if ui.button("Cancel").clicked() ||
                                 ui.input(|i| i.key_pressed(egui::Key::Escape))
                             {
-                                is_open = false;
-                                if let Err(e) = response_sender.send(ConfirmResponse::Cancel) {
-                                    warn!("Failed to send alert dialog response: {}", e);
-                                }
+                                dialog_action = DialogAction::Dismiss;
                             }
                         },
                     );
                 });
-                is_open
+
+                match dialog_action {
+                    DialogAction::Dismiss => {
+                        if let Some(confirm_dialog) = maybe_confirm_dialog.take() {
+                            confirm_dialog.dismiss();
+                        }
+                        false
+                    },
+                    DialogAction::Submit => {
+                        if let Some(confirm_dialog) = maybe_confirm_dialog.take() {
+                            confirm_dialog.confirm();
+                        }
+                        false
+                    },
+                    DialogAction::Continue => true,
+                }
             },
-            Dialog::SimpleDialog(SimpleDialog::Prompt {
-                message,
-                // The `default` field gets reused as the input buffer.
-                default: input,
-                response_sender,
-            }) => {
-                let mut is_open = true;
+            Dialog::Prompt(maybe_prompt_dialog) => {
+                let Some(prompt_dialog) = maybe_prompt_dialog else {
+                    return false;
+                };
+
+                let mut dialog_action = DialogAction::Continue;
                 Modal::new("Prompt".into()).show(ctx, |ui| {
-                    make_dialog_label(message, ui, Some(input));
+                    let mut prompt_text = prompt_dialog.current_value().to_owned();
+                    make_dialog_label(prompt_dialog.message(), ui, Some(&mut prompt_text));
                     egui::Sides::new().show(
                         ui,
                         |_ui| {},
@@ -288,25 +291,33 @@ impl Dialog {
                             if ui.button("Ok").clicked() ||
                                 ui.input(|i| i.key_pressed(egui::Key::Enter))
                             {
-                                is_open = false;
-                                if let Err(e) =
-                                    response_sender.send(PromptResponse::Ok(input.clone()))
-                                {
-                                    warn!("Failed to send input dialog response: {}", e);
-                                }
+                                prompt_dialog.set_current_value(&prompt_text);
+                                dialog_action = DialogAction::Submit;
                             }
                             if ui.button("Cancel").clicked() ||
                                 ui.input(|i| i.key_pressed(egui::Key::Escape))
                             {
-                                is_open = false;
-                                if let Err(e) = response_sender.send(PromptResponse::Cancel) {
-                                    warn!("Failed to send input dialog response: {}", e);
-                                }
+                                dialog_action = DialogAction::Dismiss;
                             }
                         },
                     );
+                    prompt_dialog.set_current_value(&prompt_text);
                 });
-                is_open
+                match dialog_action {
+                    DialogAction::Dismiss => {
+                        if let Some(prompt_dialog) = maybe_prompt_dialog.take() {
+                            prompt_dialog.dismiss();
+                        }
+                        false
+                    },
+                    DialogAction::Submit => {
+                        if let Some(prompt_dialog) = maybe_prompt_dialog.take() {
+                            prompt_dialog.confirm();
+                        }
+                        false
+                    },
+                    DialogAction::Continue => true,
+                }
             },
             Dialog::Authentication {
                 username,
@@ -316,7 +327,7 @@ impl Dialog {
                 let mut is_open = true;
                 Modal::new("authentication".into()).show(ctx, |ui| {
                     let mut frame = egui::Frame::default().inner_margin(10.0).begin(ui);
-                    frame.content_ui.set_min_width(150.0);
+                    frame.content_ui.set_min_width(MINIMUM_UI_ELEMENT_WIDTH);
 
                     if let Some(request) = request {
                         let url =
@@ -403,7 +414,7 @@ impl Dialog {
                 let modal = Modal::new("device_picker".into());
                 modal.show(ctx, |ui| {
                     let mut frame = egui::Frame::default().inner_margin(10.0).begin(ui);
-                    frame.content_ui.set_min_width(150.0);
+                    frame.content_ui.set_min_width(MINIMUM_UI_ELEMENT_WIDTH);
 
                     frame.content_ui.heading("Choose a Device");
                     frame.content_ui.add_space(10.0);
@@ -523,7 +534,7 @@ impl Dialog {
                                         );
                                     },
                                     SelectElementOptionOrOptgroup::Optgroup { label, options } => {
-                                        ui.label(egui::RichText::new(label).strong());
+                                        ui.label(RichText::new(label).strong());
 
                                         for option in options {
                                             display_option(
@@ -607,23 +618,110 @@ impl Dialog {
 
                 is_open
             },
+            Dialog::ContextMenu {
+                menu,
+                toolbar_offset,
+            } => {
+                let mut is_open = true;
+                if let Some(context_menu) = menu {
+                    let mut selected_action = None;
+                    let mut position = context_menu.position();
+                    position.min.y += toolbar_offset.0 as i32;
+                    position.max.y += toolbar_offset.0 as i32;
+
+                    let response = Area::new(Id::new("context_menu"))
+                        .fixed_pos(pos2(position.min.x as f32, position.min.y as f32))
+                        .order(Order::Foreground)
+                        .show(ctx, |ui| {
+                            Frame::popup(ui.style()).show(ui, |ui| {
+                                ui.set_min_width(MINIMUM_UI_ELEMENT_WIDTH);
+                                for item in context_menu.items() {
+                                    match item {
+                                        ContextMenuItem::Item {
+                                            label,
+                                            action,
+                                            enabled,
+                                        } => {
+                                            let (color, sense) = match enabled {
+                                                true => (
+                                                    ui.visuals().strong_text_color(),
+                                                    Sense::click(),
+                                                ),
+                                                false => {
+                                                    (ui.visuals().weak_text_color(), Sense::empty())
+                                                },
+                                            };
+
+                                            ui.style_mut().visuals.widgets.inactive.weak_bg_fill =
+                                                ui.visuals().panel_fill;
+                                            ui.style_mut().visuals.widgets.inactive.bg_fill =
+                                                ui.visuals().panel_fill;
+                                            let button =
+                                                Button::new(RichText::new(label).color(color))
+                                                    .sense(sense)
+                                                    .corner_radius(CornerRadius::ZERO)
+                                                    .stroke(Stroke::NONE)
+                                                    .wrap_mode(egui::TextWrapMode::Extend)
+                                                    .min_size(Vec2 {
+                                                        x: MINIMUM_UI_ELEMENT_WIDTH,
+                                                        y: 0.0,
+                                                    });
+
+                                            if ui.add(button).clicked() {
+                                                selected_action = Some(*action);
+                                                ui.close();
+                                            }
+                                        },
+                                        ContextMenuItem::Separator => {
+                                            ui.separator();
+                                        },
+                                    }
+                                }
+                            })
+                        });
+
+                    if response.response.clicked_elsewhere() {
+                        is_open = false;
+                    }
+
+                    if let Some(action) = selected_action {
+                        if let Some(context_menu) = menu.take() {
+                            context_menu.select(action);
+                            return false;
+                        }
+                    }
+                }
+                is_open
+            },
         }
     }
 
-    pub fn webdriver_diaglog_type(&self) -> WebDriverUserPrompt {
+    pub(crate) fn embedder_control_id(&self) -> Option<EmbedderControlId> {
         match self {
-            Dialog::File { .. } => WebDriverUserPrompt::File,
-            Dialog::SimpleDialog(SimpleDialog::Alert { .. }) => WebDriverUserPrompt::Alert,
-            Dialog::SimpleDialog(SimpleDialog::Confirm { .. }) => WebDriverUserPrompt::Confirm,
-            Dialog::SimpleDialog(SimpleDialog::Prompt { .. }) => WebDriverUserPrompt::Prompt,
-            _ => WebDriverUserPrompt::Default,
+            Dialog::SelectElement { maybe_prompt, .. } => {
+                maybe_prompt.as_ref().map(|element| element.id())
+            },
+            Dialog::ColorPicker { maybe_prompt, .. } => {
+                maybe_prompt.as_ref().map(|element| element.id())
+            },
+            _ => None,
+        }
+    }
+
+    pub(crate) fn new_context_menu(
+        menu: ContextMenu,
+        toolbar_offset: Length<f32, DeviceIndependentPixel>,
+    ) -> Dialog {
+        Dialog::ContextMenu {
+            menu: Some(menu),
+            toolbar_offset,
         }
     }
 }
 
 fn make_dialog_label(message: &str, ui: &mut egui::Ui, input_text: Option<&mut String>) {
     let mut frame = egui::Frame::default().inner_margin(10.0).begin(ui);
-    frame.content_ui.set_min_width(150.0);
+    frame.content_ui.set_min_width(MINIMUM_UI_ELEMENT_WIDTH);
     frame.content_ui.label(message);
     if let Some(input_text) = input_text {
         frame.content_ui.text_edit_singleline(input_text);

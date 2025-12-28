@@ -25,7 +25,7 @@ use crate::dom::types::{TransformStream, TransformStreamDefaultController};
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 /// <https://encoding.spec.whatwg.org/#decode-and-enqueue-a-chunk>
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn decode_and_enqueue_a_chunk(
     cx: SafeJSContext,
     global: &GlobalScope,
@@ -67,7 +67,7 @@ pub(crate) fn decode_and_enqueue_a_chunk(
 }
 
 /// <https://encoding.spec.whatwg.org/#flush-and-enqueue>
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub(crate) fn flush_and_enqueue(
     cx: SafeJSContext,
     global: &GlobalScope,
@@ -103,14 +103,14 @@ pub(crate) struct TextDecoderStream {
     reflector_: Reflector,
 
     /// <https://encoding.spec.whatwg.org/#textdecodercommon>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     decoder: Rc<TextDecoderCommon>,
 
     /// <https://streams.spec.whatwg.org/#generictransformstream>
     transform: Dom<TransformStream>,
 }
 
-#[allow(non_snake_case)]
+#[expect(non_snake_case)]
 impl TextDecoderStream {
     fn new_inherited(
         decoder: Rc<TextDecoderCommon>,
@@ -147,7 +147,6 @@ impl TextDecoderStream {
     }
 }
 
-#[allow(non_snake_case)]
 impl TextDecoderStreamMethods<crate::DomTypeHolder> for TextDecoderStream {
     /// <https://encoding.spec.whatwg.org/#dom-textdecoderstream>
     fn Constructor(
@@ -157,7 +156,7 @@ impl TextDecoderStreamMethods<crate::DomTypeHolder> for TextDecoderStream {
         label: DOMString,
         options: &TextDecoderBinding::TextDecoderOptions,
     ) -> Fallible<DomRoot<TextDecoderStream>> {
-        let encoding = match Encoding::for_label_no_replacement(label.as_bytes()) {
+        let encoding = match Encoding::for_label_no_replacement(&label.as_bytes()) {
             Some(enc) => enc,
             None => {
                 return Err(Error::Range(

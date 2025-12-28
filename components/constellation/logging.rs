@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::thread;
 
 use backtrace::Backtrace;
-use base::id::WebViewId;
+use base::id::{ScriptEventLoopId, TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
 use constellation_traits::{
-    EmbedderToConstellationMessage, LogEntry, ScriptToConstellationChan,
-    ScriptToConstellationMessage,
+    EmbedderToConstellationMessage, LogEntry, ScriptToConstellationMessage,
+    ScriptToConstellationSender,
 };
 use crossbeam_channel::Sender;
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -24,15 +24,15 @@ use parking_lot::ReentrantMutex;
 /// #[derive(Clone)]
 pub struct FromScriptLogger {
     /// A channel to the constellation
-    pub script_to_constellation_chan: Arc<ReentrantMutex<ScriptToConstellationChan>>,
+    pub script_to_constellation_sender: Arc<ReentrantMutex<ScriptToConstellationSender>>,
 }
 
 /// A logger directed at the constellation from content processes
 impl FromScriptLogger {
     /// Create a new constellation logger.
-    pub fn new(script_to_constellation_chan: ScriptToConstellationChan) -> FromScriptLogger {
+    pub fn new(script_to_constellation_chan: ScriptToConstellationSender) -> FromScriptLogger {
         FromScriptLogger {
-            script_to_constellation_chan: Arc::new(ReentrantMutex::new(
+            script_to_constellation_sender: Arc::new(ReentrantMutex::new(
                 script_to_constellation_chan,
             )),
         }
@@ -52,16 +52,28 @@ impl Log for FromScriptLogger {
     fn log(&self, record: &Record) {
         if let Some(entry) = log_entry(record) {
             let thread_name = thread::current().name().map(ToOwned::to_owned);
-            let msg = ScriptToConstellationMessage::LogEntry(thread_name, entry);
-            let chan = self.script_to_constellation_chan.lock();
-            let _ = chan.send(msg);
+            let _ = self.script_to_constellation_sender.lock().send(
+                // TODO: The WebViewId and PipelineId are unused for the `LogEntry` method, but it
+                // would probably be better to have an entirely new message variant or sender for
+                // messages that definitely do not need these fields to avoid having to use the
+                // TEST_* values here.
+                (
+                    TEST_WEBVIEW_ID,
+                    TEST_PIPELINE_ID,
+                    ScriptToConstellationMessage::LogEntry(
+                        ScriptEventLoopId::installed(),
+                        thread_name,
+                        entry,
+                    ),
+                ),
+            );
         }
     }
 
     fn flush(&self) {}
 }
 
-/// A logger directed at the constellation from the compositor
+/// A logger directed at the constellation from `Paint`.
 #[derive(Clone)]
 pub struct FromEmbedderLogger {
     /// A channel to the constellation
@@ -89,9 +101,9 @@ impl Log for FromEmbedderLogger {
 
     fn log(&self, record: &Record) {
         if let Some(entry) = log_entry(record) {
-            let top_level_id = WebViewId::installed();
+            let event_loop_id = ScriptEventLoopId::installed();
             let thread_name = thread::current().name().map(ToOwned::to_owned);
-            let msg = EmbedderToConstellationMessage::LogEntry(top_level_id, thread_name, entry);
+            let msg = EmbedderToConstellationMessage::LogEntry(event_loop_id, thread_name, entry);
             let chan = self.constellation_chan.lock();
             let _ = chan.send(msg);
         }

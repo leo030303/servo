@@ -123,7 +123,6 @@ pub struct OpenXRInput {
     click_state: ClickState,
     squeeze_state: ClickState,
     menu_gesture_sustain: u8,
-    #[allow(unused)]
     hand_tracker: Option<HandTracker>,
     action_buttons_common: Vec<Action<f32>>,
     action_buttons_left: Vec<Action<f32>>,
@@ -141,7 +140,7 @@ fn hand_str(h: Handedness) -> &'static str {
 }
 
 impl OpenXRInput {
-    pub fn new<G: Graphics>(
+    fn new<G: Graphics>(
         id: InputId,
         handedness: Handedness,
         action_set: &ActionSet,
@@ -158,7 +157,7 @@ impl OpenXRInput {
             )
             .unwrap();
         let action_aim_space = action_aim_pose
-            .create_space(session.clone(), Path::NULL, IDENTITY_POSE)
+            .create_space(session, Path::NULL, IDENTITY_POSE)
             .unwrap();
         let action_grip_pose: Action<Posef> = action_set
             .create_action(
@@ -168,7 +167,7 @@ impl OpenXRInput {
             )
             .unwrap();
         let action_grip_space = action_grip_pose
-            .create_space(session.clone(), Path::NULL, IDENTITY_POSE)
+            .create_space(session, Path::NULL, IDENTITY_POSE)
             .unwrap();
         let action_click: Action<bool> = action_set
             .create_action(
@@ -300,7 +299,7 @@ impl OpenXRInput {
         }
     }
 
-    pub fn setup_inputs<G: Graphics>(
+    pub(super) fn setup_inputs<G: Graphics>(
         instance: &Instance,
         session: &Session<G>,
         needs_hands: bool,
@@ -441,7 +440,7 @@ impl OpenXRInput {
         ret
     }
 
-    pub fn frame<G: Graphics>(
+    pub(super) fn frame<G: Graphics>(
         &mut self,
         session: &Session<G>,
         frame_state: &FrameState,
@@ -595,7 +594,7 @@ impl OpenXRInput {
         }
     }
 
-    pub fn input_source(&self) -> InputSource {
+    pub(crate) fn input_source(&self) -> InputSource {
         let hand_support = if self.hand_tracker.is_some() {
             // openxr runtimes must always support all or none joints
             Some(Hand::<()>::default().map(|_, _| Some(())))

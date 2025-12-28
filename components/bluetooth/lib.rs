@@ -19,6 +19,7 @@ use std::string::String;
 use std::thread;
 use std::time::Duration;
 
+use base::generic_channel::{self, GenericReceiver, GenericSender};
 use base::id::WebViewId;
 use bitflags::bitflags;
 use bluetooth_traits::blocklist::{Blocklist, uuid_is_blocklisted};
@@ -31,10 +32,9 @@ use bluetooth_traits::{
     BluetoothServiceMsg, GATTType,
 };
 use embedder_traits::{EmbedderMsg, EmbedderProxy};
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use log::warn;
+use rand::{self, Rng};
 use servo_config::pref;
-use servo_rand::{self, Rng};
 
 use crate::bluetooth::{
     BluetoothAdapter, BluetoothDevice, BluetoothGATTCharacteristic, BluetoothGATTDescriptor,
@@ -74,9 +74,9 @@ pub trait BluetoothThreadFactory {
     fn new(embedder_proxy: EmbedderProxy) -> Self;
 }
 
-impl BluetoothThreadFactory for IpcSender<BluetoothRequest> {
-    fn new(embedder_proxy: EmbedderProxy) -> IpcSender<BluetoothRequest> {
-        let (sender, receiver) = ipc::channel().unwrap();
+impl BluetoothThreadFactory for GenericSender<BluetoothRequest> {
+    fn new(embedder_proxy: EmbedderProxy) -> GenericSender<BluetoothRequest> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
         let adapter = if pref!(dom_bluetooth_enabled) {
             BluetoothAdapter::new()
         } else {
@@ -93,7 +93,7 @@ impl BluetoothThreadFactory for IpcSender<BluetoothRequest> {
     }
 }
 
-// https://webbluetoothcg.github.io/web-bluetooth/#matches-a-filter
+/// <https://webbluetoothcg.github.io/web-bluetooth/#matches-a-filter>
 fn matches_filter(device: &BluetoothDevice, filter: &BluetoothScanfilter) -> bool {
     if filter.is_empty_or_invalid() {
         return false;
@@ -166,7 +166,7 @@ fn matches_filter(device: &BluetoothDevice, filter: &BluetoothScanfilter) -> boo
     true
 }
 
-// https://webbluetoothcg.github.io/web-bluetooth/#bluetoothdatafilterinit-matches
+/// <https://webbluetoothcg.github.io/web-bluetooth/#bluetoothdatafilterinit-matches>
 fn data_filter_matches(data: &[u8], prefix: &[u8], mask: &[u8]) -> bool {
     // Step 1-2: No need to copy the bytes here.
     // Step 3.
@@ -198,7 +198,7 @@ fn is_mock_adapter(adapter: &BluetoothAdapter) -> bool {
 }
 
 pub struct BluetoothManager {
-    receiver: IpcReceiver<BluetoothRequest>,
+    receiver: GenericReceiver<BluetoothRequest>,
     adapter: Option<BluetoothAdapter>,
     address_to_id: HashMap<String, String>,
     service_to_device: HashMap<String, String>,
@@ -214,7 +214,7 @@ pub struct BluetoothManager {
 
 impl BluetoothManager {
     pub fn new(
-        receiver: IpcReceiver<BluetoothRequest>,
+        receiver: GenericReceiver<BluetoothRequest>,
         adapter: Option<BluetoothAdapter>,
         embedder_proxy: EmbedderProxy,
     ) -> BluetoothManager {
@@ -409,7 +409,8 @@ impl BluetoothManager {
             ]);
         }
 
-        let (ipc_sender, ipc_receiver) = ipc::channel().expect("Failed to create IPC channel!");
+        let (ipc_sender, ipc_receiver) =
+            generic_channel::channel().expect("Failed to create IPC channel!");
         self.embedder_proxy
             .send(EmbedderMsg::GetSelectedBluetoothDevice(
                 webview_id,
@@ -428,9 +429,9 @@ impl BluetoothManager {
 
     fn generate_device_id(&mut self) -> String {
         let mut device_id;
-        let mut rng = servo_rand::thread_rng();
+        let mut rng = rand::rng();
         loop {
-            device_id = rng.r#gen::<u32>().to_string();
+            device_id = rng.random::<u32>().to_string();
             if !self.cached_devices.contains_key(&device_id) {
                 break;
             }
@@ -608,7 +609,7 @@ impl BluetoothManager {
 
     // Methods
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#request-bluetooth-devices
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#request-bluetooth-devices>
     fn request_device(&mut self, options: RequestDeviceoptions) -> BluetoothResponseResult {
         // Step 6.
         let mut adapter = self.get_adapter()?;
@@ -654,7 +655,7 @@ impl BluetoothManager {
         // Step 12: Missing, because it is optional.
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-connect
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-connect>
     fn gatt_server_connect(&mut self, device_id: String) -> BluetoothResponseResult {
         // Step 2.
         if !self.device_is_cached(&device_id) {
@@ -687,7 +688,7 @@ impl BluetoothManager {
         }
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-disconnect
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattserver-disconnect>
     fn gatt_server_disconnect(&mut self, device_id: String) -> BluetoothResult<()> {
         let mut adapter = self.get_adapter()?;
         match self.get_device(&mut adapter, &device_id) {
@@ -710,7 +711,7 @@ impl BluetoothManager {
         }
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#getgattchildren
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#getgattchildren>
     fn get_gatt_children(
         &mut self,
         id: String,
@@ -867,8 +868,8 @@ impl BluetoothManager {
         }
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-readvalue
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-readvalue
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-readvalue>
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-readvalue>
     fn read_value(&mut self, id: String) -> BluetoothResponseResult {
         // (Characteristic) Step 5.2: Missing because it is optional.
         // (Descriptor)     Step 5.1: Missing because it is optional.
@@ -901,8 +902,8 @@ impl BluetoothManager {
         }
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-writevalue
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-writevalue
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-writevalue>
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattdescriptor-writevalue>
     fn write_value(&mut self, id: String, value: Vec<u8>) -> BluetoothResponseResult {
         // (Characteristic) Step 7.2: Missing because it is optional.
         // (Descriptor)     Step 7.1: Missing because it is optional.
@@ -940,8 +941,8 @@ impl BluetoothManager {
         }
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-startnotifications
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-stopnotifications
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-startnotifications>
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothremotegattcharacteristic-stopnotifications>
     fn enable_notification(&mut self, id: String, enable: bool) -> BluetoothResponseResult {
         // (StartNotifications) Step 3 - 4.
         // (StopNotifications) Step 1 - 2.
@@ -975,14 +976,14 @@ impl BluetoothManager {
         }
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothdevice-watchadvertisements
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetoothdevice-watchadvertisements>
     fn watch_advertisements(&mut self, _device_id: String) -> BluetoothResponseResult {
         // Step 2.
         // TODO: Implement this when supported in lower level
         Err(BluetoothError::NotSupported)
     }
 
-    // https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-getavailability
+    /// <https://webbluetoothcg.github.io/web-bluetooth/#dom-bluetooth-getavailability>
     fn get_availability(&mut self) -> BluetoothResponseResult {
         Ok(BluetoothResponse::GetAvailability(
             self.get_adapter().is_ok(),

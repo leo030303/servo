@@ -9,6 +9,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 
+use base::text::{Utf8CodeUnitLength, Utf16CodeUnitLength};
 use crossbeam_channel::Sender;
 use html5ever::interface::{Tracer as HtmlTracer, TreeSink};
 use html5ever::tokenizer::{TokenSink, Tokenizer};
@@ -35,7 +36,7 @@ use xml5ever::tree_builder::{Tracer as XmlTracer, XmlTreeBuilder};
 use crate::JSTraceable;
 use crate::error::Error;
 use crate::reflector::Reflector;
-use crate::str::{DOMString, USVString};
+use crate::str::USVString;
 
 /// Trace the `JSObject` held by `reflector`.
 ///
@@ -71,7 +72,7 @@ pub(crate) unsafe fn trace_object(
 macro_rules! unsafe_no_jsmanaged_fields(
     ($($ty:ty),+) => (
         $(
-            #[allow(unsafe_code)]
+            #[expect(unsafe_code)]
             unsafe impl crate::JSTraceable for $ty {
                 #[inline]
                 unsafe fn trace(&self, _: *mut ::js::jsapi::JSTracer) {
@@ -82,7 +83,6 @@ macro_rules! unsafe_no_jsmanaged_fields(
     );
 );
 
-unsafe_no_jsmanaged_fields!(DOMString);
 unsafe_no_jsmanaged_fields!(USVString);
 unsafe_no_jsmanaged_fields!(Error);
 
@@ -289,7 +289,7 @@ unsafe impl<Handle: JSTraceable + Clone, Sink: TreeSink<Handle = Handle> + JSTra
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl<Handle: JSTraceable + Clone, Sink: TokenSink<Handle = Handle> + CustomTraceable>
     CustomTraceable for Tokenizer<Sink>
 {
@@ -298,7 +298,7 @@ unsafe impl<Handle: JSTraceable + Clone, Sink: TokenSink<Handle = Handle> + Cust
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl<Handle: JSTraceable + Clone, Sink: JSTraceable + XmlTreeSink<Handle = Handle>>
     CustomTraceable for XmlTokenizer<XmlTreeBuilder<Handle, Sink>>
 {
@@ -408,7 +408,7 @@ impl<T> From<T> for NoTrace<T> {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl<T> JSTraceable for NoTrace<T> {
     #[inline]
     unsafe fn trace(&self, _: *mut ::js::jsapi::JSTracer) {}
@@ -417,5 +417,24 @@ unsafe impl<T> JSTraceable for NoTrace<T> {
 impl<T: MallocSizeOf> MallocSizeOf for NoTrace<T> {
     fn size_of(&self, ops: &mut MallocSizeOfOps) -> usize {
         self.0.size_of(ops)
+    }
+}
+
+unsafe impl CustomTraceable for Utf8CodeUnitLength {
+    #[inline]
+    unsafe fn trace(&self, _: *mut JSTracer) {}
+}
+
+unsafe impl CustomTraceable for Utf16CodeUnitLength {
+    #[inline]
+    unsafe fn trace(&self, _: *mut JSTracer) {}
+}
+
+unsafe impl<T: CustomTraceable> CustomTraceable for Option<T> {
+    #[inline]
+    unsafe fn trace(&self, tracer: *mut JSTracer) {
+        unsafe {
+            self.as_ref().inspect(|value| value.trace(tracer));
+        }
     }
 }

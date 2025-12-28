@@ -7,18 +7,20 @@
 use std::fs;
 use std::iter::FromIterator;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use base::id::{TEST_PIPELINE_ID, TEST_WEBVIEW_ID};
+use base::threadpool::ThreadPool;
 use content_security_policy as csp;
 use crossbeam_channel::{Sender, unbounded};
 use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as DevtoolsHttpResponse};
 use headers::{
     AccessControlAllowCredentials, AccessControlAllowHeaders, AccessControlAllowMethods,
-    AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType,
-    Expires, HeaderMapExt, LastModified, Pragma, StrictTransportSecurity, UserAgent,
+    AccessControlAllowOrigin, AccessControlMaxAge, CacheControl, ContentLength, ContentType, ETag,
+    Expires, HeaderMapExt, IfNoneMatch, LastModified, Pragma, StrictTransportSecurity, UserAgent,
 };
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode};
@@ -27,13 +29,13 @@ use hyper::body::{Bytes, Incoming};
 use hyper::{Request as HyperRequest, Response as HyperResponse};
 use mime::{self, Mime};
 use net::async_runtime::spawn_blocking_task;
+use net::connector::CACertificates;
 use net::fetch::cors_cache::CorsCache;
 use net::fetch::methods::{self, FetchContext};
 use net::filemanager_thread::FileManager;
 use net::hsts::HstsEntry;
 use net::protocols::ProtocolRegistry;
 use net::request_interceptor::RequestInterceptor;
-use net::resource_thread::CoreResourceThreadPool;
 use net_traits::filemanager_thread::FileTokenCheck;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::{
@@ -44,15 +46,16 @@ use net_traits::{
     FetchTaskTarget, IncludeSubdomains, NetworkError, ReferrerPolicy, ResourceFetchTiming,
     ResourceTimingType,
 };
+use parking_lot::Mutex;
 use servo_arc::Arc as ServoArc;
-use servo_url::ServoUrl;
+use servo_url::{ImmutableOrigin, ServoUrl};
 use uuid::Uuid;
 
 use crate::http_loader::{devtools_response_with_body, expect_devtools_http_request};
 use crate::{
     DEFAULT_USER_AGENT, create_embedder_proxy, create_embedder_proxy_and_receiver,
     create_http_state, fetch, fetch_with_context, fetch_with_cors_cache, make_body, make_server,
-    make_ssl_server, new_fetch_context,
+    make_ssl_server, mock_origin, new_fetch_context,
 };
 
 // TODO write a struct that impls Handler for storing test values
@@ -69,6 +72,7 @@ fn test_fetch_response_is_not_network_error() {
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -83,6 +87,7 @@ fn test_fetch_on_bad_port_is_network_error() {
     let url = ServoUrl::parse("http://www.example.org:6667").unwrap();
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     assert!(fetch_response.is_network_error());
@@ -105,6 +110,7 @@ fn test_fetch_response_body_matches_const_message() {
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -112,7 +118,7 @@ fn test_fetch_response_body_matches_const_message() {
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.response_type, ResponseType::Basic);
 
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(ref body) => {
             assert_eq!(&**body, MESSAGE);
         },
@@ -125,6 +131,7 @@ fn test_fetch_aboutblank() {
     let url = ServoUrl::parse("about:blank").unwrap();
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
 
     let fetch_response = fetch(request, None);
@@ -132,14 +139,14 @@ fn test_fetch_aboutblank() {
     assert_eq!(fetch_response.response_type, ResponseType::Opaque);
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.headers.len(), 0);
-    let resp_body = fetch_response.body.lock().unwrap();
+    let resp_body = fetch_response.body.lock();
     assert_eq!(*resp_body, ResponseBody::Empty);
 
     // The underlying response behind the filter should
     // have a 0-byte body.
     let actual_response = fetch_response.actual_response();
     assert!(!actual_response.is_network_error());
-    let resp_body = actual_response.body.lock().unwrap();
+    let resp_body = actual_response.body.lock();
     assert_eq!(*resp_body, ResponseBody::Done(vec![]));
 }
 
@@ -181,7 +188,7 @@ fn test_fetch_blob() {
     let origin = ServoUrl::parse("http://www.example.org/").unwrap();
 
     let id = Uuid::new_v4();
-    context.filemanager.lock().unwrap().promote_memory(
+    context.filemanager.lock().promote_memory(
         id.clone(),
         blob_buf,
         true,
@@ -191,6 +198,7 @@ fn test_fetch_blob() {
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(origin.origin())
+        .policy_container(Default::default())
         .build();
 
     let (sender, receiver) = unbounded();
@@ -218,10 +226,7 @@ fn test_fetch_blob() {
     let content_length: ContentLength = fetch_response.headers.typed_get().unwrap();
     assert_eq!(content_length.0, bytes.len() as u64);
 
-    assert_eq!(
-        *fetch_response.body.lock().unwrap(),
-        ResponseBody::Receiving(vec![])
-    );
+    assert_eq!(*fetch_response.body.lock(), ResponseBody::Receiving(vec![]));
 }
 
 #[test]
@@ -233,9 +238,10 @@ fn test_file() {
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
 
-    let pool = CoreResourceThreadPool::new(1, "CoreResourceTestPool".to_string());
+    let pool = ThreadPool::new(1, "CoreResourceTestPool".to_string());
     let pool_handle = Arc::new(pool);
     let mut context = new_fetch_context(None, None, Some(Arc::downgrade(&pool_handle)));
     let fetch_response = fetch_with_context(request, &mut context);
@@ -245,7 +251,7 @@ fn test_file() {
 
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.headers.len(), 0);
-    let resp_body = fetch_response.body.lock().unwrap();
+    let resp_body = fetch_response.body.lock();
     assert_eq!(*resp_body, ResponseBody::Empty);
 
     // The underlying response behind the filter should
@@ -260,7 +266,7 @@ fn test_file() {
         .into();
     assert_eq!(content_type, mime::TEXT_CSS);
 
-    let resp_body = actual_response.body.lock().unwrap();
+    let resp_body = actual_response.body.lock();
     let file = fs::read(path).unwrap();
 
     match *resp_body {
@@ -276,6 +282,7 @@ fn test_fetch_ftp() {
     let url = ServoUrl::parse("ftp://not-supported").unwrap();
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     assert!(fetch_response.is_network_error());
@@ -286,6 +293,7 @@ fn test_fetch_bogus_scheme() {
     let url = ServoUrl::parse("bogus://whatever").unwrap();
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     assert!(fetch_response.is_network_error());
@@ -338,12 +346,15 @@ fn test_cors_preflight_fetch() {
         };
     let (server, url) = make_server(handler);
 
+    let origin = url.origin();
     let target_url = url.clone().join("a.html").unwrap();
     let mut request = RequestBuilder::new(
         Some(TEST_WEBVIEW_ID),
         url,
         Referrer::ReferrerUrl(target_url),
     )
+    .origin(origin)
+    .policy_container(Default::default())
     .build();
     request.referrer_policy = ReferrerPolicy::Origin;
     request.use_cors_preflight = true;
@@ -352,7 +363,7 @@ fn test_cors_preflight_fetch() {
     let _ = server.close();
 
     assert!(!fetch_response.is_network_error());
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
         _ => panic!(),
     };
@@ -401,7 +412,10 @@ fn test_cors_preflight_cache_fetch() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(mock_origin())
+        .build();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
     let wrapped_request0 = request.clone();
@@ -422,11 +436,11 @@ fn test_cors_preflight_cache_fetch() {
     assert_eq!(true, cache.match_method(&wrapped_request2, Method::GET));
     assert_eq!(true, cache.match_method(&wrapped_request3, Method::GET));
 
-    match *fetch_response0.body.lock().unwrap() {
+    match *fetch_response0.body.lock() {
         ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
         _ => panic!(),
     };
-    match *fetch_response1.body.lock().unwrap() {
+    match *fetch_response1.body.lock() {
         ResponseBody::Done(ref body) => assert_eq!(&**body, ACK),
         _ => panic!(),
     };
@@ -470,7 +484,10 @@ fn test_cors_preflight_fetch_network_error() {
         };
     let (server, url) = make_server(handler);
 
-    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(mock_origin())
+        .build();
     request.method = Method::from_bytes(b"CHICKEN").unwrap();
     request.use_cors_preflight = true;
     request.mode = RequestMode::CorsMode;
@@ -501,6 +518,7 @@ fn test_fetch_response_is_basic_filtered() {
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -566,7 +584,10 @@ fn test_fetch_response_is_cors_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will stop it from defaulting to a basic filtered response
-    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
+    let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(mock_origin())
+        .build();
     request.mode = RequestMode::CorsMode;
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -602,7 +623,10 @@ fn test_fetch_response_is_opaque_filtered() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(ImmutableOrigin::new_opaque())
+        .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
 
@@ -614,7 +638,7 @@ fn test_fetch_response_is_opaque_filtered() {
     // this also asserts that status message is "the empty byte sequence"
     assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Empty => {},
         _ => panic!(),
     }
@@ -652,6 +676,7 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
 
     let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     request.redirect_mode = RedirectMode::Manual;
     let fetch_response = fetch(request, None);
@@ -663,7 +688,7 @@ fn test_fetch_response_is_opaque_redirect_filtered() {
     // this also asserts that status message is "the empty byte sequence"
     assert!(fetch_response.status.is_error());
     assert_eq!(fetch_response.headers, HeaderMap::new());
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Empty => {},
         _ => panic!(),
     }
@@ -689,6 +714,7 @@ fn test_fetch_with_local_urls_only() {
         let mut request =
             RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
                 .origin(url.origin())
+                .policy_container(Default::default())
                 .build();
 
         // Set the flag.
@@ -741,6 +767,9 @@ fn test_fetch_with_hsts() {
             ResourceTimingType::Navigation,
         ))),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
     };
 
     // The server certificate is self-signed, so we need to add an override
@@ -750,13 +779,14 @@ fn test_fetch_with_hsts() {
     }
 
     {
-        let mut list = context.state.hsts_list.write().unwrap();
+        let mut list = context.state.hsts_list.write();
         list.push(
             HstsEntry::new("localhost".to_owned(), IncludeSubdomains::NotIncluded, None).unwrap(),
         );
     }
     let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     // Set the flag.
     request.local_urls_only = false;
@@ -801,6 +831,9 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
             ResourceTimingType::Navigation,
         ))),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
     };
 
     // The server certificate is self-signed, so we need to add an override
@@ -815,6 +848,7 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
         .destination(Destination::Document)
         .origin(url.clone().origin())
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let response = fetch_with_context(request, &mut context);
@@ -834,7 +868,6 @@ fn test_load_adds_host_to_hsts_list_when_url_is_https() {
             .state
             .hsts_list
             .read()
-            .unwrap()
             .is_host_secure(url.host_str().unwrap())
     );
 }
@@ -867,6 +900,9 @@ fn test_fetch_self_signed() {
             ResourceTimingType::Navigation,
         ))),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
     };
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
@@ -875,6 +911,7 @@ fn test_fetch_self_signed() {
         .destination(Destination::Document)
         .origin(url.clone().origin())
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let response = fetch_with_context(request, &mut context);
@@ -896,6 +933,7 @@ fn test_fetch_self_signed() {
         .destination(Destination::Document)
         .origin(url.clone().origin())
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let response = fetch_with_context(request, &mut context);
@@ -917,6 +955,7 @@ fn test_fetch_with_sri_network_error() {
 
     let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     // To calulate hash use :
     // echo -n "alert('Hello, Network Error');" | openssl dgst -sha384 -binary | openssl base64 -A
@@ -943,6 +982,7 @@ fn test_fetch_with_sri_sucess() {
 
     let mut request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     // To calulate hash use :
     // echo -n "alert('Hello, Network Error');" | openssl dgst -sha384 -binary | openssl base64 -A
@@ -986,6 +1026,7 @@ fn test_fetch_blocked_nosniff() {
         let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
             .origin(url.origin())
             .destination(destination)
+            .policy_container(Default::default())
             .build();
         let fetch_response = fetch(request, None);
         let _ = server.close();
@@ -1032,6 +1073,7 @@ fn setup_server_and_fetch(message: &'static [u8], redirect_cap: u32) -> Response
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
     let _ = server.close();
@@ -1049,7 +1091,7 @@ fn test_fetch_redirect_count_ceiling() {
     assert!(!fetch_response.is_network_error());
     assert_eq!(fetch_response.response_type, ResponseType::Basic);
 
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(ref body) => {
             assert_eq!(&**body, MESSAGE);
         },
@@ -1067,7 +1109,7 @@ fn test_fetch_redirect_count_failure() {
 
     assert!(fetch_response.is_network_error());
 
-    match *fetch_response.body.lock().unwrap() {
+    match *fetch_response.body.lock() {
         ResponseBody::Done(_) | ResponseBody::Receiving(_) => panic!(),
         _ => {},
     };
@@ -1123,6 +1165,7 @@ fn test_fetch_redirect_updates_method_runner(
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .method(method)
+        .policy_container(Default::default())
         .build();
 
     let _ = fetch(request, None);
@@ -1180,14 +1223,14 @@ fn test_fetch_redirect_updates_method() {
 fn response_is_done(response: &Response) -> bool {
     let response_complete = match response.response_type {
         ResponseType::Default | ResponseType::Basic | ResponseType::Cors => {
-            (*response.body.lock().unwrap()).is_done()
+            (*response.body.lock()).is_done()
         },
         // if the internal response cannot have a body, it shouldn't block the "done" state
         ResponseType::Opaque | ResponseType::OpaqueRedirect | ResponseType::Error(..) => true,
     };
 
     let internal_complete = if let Some(ref res) = response.internal_response {
-        res.body.lock().unwrap().is_done()
+        res.body.lock().is_done()
     } else {
         true
     };
@@ -1207,11 +1250,89 @@ fn test_fetch_async_returns_complete_response() {
 
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let fetch_response = fetch(request, None);
 
     let _ = server.close();
     assert_eq!(response_is_done(&fetch_response), true);
+}
+
+#[test]
+fn test_response_cache_status_is_local() {
+    static MESSAGE: &'static [u8] = b"cacheable content";
+    let handler =
+        move |_: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            // Mark this response as cacheable.
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_max_age(Duration::from_secs(604800)));
+            *response.body_mut() = make_body(MESSAGE.to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+
+    // Use the same HttpCache for both fetches.
+    let mut context = new_fetch_context(None, None, None);
+
+    // Cold request - response should come from the server.
+    let initial_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(initial_response.cache_state, CacheState::None));
+
+    // Warm request - response should come from the cache.
+    let cached_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(cached_response.cache_state, CacheState::Local));
+
+    let _ = server.close();
+}
+
+#[test]
+fn test_response_cache_status_is_validated() {
+    static MESSAGE: &'static [u8] = b"cacheable content";
+    let handler =
+        move |request: HyperRequest<Incoming>,
+              response: &mut HyperResponse<BoxBody<Bytes, hyper::Error>>| {
+            // Check for the revalidation request.
+            if let Some(_) = request.headers().typed_get::<IfNoneMatch>() {
+                *response.status_mut() = StatusCode::NOT_MODIFIED;
+                return;
+            }
+            // Mark this cacheable reponse as requiring revalidation upon refetch.
+            response
+                .headers_mut()
+                .typed_insert(CacheControl::new().with_no_cache());
+            response
+                .headers_mut()
+                .typed_insert(ETag::from_str("\"1234abcd\"").unwrap());
+            *response.body_mut() = make_body(MESSAGE.to_vec());
+        };
+    let (server, url) = make_server(handler);
+
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
+        .origin(url.origin())
+        .policy_container(Default::default())
+        .build();
+
+    // Use the same HttpCache for both fetches.
+    let mut context = new_fetch_context(None, None, None);
+
+    // Cold request - response should come from the server.
+    let initial_response = fetch_with_context(request.clone(), &mut context);
+    assert!(matches!(initial_response.cache_state, CacheState::None));
+
+    // Warm request - response should come from the cache after revalidation with server.
+    let revalidated_response = fetch_with_context(request, &mut context);
+    assert!(matches!(
+        revalidated_response.cache_state,
+        CacheState::Validated
+    ));
+
+    let _ = server.close();
 }
 
 #[test]
@@ -1225,7 +1346,10 @@ fn test_opaque_filtered_fetch_async_returns_complete_response() {
     let (server, url) = make_server(handler);
 
     // an origin mis-match will fall through to an Opaque filtered response
-    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer).build();
+    let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url, Referrer::NoReferrer)
+        .policy_container(Default::default())
+        .origin(ImmutableOrigin::new_opaque())
+        .build();
     let fetch_response = fetch(request, None);
 
     let _ = server.close();
@@ -1262,6 +1386,7 @@ fn test_opaque_redirect_filtered_fetch_async_returns_complete_response() {
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
         .redirect_mode(RedirectMode::Manual)
+        .policy_container(Default::default())
         .build();
 
     let fetch_response = fetch(request, None);
@@ -1288,6 +1413,7 @@ fn test_fetch_with_devtools() {
         .origin(url.origin())
         .redirect_mode(RedirectMode::Manual)
         .pipeline_id(Some(TEST_PIPELINE_ID))
+        .policy_container(Default::default())
         .build();
 
     let (devtools_chan, devtools_port) = unbounded();
@@ -1313,7 +1439,7 @@ fn test_fetch_with_devtools() {
 
     headers.insert(
         header::ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br"),
+        HeaderValue::from_static("gzip, deflate, br, zstd"),
     );
 
     // Append fetch metadata headers
@@ -1334,7 +1460,7 @@ fn test_fetch_with_devtools() {
         url: url,
         method: Method::GET,
         headers: headers,
-        body: Some(vec![]),
+        body: Some(vec![].into()),
         pipeline_id: TEST_PIPELINE_ID,
         started_date_time: devhttprequests.1.started_date_time,
         time_stamp: devhttprequests.1.time_stamp,
@@ -1342,7 +1468,7 @@ fn test_fetch_with_devtools() {
         send_time: devhttprequests.1.send_time,
         destination: Destination::None,
         is_xhr: true,
-        browsing_context_id: TEST_WEBVIEW_ID.0,
+        browsing_context_id: TEST_WEBVIEW_ID.into(),
     };
 
     let content = "Yay!";
@@ -1357,9 +1483,10 @@ fn test_fetch_with_devtools() {
     let httpresponse = DevtoolsHttpResponse {
         headers: Some(response_headers),
         status: HttpStatus::default(),
-        body: Some(content.as_bytes().to_vec()),
+        body: Some(content.as_bytes().to_vec().into()),
+        from_cache: false,
         pipeline_id: TEST_PIPELINE_ID,
-        browsing_context_id: TEST_WEBVIEW_ID.0,
+        browsing_context_id: TEST_WEBVIEW_ID.into(),
     };
 
     assert_eq!(devhttprequests.1, httprequest);
@@ -1424,11 +1551,15 @@ fn test_fetch_request_intercepted() {
             ResourceTimingType::Navigation,
         ))),
         protocols: Arc::new(ProtocolRegistry::default()),
+        websocket_chan: None,
+        ca_certificates: CACertificates::Default,
+        ignore_certificate_errors: false,
     };
 
     let url = ServoUrl::parse("http://www.example.org").unwrap();
     let request = RequestBuilder::new(Some(TEST_WEBVIEW_ID), url.clone(), Referrer::NoReferrer)
         .origin(url.origin())
+        .policy_container(Default::default())
         .build();
     let response = fetch_with_context(request, &mut context);
 
@@ -1436,12 +1567,11 @@ fn test_fetch_request_intercepted() {
         response
             .headers
             .get(HEADERNAME)
-            .map(|v| v == HEADERVALUE)
-            .unwrap_or(false),
+            .is_some_and(|value| value == HEADERVALUE),
         "The custom header does not exist or has an incorrect value!"
     );
 
-    let body = response.body.lock().unwrap();
+    let body = response.body.lock();
     match &*body {
         ResponseBody::Done(data) => {
             assert_eq!(data, &EXPECTED_BODY, "Body content does not match");

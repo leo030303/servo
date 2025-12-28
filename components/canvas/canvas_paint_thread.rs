@@ -3,80 +3,69 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::borrow::ToOwned;
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::{f32, thread};
 
+use base::generic_channel::GenericSender;
+use base::{Epoch, generic_channel};
 use canvas_traits::ConstellationCanvasMsg;
 use canvas_traits::canvas::*;
-use compositing_traits::CrossProcessCompositorApi;
+use compositing_traits::CrossProcessPaintApi;
 use crossbeam_channel::{Sender, select, unbounded};
 use euclid::default::{Rect, Size2D, Transform2D};
-use fonts::{FontContext, SystemFontServiceProxy};
-use ipc_channel::ipc::{self, IpcSender};
-use ipc_channel::router::ROUTER;
 use log::warn;
-use net_traits::ResourceThreads;
 use pixels::Snapshot;
+use rustc_hash::FxHashMap;
 use webrender_api::ImageKey;
 
 use crate::canvas_data::*;
 
 pub struct CanvasPaintThread {
-    canvases: HashMap<CanvasId, Canvas>,
+    canvases: FxHashMap<CanvasId, Canvas>,
     next_canvas_id: CanvasId,
-    compositor_api: CrossProcessCompositorApi,
-    font_context: Arc<FontContext>,
+    paint_api: CrossProcessPaintApi,
 }
 
 impl CanvasPaintThread {
-    fn new(
-        compositor_api: CrossProcessCompositorApi,
-        system_font_service: Arc<SystemFontServiceProxy>,
-        resource_threads: ResourceThreads,
-    ) -> CanvasPaintThread {
+    fn new(paint_api: CrossProcessPaintApi) -> CanvasPaintThread {
         CanvasPaintThread {
-            canvases: HashMap::new(),
+            canvases: FxHashMap::default(),
             next_canvas_id: CanvasId(0),
-            compositor_api: compositor_api.clone(),
-            font_context: Arc::new(FontContext::new(
-                system_font_service,
-                compositor_api,
-                resource_threads,
-            )),
+            paint_api: paint_api.clone(),
         }
     }
 
     /// Creates a new `CanvasPaintThread` and returns an `IpcSender` to
     /// communicate with it.
     pub fn start(
-        compositor_api: CrossProcessCompositorApi,
-        system_font_service: Arc<SystemFontServiceProxy>,
-        resource_threads: ResourceThreads,
-    ) -> (Sender<ConstellationCanvasMsg>, IpcSender<CanvasMsg>) {
-        let (ipc_sender, ipc_receiver) = ipc::channel::<CanvasMsg>().unwrap();
-        let msg_receiver = ROUTER.route_ipc_receiver_to_new_crossbeam_receiver(ipc_receiver);
+        paint_api: CrossProcessPaintApi,
+    ) -> (Sender<ConstellationCanvasMsg>, GenericSender<CanvasMsg>) {
+        let (ipc_sender, ipc_receiver) = generic_channel::channel::<CanvasMsg>().unwrap();
+        let msg_receiver = ipc_receiver.route_preserving_errors();
         let (create_sender, create_receiver) = unbounded();
         thread::Builder::new()
             .name("Canvas".to_owned())
             .spawn(move || {
                 let mut canvas_paint_thread = CanvasPaintThread::new(
-                    compositor_api, system_font_service, resource_threads);
+                    paint_api);
                 loop {
                     select! {
                         recv(msg_receiver) -> msg => {
                             match msg {
-                                Ok(CanvasMsg::Canvas2d(message, canvas_id)) => {
+                                Ok(Ok(CanvasMsg::Canvas2d(message, canvas_id))) => {
                                     canvas_paint_thread.process_canvas_2d_message(message, canvas_id);
                                 },
-                                Ok(CanvasMsg::Close(canvas_id)) => {
+                                Ok(Ok(CanvasMsg::Close(canvas_id))) => {
                                     canvas_paint_thread.canvases.remove(&canvas_id);
                                 },
-                                Ok(CanvasMsg::Recreate(size, canvas_id)) => {
+                                Ok(Ok(CanvasMsg::Recreate(size, canvas_id))) => {
                                     canvas_paint_thread.canvas(canvas_id).recreate(size);
                                 },
-                                Err(e) => {
-                                    warn!("Error on CanvasPaintThread receive ({})", e);
+                                Ok(Err(e)) => {
+                                    warn!("CanvasPaintThread message deserialization error: {e:?}");
+                                }
+                                Err(_disconnected) => {
+                                    warn!("CanvasMsg receiver disconnected");
+                                    break;
                                 },
                             }
                         }
@@ -104,15 +93,14 @@ impl CanvasPaintThread {
     }
 
     #[servo_tracing::instrument(skip_all)]
-    pub fn create_canvas(&mut self, size: Size2D<u64>) -> Option<(CanvasId, ImageKey)> {
+    pub fn create_canvas(&mut self, size: Size2D<u64>) -> Option<CanvasId> {
         let canvas_id = self.next_canvas_id;
         self.next_canvas_id.0 += 1;
 
-        let canvas = Canvas::new(size, self.compositor_api.clone(), self.font_context.clone())?;
-        let image_key = canvas.image_key();
+        let canvas = Canvas::new(size, self.paint_api.clone())?;
         self.canvases.insert(canvas_id, canvas);
 
-        Some((canvas_id, image_key))
+        Some(canvas_id)
     }
 
     #[servo_tracing::instrument(
@@ -121,26 +109,40 @@ impl CanvasPaintThread {
     )]
     fn process_canvas_2d_message(&mut self, message: Canvas2dMsg, canvas_id: CanvasId) {
         match message {
+            Canvas2dMsg::SetImageKey(image_key) => {
+                self.canvas(canvas_id).set_image_key(image_key);
+            },
             Canvas2dMsg::FillText(
-                text,
-                x,
-                y,
-                max_width,
-                style,
-                is_rtl,
-                text_options,
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
                 shadow_options,
                 composition_options,
                 transform,
             ) => {
                 self.canvas(canvas_id).fill_text(
-                    text,
-                    x,
-                    y,
-                    max_width,
-                    is_rtl,
-                    style,
-                    text_options,
+                    text_bounds,
+                    text_runs,
+                    fill_or_stroke_style,
+                    shadow_options,
+                    composition_options,
+                    transform,
+                );
+            },
+            Canvas2dMsg::StrokeText(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ) => {
+                self.canvas(canvas_id).stroke_text(
+                    text_bounds,
+                    text_runs,
+                    fill_or_stroke_style,
+                    line_options,
                     shadow_options,
                     composition_options,
                     transform,
@@ -268,21 +270,16 @@ impl CanvasPaintThread {
                     transform,
                 );
             },
-            Canvas2dMsg::MeasureText(text, sender, text_options) => {
-                let metrics = self.canvas(canvas_id).measure_text(text, text_options);
-                sender.send(metrics).unwrap();
-            },
             Canvas2dMsg::GetImageData(dest_rect, sender) => {
                 let snapshot = self.canvas(canvas_id).read_pixels(dest_rect);
-                sender.send(snapshot.as_ipc()).unwrap();
+                sender.send(snapshot.to_shared()).unwrap();
             },
             Canvas2dMsg::PutImageData(rect, snapshot) => {
                 self.canvas(canvas_id)
                     .put_image_data(snapshot.to_owned(), rect);
             },
-            Canvas2dMsg::UpdateImage(sender) => {
-                self.canvas(canvas_id).update_image_rendering();
-                sender.send(()).unwrap();
+            Canvas2dMsg::UpdateImage(canvas_epoch) => {
+                self.canvas(canvas_id).update_image_rendering(canvas_epoch);
             },
             Canvas2dMsg::PopClips(clips) => self.canvas(canvas_id).pop_clips(clips),
         }
@@ -293,7 +290,6 @@ impl CanvasPaintThread {
     }
 }
 
-#[allow(clippy::large_enum_variant)]
 enum Canvas {
     #[cfg(feature = "vello")]
     Vello(CanvasData<crate::vello_backend::VelloDrawTarget>),
@@ -302,27 +298,15 @@ enum Canvas {
 }
 
 impl Canvas {
-    fn new(
-        size: Size2D<u64>,
-        compositor_api: CrossProcessCompositorApi,
-        font_context: Arc<FontContext>,
-    ) -> Option<Self> {
+    fn new(size: Size2D<u64>, paint_api: CrossProcessPaintApi) -> Option<Self> {
         match servo_config::pref!(dom_canvas_backend)
             .to_lowercase()
             .as_str()
         {
             #[cfg(feature = "vello_cpu")]
-            "" | "auto" | "vello_cpu" => Some(Self::VelloCPU(CanvasData::new(
-                size,
-                compositor_api,
-                font_context,
-            ))),
+            "" | "auto" | "vello_cpu" => Some(Self::VelloCPU(CanvasData::new(size, paint_api))),
             #[cfg(feature = "vello")]
-            "" | "auto" | "vello" => Some(Self::Vello(CanvasData::new(
-                size,
-                compositor_api,
-                font_context,
-            ))),
+            "" | "auto" | "vello" => Some(Self::Vello(CanvasData::new(size, paint_api))),
             s => {
                 warn!("Unknown 2D canvas backend: `{s}`");
                 None
@@ -330,12 +314,12 @@ impl Canvas {
         }
     }
 
-    fn image_key(&self) -> ImageKey {
+    fn set_image_key(&mut self, image_key: ImageKey) {
         match self {
             #[cfg(feature = "vello")]
-            Canvas::Vello(canvas_data) => canvas_data.image_key(),
+            Canvas::Vello(canvas_data) => canvas_data.set_image_key(image_key),
             #[cfg(feature = "vello_cpu")]
-            Canvas::VelloCPU(canvas_data) => canvas_data.image_key(),
+            Canvas::VelloCPU(canvas_data) => canvas_data.set_image_key(image_key),
         }
     }
 
@@ -348,16 +332,45 @@ impl Canvas {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn stroke_text(
+        &mut self,
+        text_bounds: Rect<f64>,
+        text_runs: Vec<TextRun>,
+        fill_or_stroke_style: FillOrStrokeStyle,
+        line_options: LineOptions,
+        shadow_options: ShadowOptions,
+        composition_options: CompositionOptions,
+        transform: Transform2D<f64>,
+    ) {
+        match self {
+            #[cfg(feature = "vello")]
+            Canvas::Vello(canvas_data) => canvas_data.stroke_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+            #[cfg(feature = "vello_cpu")]
+            Canvas::VelloCPU(canvas_data) => canvas_data.stroke_text(
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
+                line_options,
+                shadow_options,
+                composition_options,
+                transform,
+            ),
+        }
+    }
+
     fn fill_text(
         &mut self,
-        text: String,
-        x: f64,
-        y: f64,
-        max_width: Option<f64>,
-        is_rtl: bool,
-        style: FillOrStrokeStyle,
-        text_options: TextOptions,
+        text_bounds: Rect<f64>,
+        text_runs: Vec<TextRun>,
+        fill_or_stroke_style: FillOrStrokeStyle,
         shadow_options: ShadowOptions,
         composition_options: CompositionOptions,
         transform: Transform2D<f64>,
@@ -365,26 +378,18 @@ impl Canvas {
         match self {
             #[cfg(feature = "vello")]
             Canvas::Vello(canvas_data) => canvas_data.fill_text(
-                text,
-                x,
-                y,
-                max_width,
-                is_rtl,
-                style,
-                text_options,
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
                 shadow_options,
                 composition_options,
                 transform,
             ),
             #[cfg(feature = "vello_cpu")]
             Canvas::VelloCPU(canvas_data) => canvas_data.fill_text(
-                text,
-                x,
-                y,
-                max_width,
-                is_rtl,
-                style,
-                text_options,
+                text_bounds,
+                text_runs,
+                fill_or_stroke_style,
                 shadow_options,
                 composition_options,
                 transform,
@@ -558,15 +563,6 @@ impl Canvas {
         }
     }
 
-    fn measure_text(&mut self, text: String, text_options: TextOptions) -> TextMetrics {
-        match self {
-            #[cfg(feature = "vello")]
-            Canvas::Vello(canvas_data) => canvas_data.measure_text(text, text_options),
-            #[cfg(feature = "vello_cpu")]
-            Canvas::VelloCPU(canvas_data) => canvas_data.measure_text(text, text_options),
-        }
-    }
-
     fn clip_path(&mut self, path: &Path, fill_rule: FillRule, transform: Transform2D<f64>) {
         match self {
             #[cfg(feature = "vello")]
@@ -585,12 +581,12 @@ impl Canvas {
         }
     }
 
-    fn update_image_rendering(&mut self) {
+    fn update_image_rendering(&mut self, canvas_epoch: Option<Epoch>) {
         match self {
             #[cfg(feature = "vello")]
-            Canvas::Vello(canvas_data) => canvas_data.update_image_rendering(),
+            Canvas::Vello(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
             #[cfg(feature = "vello_cpu")]
-            Canvas::VelloCPU(canvas_data) => canvas_data.update_image_rendering(),
+            Canvas::VelloCPU(canvas_data) => canvas_data.update_image_rendering(canvas_epoch),
         }
     }
 

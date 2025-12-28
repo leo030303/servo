@@ -4,14 +4,14 @@
 
 #![deny(unsafe_code)]
 
-use std::collections::HashMap;
 use std::fmt::Display;
 use std::sync::{LazyLock, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use base::cross_process_instant::CrossProcessInstant;
-use base::generic_channel::{GenericSend, GenericSender, SendResult};
+use base::generic_channel::{self, GenericSender};
 use base::id::{CookieStoreId, HistoryStateId};
+use base::{IpcSend, IpcSendResult};
 use content_security_policy::{self as csp};
 use cookie::Cookie;
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -19,37 +19,33 @@ use headers::{ContentType, HeaderMapExt, ReferrerPolicy as ReferrerPolicyHeader}
 use http::{Error as HttpError, HeaderMap, HeaderValue, StatusCode, header};
 use hyper_serde::Serde;
 use hyper_util::client::legacy::Error as HyperError;
-use ipc_channel::Error as IpcError;
-use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
+use ipc_channel::ipc::{self, IpcError, IpcReceiver, IpcSender};
 use ipc_channel::router::ROUTER;
 use malloc_size_of::malloc_size_of_is_0;
 use malloc_size_of_derive::MallocSizeOf;
 use mime::Mime;
+use rand::{RngCore, rng};
 use request::RequestId;
+use rustc_hash::FxHashMap;
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
-use servo_rand::RngCore;
 use servo_url::{ImmutableOrigin, ServoUrl};
 
 use crate::filemanager_thread::FileManagerThreadMsg;
 use crate::http_status::HttpStatus;
-use crate::indexeddb_thread::IndexedDBThreadMsg;
 use crate::request::{Request, RequestBuilder};
 use crate::response::{HttpsState, Response, ResponseInit};
-use crate::storage_thread::StorageThreadMsg;
 
 pub mod blob_url_store;
 pub mod filemanager_thread;
 pub mod http_status;
 pub mod image_cache;
-pub mod indexeddb_thread;
 pub mod mime_classifier;
 pub mod policy_container;
 pub mod pub_domains;
 pub mod quality;
 pub mod request;
 pub mod response;
-pub mod storage_thread;
 
 /// <https://fetch.spec.whatwg.org/#document-accept-header-value>
 pub const DOCUMENT_ACCEPT_HEADER_VALUE: HeaderValue =
@@ -137,6 +133,49 @@ pub enum ReferrerPolicy {
     StrictOriginWhenCrossOrigin,
 }
 
+impl ReferrerPolicy {
+    /// <https://html.spec.whatwg.org/multipage/#meta-referrer>
+    pub fn from_with_legacy(value: &str) -> Self {
+        // Step 5. If value is one of the values given in the first column of the following table,
+        // then set value to the value given in the second column:
+        match value.to_ascii_lowercase().as_str() {
+            "never" => ReferrerPolicy::NoReferrer,
+            "default" => ReferrerPolicy::StrictOriginWhenCrossOrigin,
+            "always" => ReferrerPolicy::UnsafeUrl,
+            "origin-when-crossorigin" => ReferrerPolicy::OriginWhenCrossOrigin,
+            _ => ReferrerPolicy::from(value),
+        }
+    }
+
+    /// <https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>
+    pub fn parse_header_for_response(headers: &Option<Serde<HeaderMap>>) -> Self {
+        // Step 4. Return policy.
+        headers
+            .as_ref()
+            // Step 1. Let policy-tokens be the result of extracting header list values given `Referrer-Policy` and response’s header list.
+            .and_then(|headers| headers.typed_get::<ReferrerPolicyHeader>())
+            // Step 2-3.
+            .into()
+    }
+}
+
+impl From<&str> for ReferrerPolicy {
+    /// <https://html.spec.whatwg.org/multipage/#referrer-policy-attribute>
+    fn from(value: &str) -> Self {
+        match value.to_ascii_lowercase().as_str() {
+            "no-referrer" => ReferrerPolicy::NoReferrer,
+            "no-referrer-when-downgrade" => ReferrerPolicy::NoReferrerWhenDowngrade,
+            "origin" => ReferrerPolicy::Origin,
+            "same-origin" => ReferrerPolicy::SameOrigin,
+            "strict-origin" => ReferrerPolicy::StrictOrigin,
+            "strict-origin-when-cross-origin" => ReferrerPolicy::StrictOriginWhenCrossOrigin,
+            "origin-when-cross-origin" => ReferrerPolicy::OriginWhenCrossOrigin,
+            "unsafe-url" => ReferrerPolicy::UnsafeUrl,
+            _ => ReferrerPolicy::EmptyString,
+        }
+    }
+}
+
 impl Display for ReferrerPolicy {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let string = match self {
@@ -154,8 +193,11 @@ impl Display for ReferrerPolicy {
     }
 }
 
+/// <https://w3c.github.io/webappsec-referrer-policy/#parse-referrer-policy-from-header>
 impl From<Option<ReferrerPolicyHeader>> for ReferrerPolicy {
     fn from(header: Option<ReferrerPolicyHeader>) -> Self {
+        // Step 2. Let policy be the empty string.
+        // Step 3. For each token in policy-tokens, if token is a referrer policy and token is not the empty string, then set policy to token.
         header.map_or(ReferrerPolicy::EmptyString, |policy| match policy {
             ReferrerPolicyHeader::NO_REFERRER => ReferrerPolicy::NoReferrer,
             ReferrerPolicyHeader::NO_REFERRER_WHEN_DOWNGRADE => {
@@ -201,9 +243,31 @@ pub enum FetchResponseMsg {
     ProcessRequestEOF(RequestId),
     // todo: send more info about the response (or perhaps the entire Response)
     ProcessResponse(RequestId, Result<FetchMetadata, NetworkError>),
-    ProcessResponseChunk(RequestId, Vec<u8>),
+    ProcessResponseChunk(RequestId, DebugVec),
     ProcessResponseEOF(RequestId, Result<ResourceFetchTiming, NetworkError>),
     ProcessCspViolations(RequestId, Vec<csp::Violation>),
+}
+
+#[derive(Deserialize, PartialEq, Serialize)]
+pub struct DebugVec(pub Vec<u8>);
+
+impl From<Vec<u8>> for DebugVec {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+impl std::ops::Deref for DebugVec {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DebugVec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("[...; {}]", self.0.len()))
+    }
 }
 
 impl FetchResponseMsg {
@@ -272,26 +336,18 @@ impl FetchMetadata {
             Self::Filtered { unsafe_, .. } => unsafe_,
         }
     }
-}
 
-pub trait FetchResponseListener {
-    fn process_request_body(&mut self, request_id: RequestId);
-    fn process_request_eof(&mut self, request_id: RequestId);
-    fn process_response(
-        &mut self,
-        request_id: RequestId,
-        metadata: Result<FetchMetadata, NetworkError>,
-    );
-    fn process_response_chunk(&mut self, request_id: RequestId, chunk: Vec<u8>);
-    fn process_response_eof(
-        &mut self,
-        request_id: RequestId,
-        response: Result<ResourceFetchTiming, NetworkError>,
-    );
-    fn resource_timing(&self) -> &ResourceFetchTiming;
-    fn resource_timing_mut(&mut self) -> &mut ResourceFetchTiming;
-    fn submit_resource_timing(&mut self);
-    fn process_csp_violations(&mut self, request_id: RequestId, violations: Vec<csp::Violation>);
+    /// <https://html.spec.whatwg.org/multipage/#cors-cross-origin>
+    pub fn is_cors_cross_origin(&self) -> bool {
+        if let Self::Filtered { filtered, .. } = self {
+            match filtered {
+                FilteredMetadata::Basic(_) | FilteredMetadata::Cors(_) => false,
+                FilteredMetadata::Opaque | FilteredMetadata::OpaqueRedirect(_) => true,
+            }
+        } else {
+            false
+        }
+    }
 }
 
 impl FetchTaskTarget for IpcSender<FetchResponseMsg> {
@@ -311,14 +367,17 @@ impl FetchTaskTarget for IpcSender<FetchResponseMsg> {
     }
 
     fn process_response_chunk(&mut self, request: &Request, chunk: Vec<u8>) {
-        let _ = self.send(FetchResponseMsg::ProcessResponseChunk(request.id, chunk));
+        let _ = self.send(FetchResponseMsg::ProcessResponseChunk(
+            request.id,
+            chunk.into(),
+        ));
     }
 
     fn process_response_eof(&mut self, request: &Request, response: &Response) {
         let payload = if let Some(network_error) = response.get_network_error() {
             Err(network_error.clone())
         } else {
-            Ok(response.get_resource_timing().lock().unwrap().clone())
+            Ok(response.get_resource_timing().lock().clone())
         };
 
         let _ = self.send(FetchResponseMsg::ProcessResponseEOF(request.id, payload));
@@ -328,6 +387,82 @@ impl FetchTaskTarget for IpcSender<FetchResponseMsg> {
         let _ = self.send(FetchResponseMsg::ProcessCspViolations(
             request.id, violations,
         ));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsSecurityState {
+    /// The connection used to fetch this resource was not secure.
+    #[default]
+    Insecure,
+    /// This resource was transferred over a connection that used weak encryption.
+    Weak,
+    /// A security error prevented the resource from being loaded.
+    Broken,
+    /// The connection used to fetch this resource was secure.
+    Secure,
+}
+
+impl Display for TlsSecurityState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let text = match self {
+            TlsSecurityState::Insecure => "insecure",
+            TlsSecurityState::Weak => "weak",
+            TlsSecurityState::Broken => "broken",
+            TlsSecurityState::Secure => "secure",
+        };
+        f.write_str(text)
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, MallocSizeOf, PartialEq, Serialize)]
+pub struct TlsSecurityInfo {
+    // "insecure", "weak", "broken", "secure".
+    #[serde(default)]
+    pub state: TlsSecurityState,
+    // Reasons explaining why the negotiated parameters are considered weak.
+    pub weakness_reasons: Vec<String>,
+    // Negotiated TLS protocol version (e.g. "TLS 1.3").
+    pub protocol_version: Option<String>,
+    // Negotiated cipher suite identifier.
+    pub cipher_suite: Option<String>,
+    // Negotiated key exchange group.
+    pub kea_group_name: Option<String>,
+    // Signature scheme used for certificate verification.
+    pub signature_scheme_name: Option<String>,
+    // Negotiated ALPN protocol (e.g. "h2" for HTTP/2, "http/1.1" for HTTP/1.1).
+    pub alpn_protocol: Option<String>,
+    // Server certificate chain encoded as DER bytes, leaf first.
+    pub certificate_chain_der: Vec<Vec<u8>>,
+    // Certificate Transparency status, if provided.
+    pub certificate_transparency: Option<String>,
+    // HTTP Strict Transport Security flag.
+    pub hsts: bool,
+    // HTTP Public Key Pinning flag (always false, kept for parity).
+    pub hpkp: bool,
+    // Encrypted Client Hello usage flag.
+    pub used_ech: bool,
+    // Delegated credentials usage flag.
+    pub used_delegated_credentials: bool,
+    // OCSP stapling usage flag.
+    pub used_ocsp: bool,
+    // Private DNS usage flag.
+    pub used_private_dns: bool,
+}
+
+impl FetchTaskTarget for IpcSender<WebSocketNetworkEvent> {
+    fn process_request_body(&mut self, _: &Request) {}
+    fn process_request_eof(&mut self, _: &Request) {}
+    fn process_response(&mut self, _: &Request, response: &Response) {
+        if response.is_network_error() {
+            let _ = self.send(WebSocketNetworkEvent::Fail);
+        }
+    }
+    fn process_response_chunk(&mut self, _: &Request, _: Vec<u8>) {}
+    fn process_response_eof(&mut self, _: &Request, _: &Response) {}
+    fn process_csp_violations(&mut self, _: &Request, violations: Vec<csp::Violation>) {
+        let _ = self.send(WebSocketNetworkEvent::ReportCSPViolations(violations));
     }
 }
 
@@ -345,51 +480,6 @@ impl FetchTaskTarget for DiscardFetch {
     fn process_csp_violations(&mut self, _: &Request, _: Vec<csp::Violation>) {}
 }
 
-pub trait Action<Listener> {
-    fn process(self, listener: &mut Listener);
-}
-
-impl<T: FetchResponseListener> Action<T> for FetchResponseMsg {
-    /// Execute the default action on a provided listener.
-    fn process(self, listener: &mut T) {
-        match self {
-            FetchResponseMsg::ProcessRequestBody(request_id) => {
-                listener.process_request_body(request_id)
-            },
-            FetchResponseMsg::ProcessRequestEOF(request_id) => {
-                listener.process_request_eof(request_id)
-            },
-            FetchResponseMsg::ProcessResponse(request_id, meta) => {
-                listener.process_response(request_id, meta)
-            },
-            FetchResponseMsg::ProcessResponseChunk(request_id, data) => {
-                listener.process_response_chunk(request_id, data)
-            },
-            FetchResponseMsg::ProcessResponseEOF(request_id, data) => {
-                match data {
-                    Ok(ref response_resource_timing) => {
-                        // update listener with values from response
-                        *listener.resource_timing_mut() = response_resource_timing.clone();
-                        listener
-                            .process_response_eof(request_id, Ok(response_resource_timing.clone()));
-                        // TODO timing check https://w3c.github.io/resource-timing/#dfn-timing-allow-check
-
-                        listener.submit_resource_timing();
-                    },
-                    // TODO Resources for which the fetch was initiated, but was later aborted
-                    // (e.g. due to a network error) MAY be included as PerformanceResourceTiming
-                    // objects in the Performance Timeline and MUST contain initialized attribute
-                    // values for processed substeps of the processing model.
-                    Err(e) => listener.process_response_eof(request_id, Err(e)),
-                }
-            },
-            FetchResponseMsg::ProcessCspViolations(request_id, violations) => {
-                listener.process_csp_violations(request_id, violations)
-            },
-        }
-    }
-}
-
 /// Handle to an async runtime,
 /// only used to shut it down for now.
 pub trait AsyncRuntime: Send {
@@ -399,21 +489,6 @@ pub trait AsyncRuntime: Send {
 /// Handle to a resource thread
 pub type CoreResourceThread = IpcSender<CoreResourceMsg>;
 
-pub type IpcSendResult = Result<(), IpcError>;
-
-/// Abstraction of the ability to send a particular type of message,
-/// used by net_traits::ResourceThreads to ease the use its IpcSender sub-fields
-/// XXX: If this trait will be used more in future, some auto derive might be appealing
-pub trait IpcSend<T>
-where
-    T: serde::Serialize + for<'de> serde::Deserialize<'de>,
-{
-    /// send message T
-    fn send(&self, _: T) -> IpcSendResult;
-    /// get underlying sender
-    fn sender(&self) -> IpcSender<T>;
-}
-
 // FIXME: Originally we will construct an Arc<ResourceThread> from ResourceThread
 // in script_thread to avoid some performance pitfall. Now we decide to deal with
 // the "Arc" hack implicitly in future.
@@ -422,55 +497,49 @@ where
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ResourceThreads {
     pub core_thread: CoreResourceThread,
-    storage_thread: GenericSender<StorageThreadMsg>,
-    idb_thread: IpcSender<IndexedDBThreadMsg>,
 }
 
 impl ResourceThreads {
-    pub fn new(
-        c: CoreResourceThread,
-        s: GenericSender<StorageThreadMsg>,
-        i: IpcSender<IndexedDBThreadMsg>,
-    ) -> ResourceThreads {
-        ResourceThreads {
-            core_thread: c,
-            storage_thread: s,
-            idb_thread: i,
-        }
+    pub fn new(core_thread: CoreResourceThread) -> ResourceThreads {
+        ResourceThreads { core_thread }
     }
 
     pub fn clear_cache(&self) {
-        let _ = self.core_thread.send(CoreResourceMsg::ClearCache);
+        // NOTE: Messages used in these methods are currently handled
+        // synchronously on the backend without consulting other threads, so
+        // waiting for the response here cannot deadlock. If the backend
+        // handling ever becomes asynchronous or involves sending messages
+        // back to the originating thread, this code will need to be revisited
+        // to avoid potential deadlocks.
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let _ = self
+            .core_thread
+            .send(CoreResourceMsg::ClearCache(Some(sender)));
+        let _ = receiver.recv();
+    }
+
+    pub fn cookies(&self) -> Vec<SiteDescriptor> {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        let _ = self.core_thread.send(CoreResourceMsg::ListCookies(sender));
+        receiver.recv().unwrap()
+    }
+
+    pub fn clear_cookies(&self) {
+        let (sender, receiver) = ipc::channel().unwrap();
+        let _ = self
+            .core_thread
+            .send(CoreResourceMsg::DeleteCookies(None, Some(sender)));
+        let _ = receiver.recv();
     }
 }
 
 impl IpcSend<CoreResourceMsg> for ResourceThreads {
     fn send(&self, msg: CoreResourceMsg) -> IpcSendResult {
-        self.core_thread.send(msg)
+        self.core_thread.send(msg).map_err(IpcError::Bincode)
     }
 
     fn sender(&self) -> IpcSender<CoreResourceMsg> {
         self.core_thread.clone()
-    }
-}
-
-impl IpcSend<IndexedDBThreadMsg> for ResourceThreads {
-    fn send(&self, msg: IndexedDBThreadMsg) -> IpcSendResult {
-        self.idb_thread.send(msg)
-    }
-
-    fn sender(&self) -> IpcSender<IndexedDBThreadMsg> {
-        self.idb_thread.clone()
-    }
-}
-
-impl GenericSend<StorageThreadMsg> for ResourceThreads {
-    fn send(&self, msg: StorageThreadMsg) -> SendResult {
-        self.storage_thread.send(msg)
-    }
-
-    fn sender(&self) -> GenericSender<StorageThreadMsg> {
-        self.storage_thread.clone()
     }
 }
 
@@ -543,11 +612,12 @@ pub enum CoreResourceMsg {
     ),
     GetCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
     GetAllCookieDataForUrlAsync(CookieStoreId, ServoUrl, Option<String>),
-    DeleteCookies(ServoUrl),
+    DeleteCookies(Option<ServoUrl>, Option<IpcSender<()>>),
     DeleteCookie(ServoUrl, String),
     DeleteCookieAsync(CookieStoreId, ServoUrl, String),
     NewCookieListener(CookieStoreId, IpcSender<CookieAsyncResponse>, ServoUrl),
     RemoveCookieListener(CookieStoreId),
+    ListCookies(GenericSender<Vec<SiteDescriptor>>),
     /// Get a history state by a given history state id
     GetHistoryState(HistoryStateId, IpcSender<Option<Vec<u8>>>),
     /// Set a history state for a given history state id
@@ -555,7 +625,7 @@ pub enum CoreResourceMsg {
     /// Removes history states for the given ids
     RemoveHistoryStates(Vec<HistoryStateId>),
     /// Clear the network cache.
-    ClearCache,
+    ClearCache(Option<GenericSender<()>>),
     /// Send the service worker network mediator for an origin to CoreResourceThread
     NetworkMediator(IpcSender<CustomResponseMediator>, ImmutableOrigin),
     /// Message forwarded to file manager's handler
@@ -563,6 +633,17 @@ pub enum CoreResourceMsg {
     /// Break the load handler loop, send a reply when done cleaning up local resources
     /// and exit
     Exit(IpcSender<()>),
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SiteDescriptor {
+    pub name: String,
+}
+
+impl SiteDescriptor {
+    pub fn new(name: String) -> Self {
+        SiteDescriptor { name }
+    }
 }
 
 // FIXME: https://github.com/servo/servo/issues/34591
@@ -588,7 +669,7 @@ pub type BoxedFetchCallback = Box<dyn FnMut(FetchResponseMsg) + Send + 'static>;
 struct FetchThread {
     /// A list of active fetches. A fetch is no longer active once the
     /// [`FetchResponseMsg::ProcessResponseEOF`] is received.
-    active_fetches: HashMap<RequestId, BoxedFetchCallback>,
+    active_fetches: FxHashMap<RequestId, BoxedFetchCallback>,
     /// A crossbeam receiver attached to the router proxy which converts incoming fetch
     /// updates from IPC messages to crossbeam messages as well as another sender which
     /// handles requests from clients wanting to do fetches.
@@ -615,7 +696,7 @@ impl FetchThread {
             .name("FetchThread".to_owned())
             .spawn(move || {
                 let mut fetch_thread = FetchThread {
-                    active_fetches: HashMap::new(),
+                    active_fetches: FxHashMap::default(),
                     receiver,
                     to_fetch_sender,
                 };
@@ -651,7 +732,12 @@ impl FetchThread {
 
                     core_resource_thread.send(message).unwrap();
 
-                    self.active_fetches.insert(request_builder_id, callback);
+                    let preexisting_fetch =
+                        self.active_fetches.insert(request_builder_id, callback);
+                    // When we terminate a fetch group, all deferred fetches are processed.
+                    // In case we were already processing a deferred fetch, we should not
+                    // process the second call. This should be handled by [`DeferredFetchRecord::process`]
+                    assert!(preexisting_fetch.is_none());
                 },
                 ToFetchThreadMessage::FetchResponse(fetch_response_msg) => {
                     let request_id = fetch_response_msg.request_id();
@@ -761,7 +847,6 @@ pub struct ResourceFetchTiming {
 }
 
 pub enum RedirectStartValue {
-    #[allow(dead_code)]
     Zero,
     FetchStart,
 }
@@ -922,6 +1007,8 @@ pub struct Metadata {
     pub timing: Option<ResourceFetchTiming>,
     /// True if the request comes from a redirection
     pub redirected: bool,
+    /// Detailed TLS metadata associated with the response, if any.
+    pub tls_security_info: Option<TlsSecurityInfo>,
 }
 
 impl Metadata {
@@ -939,6 +1026,7 @@ impl Metadata {
             referrer_policy: ReferrerPolicy::EmptyString,
             timing: None,
             redirected: false,
+            tls_security_info: None,
         }
     }
 
@@ -1084,7 +1172,10 @@ pub fn http_percent_encode(bytes: &[u8]) -> String {
     percent_encoding::percent_encode(bytes, HTTP_VALUE).to_string()
 }
 
+/// Step 12 of <https://fetch.spec.whatwg.org/#concept-fetch>
 pub fn set_default_accept_language(headers: &mut HeaderMap) {
+    // If request’s header list does not contain `Accept-Language`,
+    // then user agents should append (`Accept-Language, an appropriate header value) to request’s header list.
     if headers.contains_key(header::ACCEPT_LANGUAGE) {
         return;
     }
@@ -1096,5 +1187,4 @@ pub fn set_default_accept_language(headers: &mut HeaderMap) {
     );
 }
 
-pub static PRIVILEGED_SECRET: LazyLock<u32> =
-    LazyLock::new(|| servo_rand::ServoRng::default().next_u32());
+pub static PRIVILEGED_SECRET: LazyLock<u32> = LazyLock::new(|| rng().next_u32());

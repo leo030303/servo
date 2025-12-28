@@ -14,8 +14,8 @@ use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as Devtoo
 use headers::{ContentLength, ContentType, Cookie, HeaderMapExt};
 use http::{HeaderMap, Method};
 use net::cookie::ServoCookie;
-use net_traits::CookieSource;
-use net_traits::request::Destination as RequestDestination;
+use net_traits::request::{Destination as RequestDestination, RequestHeadersSize};
+use net_traits::{CookieSource, TlsSecurityInfo, TlsSecurityState};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use servo_url::ServoUrl;
@@ -45,8 +45,10 @@ pub struct NetworkEventActor {
     pub response_start: Option<ResponseStartMsg>,
     pub response_cookies: Option<ResponseCookiesMsg>,
     pub response_headers: Option<ResponseHeadersMsg>,
+    pub cache_details: Option<CacheDetails>,
     pub total_time: Duration,
     pub security_state: String,
+    pub security_info: Option<TlsSecurityInfo>,
     pub event_timing: Option<Timings>,
     pub watcher_name: String,
 }
@@ -106,6 +108,13 @@ pub struct ResponseContentMsg {
 pub struct ResponseHeadersMsg {
     pub headers: usize,
     pub headers_size: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheDetails {
+    from_cache: bool,
+    from_service_worker: bool,
 }
 
 #[derive(Serialize)]
@@ -223,9 +232,131 @@ struct GetEventTimingsReply {
     total_time: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CertificateIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    common_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organizational_unit: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CertificateValidity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime: Option<String>,
+    expired: bool,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct CertificateFingerprint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha1: Option<String>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct SecurityCertificate {
+    subject: CertificateIdentity,
+    issuer: CertificateIdentity,
+    validity: CertificateValidity,
+    fingerprint: CertificateFingerprint,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_built_in_root: Option<bool>,
+}
+
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct SecurityInfo {
     state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    weakness_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cipher_suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kea_group_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature_scheme_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alpn_protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_transparency: Option<String>,
+    hsts: bool,
+    hpkp: bool,
+    used_ech: bool,
+    used_delegated_credentials: bool,
+    used_ocsp: bool,
+    used_private_dns: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    certificate_chain: Vec<String>,
+    cert: SecurityCertificate,
+}
+
+impl SecurityInfo {
+    fn from_tls(info: &TlsSecurityInfo) -> Self {
+        Self {
+            state: info.state.to_string(),
+            weakness_reasons: info.weakness_reasons.clone(),
+            protocol_version: info.protocol_version.clone(),
+            cipher_suite: info.cipher_suite.clone(),
+            kea_group_name: info.kea_group_name.clone(),
+            signature_scheme_name: info.signature_scheme_name.clone(),
+            alpn_protocol: info.alpn_protocol.clone(),
+            certificate_transparency: info
+                .certificate_transparency
+                .clone()
+                .or_else(|| Some("unknown".to_string())),
+            hsts: info.hsts,
+            hpkp: info.hpkp,
+            used_ech: info.used_ech,
+            used_delegated_credentials: info.used_delegated_credentials,
+            used_ocsp: info.used_ocsp,
+            used_private_dns: info.used_private_dns,
+            certificate_chain: Vec::new(),
+            cert: SecurityCertificate {
+                subject: CertificateIdentity {
+                    name: None,
+                    common_name: None,
+                    organization: None,
+                    organizational_unit: None,
+                },
+                issuer: CertificateIdentity {
+                    name: None,
+                    common_name: None,
+                    organization: None,
+                    organizational_unit: None,
+                },
+                validity: CertificateValidity {
+                    start: None,
+                    end: None,
+                    lifetime: None,
+                    expired: false,
+                },
+                fingerprint: CertificateFingerprint {
+                    sha256: None,
+                    sha1: None,
+                },
+                serial_number: None,
+                is_built_in_root: None,
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -361,7 +492,7 @@ impl Actor for NetworkEventActor {
                         // Queue a LongStringActor for this body
                         let long_string_actor = LongStringActor::new(registry, full_str);
                         let long_string_obj = long_string_actor.long_string_obj();
-                        registry.register_later(Box::new(long_string_actor));
+                        registry.register_later(long_string_actor);
 
                         ResponseContentObj {
                             mime_type,
@@ -408,12 +539,16 @@ impl Actor for NetworkEventActor {
                 request.reply_final(&msg)?
             },
             "getSecurityInfo" => {
-                // TODO: Send the correct values for securityInfo.
                 let msg = GetSecurityInfoReply {
                     from: self.name(),
-                    security_info: SecurityInfo {
-                        state: "insecure".to_owned(),
-                    },
+                    security_info: self
+                        .security_info
+                        .as_ref()
+                        .map(SecurityInfo::from_tls)
+                        .unwrap_or_else(|| SecurityInfo {
+                            state: self.security_state.clone(),
+                            ..Default::default()
+                        }),
                 };
                 request.reply_final(&msg)?
             },
@@ -447,8 +582,10 @@ impl NetworkEventActor {
             response_start: None,
             response_cookies: None,
             response_headers: None,
+            cache_details: None,
             total_time: Duration::ZERO,
             security_state: "insecure".to_owned(),
+            security_info: None,
             event_timing: None,
             watcher_name,
         }
@@ -465,7 +602,7 @@ impl NetworkEventActor {
         self.request_started = request.started_date_time;
         self.request_time_stamp = request.time_stamp;
         self.request_destination = request.destination;
-        self.request_body = request.body.clone();
+        self.request_body = request.body.as_ref().map(|b| b.0.clone());
         self.request_headers_raw = Some(request.headers.clone());
     }
 
@@ -480,6 +617,16 @@ impl NetworkEventActor {
             self.response_content = Some(response_content);
         }
         self.response_headers_raw = response.headers.clone();
+        self.cache_details = Some(Self::cache_details(&response));
+    }
+
+    pub fn update_security_info(&mut self, security_info: Option<TlsSecurityInfo>) {
+        self.security_state = security_info
+            .as_ref()
+            .map(|info| info.state)
+            .unwrap_or(TlsSecurityState::Insecure)
+            .to_string();
+        self.security_info = security_info;
     }
 
     pub fn event_actor(&self) -> EventActor {
@@ -534,7 +681,7 @@ impl NetworkEventActor {
         response: &DevtoolsHttpResponse,
     ) -> Option<ResponseContentMsg> {
         let body = response.body.as_ref()?;
-        self.response_body = Some(body.clone());
+        self.response_body = Some(body.0.clone());
 
         let mime_type = response
             .headers
@@ -568,7 +715,7 @@ impl NetworkEventActor {
             .get_all("set-cookie")
             .iter()
             .filter_map(|cookie| {
-                let cookie_str = String::from_utf8(cookie.as_bytes().to_vec()).ok()?;
+                let cookie_str = std::str::from_utf8(cookie.as_bytes()).ok()?;
                 ServoCookie::from_cookie_string(cookie_str, url, CookieSource::HTTP)
             })
             .map(|servo_cookie| {
@@ -604,12 +751,9 @@ impl NetworkEventActor {
     }
 
     pub fn request_headers(request: &DevtoolsHttpRequest) -> RequestHeadersMsg {
-        let size = request.headers.iter().fold(0, |acc, (name, value)| {
-            acc + name.as_str().len() + value.len()
-        });
         RequestHeadersMsg {
             headers: request.headers.len(),
-            headers_size: size,
+            headers_size: request.headers.total_size(),
         }
     }
 
@@ -623,6 +767,13 @@ impl NetworkEventActor {
             })
             .collect::<Vec<_>>();
         Some(RequestCookiesMsg { cookies })
+    }
+
+    pub fn cache_details(response: &DevtoolsHttpResponse) -> CacheDetails {
+        CacheDetails {
+            from_cache: response.from_cache,
+            from_service_worker: false,
+        }
     }
 
     pub fn total_time(request: &DevtoolsHttpRequest) -> Duration {
@@ -700,6 +851,10 @@ impl NetworkEventActor {
             Value::String(self.security_state.clone()),
         );
         resource_updates.insert(
+            "securityInfoAvailable".to_string(),
+            Value::Bool(self.security_info.is_some()),
+        );
+        resource_updates.insert(
             "eventTimingsAvailable".to_owned(),
             Value::Bool(self.event_timing.is_some()),
         );
@@ -710,6 +865,7 @@ impl NetworkEventActor {
         Self::insert_serialized_map(&mut resource_updates, &self.request_headers);
         Self::insert_serialized_map(&mut resource_updates, &self.request_cookies);
         Self::insert_serialized_map(&mut resource_updates, &self.response_start);
+        Self::insert_serialized_map(&mut resource_updates, &self.cache_details);
         Self::insert_serialized_map(&mut resource_updates, &self.event_timing);
 
         // TODO: Set the correct values for these fields

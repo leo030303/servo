@@ -33,7 +33,7 @@ use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::domrect::DOMRect;
 use crate::dom::domrectlist::DOMRectList;
 use crate::dom::element::Element;
-use crate::dom::htmlscriptelement::HTMLScriptElement;
+use crate::dom::html::htmlscriptelement::HTMLScriptElement;
 use crate::dom::node::{Node, NodeTraits, ShadowIncluding, UnbindContext};
 use crate::dom::selection::Selection;
 use crate::dom::text::Text;
@@ -193,7 +193,7 @@ impl Range {
 
         // Step 12.
         if contained_children.iter().any(|n| n.is_doctype()) {
-            return Err(Error::HierarchyRequest);
+            return Err(Error::HierarchyRequest(None));
         }
 
         Ok(ContainedChildren {
@@ -252,15 +252,15 @@ impl Range {
             .unwrap();
         if start_node_root != node_root {
             // Step 1.
-            return Err(Error::WrongDocument);
+            return Err(Error::WrongDocument(None));
         }
         if node.is_doctype() {
             // Step 2.
-            return Err(Error::InvalidNodeType);
+            return Err(Error::InvalidNodeType(None));
         }
         if offset > node.len() {
             // Step 3.
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
         if let Ordering::Less = bp_position(node, offset, &start_node, self.start_offset()).unwrap()
         {
@@ -355,12 +355,12 @@ impl Range {
     ) -> ErrorResult {
         // Step 1. If node is a doctype, then throw an "InvalidNodeTypeError" DOMException.
         if node.is_doctype() {
-            return Err(Error::InvalidNodeType);
+            return Err(Error::InvalidNodeType(None));
         }
 
         // Step 2. If offset is greater than node’s length, then throw an "IndexSizeError" DOMException.
         if offset > node.len() {
-            return Err(Error::IndexSize);
+            return Err(Error::IndexSize(None));
         }
 
         // Step 3. Let bp be the boundary point (node, offset).
@@ -428,25 +428,25 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
 
     /// <https://dom.spec.whatwg.org/#dom-range-setstartbefore>
     fn SetStartBefore(&self, node: &Node) -> ErrorResult {
-        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType)?;
+        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType(None))?;
         self.SetStart(&parent, node.index())
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-setstartafter>
     fn SetStartAfter(&self, node: &Node) -> ErrorResult {
-        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType)?;
+        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType(None))?;
         self.SetStart(&parent, node.index() + 1)
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-setendbefore>
     fn SetEndBefore(&self, node: &Node) -> ErrorResult {
-        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType)?;
+        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType(None))?;
         self.SetEnd(&parent, node.index())
     }
 
     /// <https://dom.spec.whatwg.org/#dom-range-setendafter>
     fn SetEndAfter(&self, node: &Node) -> ErrorResult {
-        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType)?;
+        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType(None))?;
         self.SetEnd(&parent, node.index() + 1)
     }
 
@@ -462,7 +462,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     /// <https://dom.spec.whatwg.org/#dom-range-selectnode>
     fn SelectNode(&self, node: &Node) -> ErrorResult {
         // Steps 1, 2.
-        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType)?;
+        let parent = node.GetParentNode().ok_or(Error::InvalidNodeType(None))?;
         // Step 3.
         let index = node.index();
         // Step 4.
@@ -476,7 +476,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     fn SelectNodeContents(&self, node: &Node) -> ErrorResult {
         if node.is_doctype() {
             // Step 1.
-            return Err(Error::InvalidNodeType);
+            return Err(Error::InvalidNodeType(None));
         }
         // Step 2.
         let length = node.len();
@@ -491,7 +491,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
     fn CompareBoundaryPoints(&self, how: u16, other: &Range) -> Fallible<i16> {
         if how > RangeConstants::END_TO_START {
             // Step 1.
-            return Err(Error::NotSupported);
+            return Err(Error::NotSupported(None));
         }
         let this_root = self
             .start_container()
@@ -505,7 +505,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             .unwrap();
         if this_root != other_root {
             // Step 2.
-            return Err(Error::WrongDocument);
+            return Err(Error::WrongDocument(None));
         }
         // Step 3.
         let (this_point, other_point) = match how {
@@ -543,7 +543,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             Ok(Ordering::Less) => Ok(false),
             Ok(Ordering::Equal) => Ok(true),
             Ok(Ordering::Greater) => Ok(false),
-            Err(Error::WrongDocument) => {
+            Err(Error::WrongDocument(None)) => {
                 // Step 2.
                 Ok(false)
             },
@@ -855,12 +855,12 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
 
         // Step 1.
         if &*start_node == node {
-            return Err(Error::HierarchyRequest);
+            return Err(Error::HierarchyRequest(None));
         }
         match start_node.type_id() {
             // Handled under step 2.
             NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => (),
-            NodeTypeId::CharacterData(_) => return Err(Error::HierarchyRequest),
+            NodeTypeId::CharacterData(_) => return Err(Error::HierarchyRequest(None)),
             _ => (),
         }
 
@@ -871,7 +871,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                 let parent = match start_node.GetParentNode() {
                     Some(parent) => parent,
                     // Step 1.
-                    None => return Err(Error::HierarchyRequest),
+                    None => return Err(Error::HierarchyRequest(None)),
                 };
                 // Step 5.
                 (Some(DomRoot::from_ref(&*start_node)), parent)
@@ -1028,7 +1028,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             end.inclusive_ancestors(ShadowIncluding::No)
                 .any(|n| !n.is_inclusive_ancestor_of(&start) && !n.is::<Text>())
         {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Step 2.
@@ -1036,7 +1036,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             NodeTypeId::Document(_) |
             NodeTypeId::DocumentType |
             NodeTypeId::DocumentFragment(_) => {
-                return Err(Error::InvalidNodeType);
+                return Err(Error::InvalidNodeType(None));
             },
             _ => (),
         }
@@ -1082,7 +1082,8 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
                         self.start_offset(),
                         char_data.Length() - self.start_offset(),
                     )
-                    .unwrap(),
+                    .unwrap()
+                    .str(),
             );
         }
 
@@ -1094,14 +1095,14 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
 
         for child in iter {
             if self.contains(child.upcast()) {
-                s.push_str(&child.upcast::<CharacterData>().Data());
+                s.push_str(&child.upcast::<CharacterData>().Data().str());
             }
         }
 
         // Step 5.
         if let Some(text_node) = end_node.downcast::<Text>() {
             let char_data = text_node.upcast::<CharacterData>();
-            s.push_str(&char_data.SubstringData(0, self.end_offset()).unwrap());
+            s.push_str(&char_data.SubstringData(0, self.end_offset()).unwrap().str());
         }
 
         // Step 6.
@@ -1119,6 +1120,7 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
         // Required to obtain the global, so we do this first. Shouldn't be an
         // observable difference.
         let node = self.start_container();
+
         // Step 1. Let compliantString be the result of invoking the
         // Get Trusted Type compliant string algorithm with TrustedHTML,
         // this's relevant global object, string, "Range createContextualFragment", and "script".
@@ -1128,18 +1130,17 @@ impl RangeMethods<crate::DomTypeHolder> for Range {
             "Range createContextualFragment",
             can_gc,
         )?;
+
         let owner_doc = node.owner_doc();
+
+        // Step 3. Let element be null.
+        // Step 4. If node implements Element, set element to node.
+        // Step 5. Otherwise, if node implements Text or Comment, set element to node's parent element.
         let element = match node.type_id() {
-            // Step 3. Let element be null.
-            NodeTypeId::Document(_) | NodeTypeId::DocumentFragment(_) => None,
-            // Step 4. If node implements Element, set element to node.
             NodeTypeId::Element(_) => Some(DomRoot::downcast::<Element>(node).unwrap()),
-            // Step 5. Otherwise, if node implements Text or Comment, set element to node's parent element.
             NodeTypeId::CharacterData(CharacterDataTypeId::Comment) |
             NodeTypeId::CharacterData(CharacterDataTypeId::Text(_)) => node.GetParentElement(),
-            NodeTypeId::CharacterData(CharacterDataTypeId::ProcessingInstruction) |
-            NodeTypeId::DocumentType => unreachable!(),
-            NodeTypeId::Attr => unreachable!(),
+            _ => None,
         };
 
         // Step 6. If element is null or all of the following are true:
@@ -1224,7 +1225,6 @@ impl Default for WeakRangeVec {
     }
 }
 
-#[allow(unsafe_code)]
 impl WeakRangeVec {
     /// Whether that vector of ranges is empty.
     pub(crate) fn is_empty(&self) -> bool {
@@ -1462,7 +1462,7 @@ impl WeakRangeVec {
     }
 }
 
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 unsafe impl JSTraceable for WeakRangeVec {
     unsafe fn trace(&self, _: *mut JSTracer) {
         self.cell.borrow_mut().retain_alive()

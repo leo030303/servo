@@ -22,7 +22,7 @@ use crate::dom::readablestreamdefaultreader::ReadRequest;
 use crate::script_runtime::{CanGc, JSContext as SafeJSContext};
 
 #[derive(JSTraceable, MallocSizeOf)]
-pub(crate) enum TeeCancelAlgorithm {
+pub(crate) enum DefaultTeeCancelAlgorithm {
     Cancel1Algorithm,
     Cancel2Algorithm,
 }
@@ -35,30 +35,30 @@ pub(crate) struct DefaultTeeUnderlyingSource {
     stream: Dom<ReadableStream>,
     branch_1: MutNullableDom<ReadableStream>,
     branch_2: MutNullableDom<ReadableStream>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     reading: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     read_again: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     canceled_1: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     canceled_2: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     clone_for_branch_2: Rc<Cell<bool>>,
-    #[ignore_malloc_size_of = "Rc"]
-    #[allow(clippy::redundant_allocation)]
+    #[ignore_malloc_size_of = "mozjs"]
+    #[expect(clippy::redundant_allocation)]
     reason_1: Rc<Box<Heap<Value>>>,
-    #[ignore_malloc_size_of = "Rc"]
-    #[allow(clippy::redundant_allocation)]
+    #[ignore_malloc_size_of = "mozjs"]
+    #[expect(clippy::redundant_allocation)]
     reason_2: Rc<Box<Heap<Value>>>,
-    #[ignore_malloc_size_of = "Rc"]
+    #[conditional_malloc_size_of]
     cancel_promise: Rc<Promise>,
-    tee_cancel_algorithm: TeeCancelAlgorithm,
+    tee_cancel_algorithm: DefaultTeeCancelAlgorithm,
 }
 
 impl DefaultTeeUnderlyingSource {
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::redundant_allocation)]
+    #[expect(clippy::too_many_arguments)]
+    #[expect(clippy::redundant_allocation)]
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn new(
         reader: &ReadableStreamDefaultReader,
@@ -71,7 +71,7 @@ impl DefaultTeeUnderlyingSource {
         reason_1: Rc<Box<Heap<Value>>>,
         reason_2: Rc<Box<Heap<Value>>>,
         cancel_promise: Rc<Promise>,
-        tee_cancel_algorithm: TeeCancelAlgorithm,
+        tee_cancel_algorithm: DefaultTeeCancelAlgorithm,
         can_gc: CanGc,
     ) -> DomRoot<DefaultTeeUnderlyingSource> {
         reflect_dom_object(
@@ -153,7 +153,6 @@ impl DefaultTeeUnderlyingSource {
     /// Let cancel1Algorithm be the following steps, taking a reason argument
     /// and
     /// Let cancel2Algorithm be the following steps, taking a reason argument
-    #[allow(unsafe_code)]
     pub(crate) fn cancel_algorithm(
         &self,
         cx: SafeJSContext,
@@ -162,7 +161,7 @@ impl DefaultTeeUnderlyingSource {
         can_gc: CanGc,
     ) -> Option<Result<Rc<Promise>, Error>> {
         match self.tee_cancel_algorithm {
-            TeeCancelAlgorithm::Cancel1Algorithm => {
+            DefaultTeeCancelAlgorithm::Cancel1Algorithm => {
                 // Set canceled_1 to true.
                 self.canceled_1.set(true);
 
@@ -176,7 +175,7 @@ impl DefaultTeeUnderlyingSource {
                 // Return cancelPromise.
                 Some(Ok(self.cancel_promise.clone()))
             },
-            TeeCancelAlgorithm::Cancel2Algorithm => {
+            DefaultTeeCancelAlgorithm::Cancel2Algorithm => {
                 // Set canceled_2 to true.
                 self.canceled_2.set(true);
 
@@ -193,7 +192,7 @@ impl DefaultTeeUnderlyingSource {
         }
     }
 
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn resolve_cancel_promise(&self, cx: SafeJSContext, global: &GlobalScope, can_gc: CanGc) {
         // Let compositeReason be ! CreateArrayFromList(« reason_1, reason_2 »).
         rooted_vec!(let mut reasons_values);

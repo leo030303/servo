@@ -10,6 +10,7 @@ use js::jsapi::{Heap, IsPromiseObject, JSObject};
 use js::jsval::{JSVal, UndefinedValue};
 use js::rust::{Handle as SafeHandle, HandleObject, HandleValue as SafeHandleValue, IntoHandle};
 
+use super::byteteeunderlyingsource::ByteTeeUnderlyingSource;
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSourceBinding::UnderlyingSource as JsUnderlyingSource;
 use crate::dom::bindings::codegen::UnionTypes::ReadableStreamDefaultControllerOrReadableByteStreamController as Controller;
@@ -48,6 +49,8 @@ pub(crate) enum UnderlyingSourceType {
     /// and the actual JS object for use as `thisArg` in callbacks.
     /// This is used for the `TransformStream` API.
     Transform(Dom<TransformStream>, Rc<Promise>),
+    // Tee Byte
+    TeeByte(Dom<ByteTeeUnderlyingSource>),
 }
 
 impl UnderlyingSourceType {
@@ -112,7 +115,7 @@ impl UnderlyingSourceContainer {
     }
 
     /// <https://streams.spec.whatwg.org/#dom-underlyingsource-cancel>
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn call_cancel_algorithm(
         &self,
         cx: SafeJSContext,
@@ -165,12 +168,16 @@ impl UnderlyingSourceContainer {
                 }
                 Some(Ok(promise))
             },
+            UnderlyingSourceType::TeeByte(tee_underlyin_source) => {
+                // Call the cancel algorithm for the appropriate branch.
+                tee_underlyin_source.cancel_algorithm(reason, can_gc)
+            },
             _ => None,
         }
     }
 
     /// <https://streams.spec.whatwg.org/#dom-underlyingsource-pull>
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn call_pull_algorithm(
         &self,
         controller: Controller,
@@ -212,6 +219,10 @@ impl UnderlyingSourceContainer {
                 promise.resolve_native(&(), can_gc);
                 Some(Ok(promise))
             },
+            UnderlyingSourceType::TeeByte(tee_underlyin_source) => {
+                // Call the pull algorithm for the appropriate branch.
+                Some(Ok(tee_underlyin_source.pull_algorithm(None, can_gc)))
+            },
             // Note: other source type have no pull steps for now.
             UnderlyingSourceType::Transform(stream, _) => {
                 // Return ! TransformStreamDefaultSourcePullAlgorithm(stream).
@@ -228,7 +239,7 @@ impl UnderlyingSourceContainer {
     /// and it is also how to spec deals with the situation.
     /// see "Let startPromise be a promise resolved with startResult."
     /// at <https://streams.spec.whatwg.org/#set-up-readable-stream-default-controller>
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn call_start_algorithm(
         &self,
         controller: Controller,

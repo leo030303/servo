@@ -36,11 +36,10 @@ use crate::dom::event::{Event, EventBubbles, EventCancelable};
 use crate::dom::eventtarget::EventTarget;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::progressevent::ProgressEvent;
-use crate::realms::{InRealm, enter_realm};
+use crate::realms::enter_realm;
 use crate::script_runtime::{CanGc, JSContext};
 use crate::task::TaskOnce;
 
-#[allow(dead_code)]
 pub(crate) enum FileReadingTask {
     ProcessRead(TrustedFileReader, GenerationId),
     ProcessReadData(TrustedFileReader, GenerationId),
@@ -315,7 +314,7 @@ impl FileReader {
         return_on_abort!();
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-readAsText
+    /// <https://w3c.github.io/FileAPI/#dfn-readAsText>
     fn perform_readastext(
         result: &DomRefCell<Option<FileReaderResult>>,
         data: ReadMetaData,
@@ -328,7 +327,7 @@ impl FileReader {
         *result.borrow_mut() = Some(FileReaderResult::String(output));
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-readAsDataURL
+    /// <https://w3c.github.io/FileAPI/#dfn-readAsDataURL>
     fn perform_readasdataurl(
         result: &DomRefCell<Option<FileReaderResult>>,
         data: ReadMetaData,
@@ -340,7 +339,7 @@ impl FileReader {
     }
 
     // https://w3c.github.io/FileAPI/#dfn-readAsArrayBuffer
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     fn perform_readasarraybuffer(
         result: &DomRefCell<Option<FileReaderResult>>,
         cx: JSContext,
@@ -365,7 +364,7 @@ impl FileReader {
 }
 
 impl FileReaderMethods<crate::DomTypeHolder> for FileReader {
-    // https://w3c.github.io/FileAPI/#filereaderConstrctr
+    /// <https://w3c.github.io/FileAPI/#filereaderConstrctr>
     fn Constructor(
         global: &GlobalScope,
         proto: Option<HandleObject>,
@@ -393,27 +392,21 @@ impl FileReaderMethods<crate::DomTypeHolder> for FileReader {
     event_handler!(loadend, GetOnloadend, SetOnloadend);
 
     // https://w3c.github.io/FileAPI/#dfn-readAsArrayBuffer
-    fn ReadAsArrayBuffer(&self, blob: &Blob, realm: InRealm, can_gc: CanGc) -> ErrorResult {
-        self.read(FileReaderFunction::ArrayBuffer, blob, None, realm, can_gc)
+    fn ReadAsArrayBuffer(&self, blob: &Blob, can_gc: CanGc) -> ErrorResult {
+        self.read(FileReaderFunction::ArrayBuffer, blob, None, can_gc)
     }
 
     // https://w3c.github.io/FileAPI/#dfn-readAsDataURL
-    fn ReadAsDataURL(&self, blob: &Blob, realm: InRealm, can_gc: CanGc) -> ErrorResult {
-        self.read(FileReaderFunction::DataUrl, blob, None, realm, can_gc)
+    fn ReadAsDataURL(&self, blob: &Blob, can_gc: CanGc) -> ErrorResult {
+        self.read(FileReaderFunction::DataUrl, blob, None, can_gc)
     }
 
     // https://w3c.github.io/FileAPI/#dfn-readAsText
-    fn ReadAsText(
-        &self,
-        blob: &Blob,
-        label: Option<DOMString>,
-        realm: InRealm,
-        can_gc: CanGc,
-    ) -> ErrorResult {
-        self.read(FileReaderFunction::Text, blob, label, realm, can_gc)
+    fn ReadAsText(&self, blob: &Blob, label: Option<DOMString>, can_gc: CanGc) -> ErrorResult {
+        self.read(FileReaderFunction::Text, blob, label, can_gc)
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-abort
+    /// <https://w3c.github.io/FileAPI/#dfn-abort>
     fn Abort(&self, can_gc: CanGc) {
         // Step 2
         if self.ready_state.get() == FileReaderReadyState::Loading {
@@ -431,13 +424,13 @@ impl FileReaderMethods<crate::DomTypeHolder> for FileReader {
         self.dispatch_progress_event(atom!("loadend"), 0, None, can_gc);
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-error
+    /// <https://w3c.github.io/FileAPI/#dfn-error>
     fn GetError(&self) -> Option<DomRoot<DOMException>> {
         self.error.get()
     }
 
-    #[allow(unsafe_code)]
-    // https://w3c.github.io/FileAPI/#dfn-result
+    #[expect(unsafe_code)]
+    /// <https://w3c.github.io/FileAPI/#dfn-result>
     fn GetResult(&self, _: JSContext) -> Option<StringOrObject> {
         self.result.borrow().as_ref().map(|r| match *r {
             FileReaderResult::String(ref string) => StringOrObject::String(string.clone()),
@@ -451,7 +444,7 @@ impl FileReaderMethods<crate::DomTypeHolder> for FileReader {
         })
     }
 
-    // https://w3c.github.io/FileAPI/#dfn-readyState
+    /// <https://w3c.github.io/FileAPI/#dfn-readyState>
     fn ReadyState(&self) -> u16 {
         self.ready_state.get() as u16
     }
@@ -483,14 +476,13 @@ impl FileReader {
         function: FileReaderFunction,
         blob: &Blob,
         label: Option<DOMString>,
-        realm: InRealm,
         can_gc: CanGc,
     ) -> ErrorResult {
         let cx = GlobalScope::get_cx();
 
         // If fr’s state is "loading", throw an InvalidStateError DOMException.
         if self.ready_state.get() == FileReaderReadyState::Loading {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
 
         // Set fr’s state to "loading".
@@ -530,7 +522,6 @@ impl FileReader {
         // Read all bytes from stream with reader.
         reader.read_all_bytes(
             cx,
-            &self.global(),
             Rc::new(move |blob_contents| {
                 let global = filereader_success.global();
                 let task_manager = global.task_manager();
@@ -583,7 +574,6 @@ impl FileReader {
                     DOMErrorName::OperationError,
                 ));
             }),
-            realm,
             can_gc,
         );
         Ok(())

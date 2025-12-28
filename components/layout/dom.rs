@@ -94,15 +94,19 @@ impl InnerDOMLayoutData {
         }
     }
 
-    fn clear_fragment_layout_cache(&self) {
+    fn with_each_layout_box_base(&self, callback: impl Fn(&LayoutBoxBase)) {
         if let Some(data) = self.self_box.borrow().as_ref() {
-            data.clear_fragment_layout_cache();
+            data.with_each_base(callback);
         }
+    }
+
+    fn with_each_layout_box_base_including_pseudos(&self, callback: impl Fn(&LayoutBoxBase)) {
+        self.with_each_layout_box_base(&callback);
         for pseudo_layout_data in self.pseudo_boxes.iter() {
             pseudo_layout_data
                 .data
                 .borrow()
-                .clear_fragment_layout_cache();
+                .with_each_layout_box_base(&callback);
         }
     }
 }
@@ -119,25 +123,24 @@ pub(super) enum LayoutBox {
 }
 
 impl LayoutBox {
-    fn clear_fragment_layout_cache(&self) {
-        match self {
-            LayoutBox::DisplayContents(..) => {},
-            LayoutBox::BlockLevel(block_level_box) => {
-                block_level_box.borrow().clear_fragment_layout_cache()
-            },
+    pub(crate) fn with_each_base(&self, callback: impl Fn(&LayoutBoxBase)) {
+        self.with_base_fold((), |_, base| callback(base))
+    }
+
+    pub(crate) fn with_first_base<T>(
+        &self,
+        callback: impl FnOnce(&LayoutBoxBase) -> T,
+    ) -> Option<T> {
+        Some(match self {
+            LayoutBox::DisplayContents(..) => return None,
+            LayoutBox::BlockLevel(block_level_box) => block_level_box.borrow().with_base(callback),
             LayoutBox::InlineLevel(inline_items) => {
-                for inline_item in inline_items.iter() {
-                    inline_item.borrow().clear_fragment_layout_cache()
-                }
+                inline_items.first()?.borrow().with_base(callback)
             },
-            LayoutBox::FlexLevel(flex_level_box) => {
-                flex_level_box.borrow().clear_fragment_layout_cache()
-            },
-            LayoutBox::TaffyItemBox(taffy_item_box) => {
-                taffy_item_box.borrow_mut().clear_fragment_layout_cache()
-            },
-            LayoutBox::TableLevelBox(table_box) => table_box.clear_fragment_layout_cache(),
-        }
+            LayoutBox::FlexLevel(flex_level_box) => flex_level_box.borrow().with_base(callback),
+            LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box.borrow().with_base(callback),
+            LayoutBox::TableLevelBox(table_box) => table_box.with_base(callback),
+        })
     }
 
     pub(crate) fn with_base_flat<T>(&self, callback: impl Fn(&LayoutBoxBase) -> Vec<T>) -> Vec<T> {
@@ -154,24 +157,53 @@ impl LayoutBox {
         }
     }
 
-    pub(crate) fn with_base_mut(&mut self, callback: impl Fn(&mut LayoutBoxBase)) {
+    pub(crate) fn with_base_fold<T>(
+        &self,
+        init: T,
+        callback: impl Fn(T, &LayoutBoxBase) -> T,
+    ) -> T {
         match self {
-            LayoutBox::DisplayContents(..) => {},
-            LayoutBox::BlockLevel(block_level_box) => {
-                block_level_box.borrow_mut().with_base_mut(callback);
+            LayoutBox::DisplayContents(..) => init,
+            LayoutBox::BlockLevel(block_level_box) => block_level_box
+                .borrow()
+                .with_base(|base| callback(init, base)),
+            LayoutBox::InlineLevel(inline_items) => inline_items.iter().fold(init, |acc, item| {
+                item.borrow().with_base(|base| callback(acc, base))
+            }),
+            LayoutBox::FlexLevel(flex_level_box) => flex_level_box
+                .borrow()
+                .with_base(|base| callback(init, base)),
+            LayoutBox::TableLevelBox(table_level_box) => {
+                table_level_box.with_base(|base| callback(init, base))
             },
-            LayoutBox::InlineLevel(inline_items) => {
-                for inline_item in inline_items {
-                    inline_item.borrow_mut().with_base_mut(&callback);
-                }
+            LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box
+                .borrow()
+                .with_base(|base| callback(init, base)),
+        }
+    }
+
+    pub(crate) fn with_base_mut_fold<T>(
+        &mut self,
+        init: T,
+        callback: impl Fn(T, &mut LayoutBoxBase) -> T,
+    ) -> T {
+        match self {
+            LayoutBox::DisplayContents(..) => init,
+            LayoutBox::BlockLevel(block_level_box) => block_level_box
+                .borrow_mut()
+                .with_base_mut(|base| callback(init, base)),
+            LayoutBox::InlineLevel(inline_items) => inline_items.iter().fold(init, |acc, item| {
+                item.borrow_mut().with_base_mut(|base| callback(acc, base))
+            }),
+            LayoutBox::FlexLevel(flex_level_box) => flex_level_box
+                .borrow_mut()
+                .with_base_mut(|base| callback(init, base)),
+            LayoutBox::TableLevelBox(table_level_box) => {
+                table_level_box.with_base_mut(|base| callback(init, base))
             },
-            LayoutBox::FlexLevel(flex_level_box) => {
-                flex_level_box.borrow_mut().with_base_mut(callback)
-            },
-            LayoutBox::TableLevelBox(table_level_box) => table_level_box.with_base_mut(callback),
-            LayoutBox::TaffyItemBox(taffy_item_box) => {
-                taffy_item_box.borrow_mut().with_base_mut(callback)
-            },
+            LayoutBox::TaffyItemBox(taffy_item_box) => taffy_item_box
+                .borrow_mut()
+                .with_base_mut(|base| callback(init, base)),
         }
     }
 
@@ -301,7 +333,7 @@ pub(crate) trait NodeExt<'dom> {
     fn unset_all_pseudo_boxes(&self);
 
     fn fragments_for_pseudo(&self, pseudo_element: Option<PseudoElement>) -> Vec<Fragment>;
-    fn clear_fragment_layout_cache(&self);
+    fn with_each_layout_box_base_including_pseudos(&self, callback: impl Fn(&LayoutBoxBase));
 
     fn repair_style(&self, context: &SharedStyleContext);
     fn take_restyle_damage(&self) -> LayoutDamage;
@@ -310,14 +342,8 @@ pub(crate) trait NodeExt<'dom> {
 impl<'dom> NodeExt<'dom> for ServoThreadSafeLayoutNode<'dom> {
     fn as_image(&self) -> Option<(Option<Image>, PhysicalSize<f64>)> {
         let (resource, metadata) = self.image_data()?;
-        let (width, height) = resource
-            .as_ref()
-            .map(|image| {
-                let image_metadata = image.metadata();
-                (image_metadata.width, image_metadata.height)
-            })
-            .or_else(|| metadata.map(|metadata| (metadata.width, metadata.height)))
-            .unwrap_or((0, 0));
+        let width = metadata.map(|metadata| metadata.width).unwrap_or_default();
+        let height = metadata.map(|metadata| metadata.height).unwrap_or_default();
         let (mut width, mut height) = (width as f64, height as f64);
         if let Some(density) = self.image_density().filter(|density| *density != 1.) {
             width /= density;
@@ -346,7 +372,7 @@ impl<'dom> NodeExt<'dom> for ServoThreadSafeLayoutNode<'dom> {
 
     fn as_canvas(&self) -> Option<(CanvasInfo, PhysicalSize<f64>)> {
         let canvas_data = self.canvas_data()?;
-        let source = canvas_data.source;
+        let source = canvas_data.image_key;
         Some((
             CanvasInfo { source },
             PhysicalSize::new(canvas_data.width.into(), canvas_data.height.into()),
@@ -449,9 +475,9 @@ impl<'dom> NodeExt<'dom> for ServoThreadSafeLayoutNode<'dom> {
         self.ensure_inner_layout_data().pseudo_boxes.clear();
     }
 
-    fn clear_fragment_layout_cache(&self) {
+    fn with_each_layout_box_base_including_pseudos(&self, callback: impl Fn(&LayoutBoxBase)) {
         if let Some(inner_layout_data) = self.inner_layout_data() {
-            inner_layout_data.clear_fragment_layout_cache();
+            inner_layout_data.with_each_layout_box_base_including_pseudos(callback);
         }
     }
 

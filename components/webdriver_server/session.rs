@@ -2,10 +2,10 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
 
 use base::id::{BrowsingContextId, WebViewId};
+use rustc_hash::FxHashSet;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 use webdriver::error::WebDriverResult;
@@ -21,7 +21,7 @@ use crate::user_prompt::{
 };
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub enum PageLoadStrategy {
+pub(crate) enum PageLoadStrategy {
     None,
     Eager,
     Normal,
@@ -42,7 +42,7 @@ impl ToString for PageLoadStrategy {
 /// Represents the current WebDriver session and holds relevant session state.
 /// Currently, only 1 webview is supported per session.
 /// So only there is only 1 InputState.
-pub struct WebDriverSession {
+pub(crate) struct WebDriverSession {
     /// <https://www.w3.org/TR/webdriver2/#dfn-session-id>
     id: Uuid,
 
@@ -64,14 +64,14 @@ pub struct WebDriverSession {
     user_prompt_handler: UserPromptHandler,
 
     /// <https://w3c.github.io/webdriver/#dfn-input-state-map>
-    input_state_table: RefCell<HashMap<String, InputSourceState>>,
+    pub(crate) input_state_table: HashMap<String, InputSourceState>,
 
     /// <https://w3c.github.io/webdriver/#dfn-input-cancel-list>
-    input_cancel_list: RefCell<Vec<(String, ActionItem)>>,
+    pub(crate) input_cancel_list: Vec<(String, ActionItem)>,
 }
 
 impl WebDriverSession {
-    pub fn new() -> WebDriverSession {
+    pub(crate) fn new() -> WebDriverSession {
         WebDriverSession {
             id: Uuid::new_v4(),
             webview_id: None,
@@ -80,57 +80,55 @@ impl WebDriverSession {
             page_loading_strategy: PageLoadStrategy::Normal,
             strict_file_interactability: false,
             user_prompt_handler: UserPromptHandler::new(),
-            input_state_table: RefCell::new(HashMap::new()),
-            input_cancel_list: RefCell::new(Vec::new()),
+            input_state_table: Default::default(),
+            input_cancel_list: Default::default(),
         }
     }
 
-    pub fn set_webview_id(&mut self, webview_id: WebViewId) {
+    pub(crate) fn set_webview_id(&mut self, webview_id: WebViewId) {
         self.webview_id = Some(webview_id);
     }
 
-    pub fn set_browsing_context_id(&mut self, browsing_context_id: BrowsingContextId) {
+    pub(crate) fn set_browsing_context_id(&mut self, browsing_context_id: BrowsingContextId) {
         self.browsing_context_id = Some(browsing_context_id);
     }
 
-    pub fn current_webview_id(&self) -> Option<WebViewId> {
+    pub(crate) fn current_webview_id(&self) -> Option<WebViewId> {
         self.webview_id
     }
 
-    pub fn current_browsing_context_id(&self) -> Option<BrowsingContextId> {
+    pub(crate) fn current_browsing_context_id(&self) -> Option<BrowsingContextId> {
         self.browsing_context_id
     }
 
-    pub fn session_timeouts(&self) -> &TimeoutsConfiguration {
+    pub(crate) fn session_timeouts(&self) -> &TimeoutsConfiguration {
         &self.timeouts
     }
 
-    pub fn session_timeouts_mut(&mut self) -> &mut TimeoutsConfiguration {
+    pub(crate) fn session_timeouts_mut(&mut self) -> &mut TimeoutsConfiguration {
         &mut self.timeouts
     }
 
-    pub fn page_loading_strategy(&self) -> PageLoadStrategy {
+    pub(crate) fn page_loading_strategy(&self) -> PageLoadStrategy {
         self.page_loading_strategy.clone()
     }
 
-    pub fn strict_file_interactability(&self) -> bool {
+    pub(crate) fn strict_file_interactability(&self) -> bool {
         self.strict_file_interactability
     }
 
-    pub fn user_prompt_handler(&self) -> &UserPromptHandler {
+    pub(crate) fn user_prompt_handler(&self) -> &UserPromptHandler {
         &self.user_prompt_handler
     }
 
-    pub fn input_state_table(&self) -> Ref<'_, HashMap<String, InputSourceState>> {
-        self.input_state_table.borrow()
-    }
-
-    pub fn input_state_table_mut(&self) -> RefMut<'_, HashMap<String, InputSourceState>> {
-        self.input_state_table.borrow_mut()
-    }
-
-    pub fn input_cancel_list_mut(&self) -> RefMut<'_, Vec<(String, ActionItem)>> {
-        self.input_cancel_list.borrow_mut()
+    pub(crate) fn pointer_ids(&self) -> FxHashSet<u32> {
+        self.input_state_table
+            .values()
+            .filter_map(|source| match source {
+                InputSourceState::Pointer(pointer_state) => Some(pointer_state.pointer_id),
+                _ => None,
+            })
+            .collect()
     }
 }
 

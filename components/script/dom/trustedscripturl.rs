@@ -62,15 +62,15 @@ impl TrustedScriptURL {
         }
     }
 
-    pub(crate) fn data(&self) -> DOMString {
-        self.data.clone()
+    pub(crate) fn data(&self) -> &DOMString {
+        &self.data
     }
 }
 
 impl fmt::Display for TrustedScriptURL {
     #[inline]
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str(&self.data)
+        f.write_str(&self.data.str())
     }
 }
 

@@ -16,6 +16,7 @@ from github import Github
 import hashlib
 import io
 import json
+import re
 import os
 import os.path as path
 import shutil
@@ -55,15 +56,17 @@ PACKAGES = {
     "mac": [
         "production/servo-tech-demo.dmg",
     ],
+    "mac-arm64": [
+        "production/servo-tech-demo.dmg",
+    ],
     "windows-msvc": [
         r"production\msi\Servo.exe",
         r"production\msi\Servo.zip",
     ],
     "ohos": [
-        (
-            "openharmony/aarch64-unknown-linux-ohos/release/entry/build/"
-            "default/outputs/default/servoshell-default-signed.hap"
-        )
+        "aarch64-unknown-linux-ohos/production/libservoshell.so",
+        "openharmony/aarch64-unknown-linux-ohos/production/entry/build/"
+        + "default/outputs/default/servoshell-default-signed.hap",
     ],
 }
 
@@ -133,10 +136,14 @@ class PackageCommands(CommandBase):
 
             if build_type.is_dev():
                 build_type_string = "Debug"
-            elif build_type.is_release():
+            elif build_type.is_release() or build_type.is_prod():
                 build_type_string = "Release"
             else:
-                raise Exception("TODO what should this be?")
+                print(f"Servo was built with custom cargo profile `{build_type.profile}`.")
+                print("Using Debug build for gradle.")
+                build_type_string = "Debug"
+            # Inform the android build of where `libservoshell.so` is located.
+            env["SERVO_TARGET_DIR"] = target_dir
 
             flavor_name = "Basic"
             if flavor is not None:
@@ -473,6 +480,22 @@ class PackageCommands(CommandBase):
                 path.basename(package),
             )
 
+        # Map the default platform shorthand to a name containing architecture.
+        def map_platform(platform: str) -> str:
+            if platform == "android":
+                return "aarch64-android"
+            elif platform == "linux":
+                return "x86_64-linux-gnu"
+            elif platform == "windows-msvc":
+                return "x86_64-windows-msvc"
+            elif platform == "mac":
+                return "x86_64-apple-darwin"
+            elif platform == "mac-arm64":
+                return "aarch64-apple-darwin"
+            elif platform == "ohos":
+                return "aarch64-linux-ohos"
+            raise Exception("Unknown platform: {}".format(platform))
+
         def upload_to_github_release(platform: str, package: str, package_hash: str) -> None:
             if not github_release_id:
                 return
@@ -481,9 +504,19 @@ class PackageCommands(CommandBase):
             g = Github(os.environ["NIGHTLY_REPO_TOKEN"])
             nightly_repo = g.get_repo(os.environ["NIGHTLY_REPO"])
             release = nightly_repo.get_release(github_release_id)
-            package_hash_fileobj = io.BytesIO(package_hash.encode("utf-8"))
 
-            asset_name = f"servo-latest.{extension}"
+            if platform != "mac-arm64":
+                # Legacy assetname. Will be removed after a period with duplicate assets.
+                asset_name = f"servo-latest.{extension}"
+                package_hash_fileobj = io.BytesIO(f"{package_hash}  {asset_name}".encode("utf-8"))
+                release.upload_asset(package, name=asset_name)
+                # pyrefly: ignore[missing-attribute]
+                release.upload_asset_from_memory(
+                    package_hash_fileobj, package_hash_fileobj.getbuffer().nbytes, name=f"{asset_name}.sha256"
+                )
+            asset_platform = map_platform(platform)
+            asset_name = f"servo-{asset_platform}.{extension}"
+            package_hash_fileobj = io.BytesIO(f"{package_hash}  {asset_name}".encode("utf-8"))
             release.upload_asset(package, name=asset_name)
             # pyrefly: ignore[missing-attribute]
             release.upload_asset_from_memory(
@@ -507,7 +540,7 @@ class PackageCommands(CommandBase):
             extension = path.basename(package).partition(".")[2]
             latest_upload_key = "{}/servo-latest.{}".format(nightly_dir, extension)
 
-            package_hash_fileobj = io.BytesIO(package_hash.encode("utf-8"))
+            package_hash_fileobj = io.BytesIO(f"{package_hash}  {filename}".encode("utf-8"))
             latest_hash_upload_key = f"{latest_upload_key}.sha256"
 
             s3.upload_file(package, BUCKET, package_upload_key)
@@ -553,4 +586,77 @@ class PackageCommands(CommandBase):
             upload_to_s3(platform, package, package_hash, timestamp)
             upload_to_github_release(platform, package, package_hash)
 
+        return 0
+
+    @Command(
+        "release", description="Perform necessary updates before release a new servoshell version", category="package"
+    )
+    @CommandArgument("target", type=str, help="Target version to bump to")
+    @CommandArgument("--allow-dirty", action="store_true", help="Allow working directory to be dirty")
+    def bump_version(self, target: str, allow_dirty: bool) -> int:
+        if not allow_dirty:
+            # Check if the working directory is clean
+            status_output = check_output(["git", "status", "--porcelain"]).strip()
+            if status_output:
+                print("Working directory is dirty. Please commit or stash your changes before bumping version.")
+                print("To bypass this check, use --allow-dirty.")
+                return 1
+        print("\r ➤  Bumping version number...")
+        # Todo: Also update assemblyIdentity.version in ports/servoshell/platform/windows/servo.exe.manifest
+        #   Note: assemblyIdentity requires 4 version components, while we usually use 3.
+        replacements = {
+            "ports/servoshell/Cargo.toml": r'^version ?= ?"(?P<version>.*?)"',
+            "support/windows/Servo.wxs.mako": r'<Product(.|\n)*Version="(?P<version>.*?)".*>',
+            "Info.plist": r"<key>CFBundleShortVersionString</key>\n\s*<string>(?P<version>.*?)</string>",
+            "support/android/apk/servoapp/build.gradle.kts": r'versionName\s*=\s*"(?P<version>.*?)"',
+            "support/openharmony/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+            "support/openharmony/entry/oh-package.json5": r'"version"\s*:\s*"(?P<version>.*?)"',
+        }
+
+        for filename, expression in replacements.items():
+            filepath = path.join(self.get_top_dir(), filename)
+            with open(filepath, "r") as file:
+                content = file.read()
+
+            compiled_pattern = re.compile(expression, re.MULTILINE)
+
+            new_content, count = compiled_pattern.subn(
+                lambda m: m.group(0).replace(m.group("version"), target),
+                content,
+            )
+
+            if count == 0:
+                print(f"No occurrences found in {filename} to replace.")
+                return 1
+            elif count > 1:
+                print(f"Warning: Multiple ({count}) occurrences found in {filename}. Only one expected.")
+                # Print all occurrences for debugging
+                matches = compiled_pattern.findall(content)
+                for match in matches:
+                    print(f"Found occurrence: {match}")
+                return 1
+
+            with open(filepath, "w") as file:
+                file.write(new_content)
+
+            print(f"Updated occurrence in {filename}.")
+        print("\r ➤  Updating license.html...")
+        # cargo about generate etc/about.hbs > resources/resource_protocol/license.html
+        try:
+            # Remove resources/resource_protocol/license.html before regenerating it
+            license_html_path = path.join("resources", "resource_protocol", "license.html")
+            if path.exists(license_html_path):
+                os.remove(license_html_path)
+            subprocess.check_call(
+                [
+                    "cargo",
+                    "about",
+                    "generate",
+                    "etc/about.hbs",
+                ],
+                stdout=open("resources/resource_protocol/license.html", "w"),
+            )
+        except subprocess.CalledProcessError as e:
+            print("Updating license.html exited with return value %d" % e.returncode)
+            return e.returncode
         return 0

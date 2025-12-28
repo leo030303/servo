@@ -36,7 +36,7 @@ use crate::dom::bindings::reflector::{Reflector, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::bindings::str::DOMString;
 use crate::dom::bindings::utils::to_frozen_array;
-use crate::dom::document::Document;
+use crate::dom::document::{Document, RenderingUpdateReason};
 use crate::dom::domrectreadonly::DOMRectReadOnly;
 use crate::dom::element::Element;
 use crate::dom::intersectionobserverentry::IntersectionObserverEntry;
@@ -73,7 +73,7 @@ pub(crate) struct IntersectionObserver {
     /// > with the intersection root, as per the processing model.
     ///
     /// <https://w3c.github.io/IntersectionObserver/#intersection-observer-callback>
-    #[ignore_malloc_size_of = "Rc are hard"]
+    #[conditional_malloc_size_of]
     callback: Rc<IntersectionObserverCallback>,
 
     /// <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserver-queuedentries-slot>
@@ -139,7 +139,7 @@ impl IntersectionObserver {
         let root_margin = if let Ok(margin) = parse_a_margin(init.rootMargin.as_ref()) {
             margin
         } else {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         };
 
         // Step 4.
@@ -148,7 +148,7 @@ impl IntersectionObserver {
         let scroll_margin = if let Ok(margin) = parse_a_margin(init.scrollMargin.as_ref()) {
             margin
         } else {
-            return Err(Error::Syntax);
+            return Err(Error::Syntax(None));
         };
 
         // Step 1 and step 2, 3, 4 setter
@@ -285,6 +285,13 @@ impl IntersectionObserver {
         self.observation_targets
             .borrow_mut()
             .push(Dom::from_ref(target));
+
+        target
+            .owner_window()
+            .Document()
+            .add_rendering_update_reason(
+                RenderingUpdateReason::IntersectionObserverStartedObservingTarget,
+            );
     }
 
     /// <https://w3c.github.io/IntersectionObserver/#unobserve-target-element>
@@ -424,12 +431,14 @@ impl IntersectionObserver {
                     window.box_area_query_without_reflow(
                         &DomRoot::upcast::<Node>(element.clone()),
                         BoxAreaType::Padding,
+                        false,
                     )
                 } else {
                     // > Otherwise, it’s the result of getting the bounding box for the intersection root.
                     window.box_area_query_without_reflow(
                         &DomRoot::upcast::<Node>(element.clone()),
                         BoxAreaType::Border,
+                        false,
                     )
                 }
             },
@@ -509,9 +518,11 @@ impl IntersectionObserver {
 
         // Step 7
         // > Set targetRect to the DOMRectReadOnly obtained by getting the bounding box for target.
-        let maybe_target_rect = document
-            .window()
-            .box_area_query_without_reflow(target.upcast::<Node>(), BoxAreaType::Border);
+        let maybe_target_rect = document.window().box_area_query_without_reflow(
+            target.upcast::<Node>(),
+            BoxAreaType::Border,
+            false,
+        );
 
         // Following the implementation of Gecko, we will skip further processing if these
         // information not available. This would also handle display none element.
@@ -952,7 +963,7 @@ fn parse_a_margin(value: Option<&DOMString>) -> Result<IntersectionObserverMargi
     // <https://w3c.github.io/IntersectionObserver/#dom-intersectionobserverinit-scrollmargin>
     // > ... defaulting to "0px".
     let value = match value {
-        Some(str) => str.str(),
+        Some(str) => &str.str(),
         _ => "0px",
     };
 

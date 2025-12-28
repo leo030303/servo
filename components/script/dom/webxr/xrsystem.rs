@@ -154,7 +154,6 @@ impl XRSystemMethods<crate::DomTypeHolder> for XRSystem {
     }
 
     /// <https://immersive-web.github.io/webxr/#dom-xr-requestsession>
-    #[allow(unsafe_code)]
     fn RequestSession(
         &self,
         mode: XRSessionMode,
@@ -173,13 +172,13 @@ impl XRSystemMethods<crate::DomTypeHolder> for XRSystem {
                         "The dom.webxr.unsafe-assume-user-intent preference assumes user intent to enter WebXR."
                     );
                 } else {
-                    promise.reject_error(Error::Security, can_gc);
+                    promise.reject_error(Error::Security(None), can_gc);
                     return promise;
                 }
             }
 
             if self.pending_or_active_session() {
-                promise.reject_error(Error::InvalidState, can_gc);
+                promise.reject_error(Error::InvalidState(None), can_gc);
                 return promise;
             }
 
@@ -193,7 +192,7 @@ impl XRSystemMethods<crate::DomTypeHolder> for XRSystem {
         if let Some(ref r) = init.requiredFeatures {
             for feature in r {
                 if let Ok(ConversionResult::Success(s)) =
-                    String::safe_from_jsval(cx, feature.handle(), ())
+                    String::safe_from_jsval(cx, feature.handle(), (), can_gc)
                 {
                     required_features.push(s)
                 } else {
@@ -201,7 +200,7 @@ impl XRSystemMethods<crate::DomTypeHolder> for XRSystem {
                     if mode != XRSessionMode::Inline {
                         self.pending_immersive_session.set(false);
                     }
-                    promise.reject_error(Error::NotSupported, can_gc);
+                    promise.reject_error(Error::NotSupported(None), can_gc);
                     return promise;
                 }
             }
@@ -210,7 +209,7 @@ impl XRSystemMethods<crate::DomTypeHolder> for XRSystem {
         if let Some(ref o) = init.optionalFeatures {
             for feature in o {
                 if let Ok(ConversionResult::Success(s)) =
-                    String::safe_from_jsval(cx, feature.handle(), ())
+                    String::safe_from_jsval(cx, feature.handle(), (), can_gc)
                 {
                     optional_features.push(s)
                 } else {
@@ -266,7 +265,7 @@ impl XRSystemMethods<crate::DomTypeHolder> for XRSystem {
         promise
     }
 
-    // https://github.com/immersive-web/webxr-test-api/blob/master/explainer.md
+    /// <https://github.com/immersive-web/webxr-test-api/blob/master/explainer.md>
     fn Test(&self) -> DomRoot<XRTest> {
         self.test
             .or_init(|| XRTest::new(&self.global(), CanGc::note()))
@@ -289,7 +288,7 @@ impl XRSystem {
                 if mode != XRSessionMode::Inline {
                     self.pending_immersive_session.set(false);
                 }
-                promise.reject_error(Error::NotSupported, can_gc);
+                promise.reject_error(Error::NotSupported(None), can_gc);
                 return;
             },
         };
@@ -323,10 +322,8 @@ impl XRSystem {
                 task!(fire_sessionavailable_event: move || {
                     // The sessionavailable event indicates user intent to enter an XR session
                     let xr = xr.root();
-                    let interacting = ScriptThread::is_user_interacting();
-                    ScriptThread::set_user_interacting(true);
-                    xr.upcast::<EventTarget>().fire_bubbling_event(atom!("sessionavailable"), CanGc::note());
-                    ScriptThread::set_user_interacting(interacting);
+                        let _guard = ScriptThread::user_interacting_guard();
+                        xr.upcast::<EventTarget>().fire_bubbling_event(atom!("sessionavailable"), CanGc::note());
                 })
             );
     }

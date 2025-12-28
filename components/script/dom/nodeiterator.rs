@@ -26,7 +26,6 @@ pub(crate) struct NodeIterator {
     reference_node: MutDom<Node>,
     pointer_before_reference_node: Cell<bool>,
     what_to_show: u32,
-    #[ignore_malloc_size_of = "Rc<NodeFilter> has shared ownership, so its size cannot be measured accurately"]
     filter: Filter,
     active: Cell<bool>,
 }
@@ -74,17 +73,17 @@ impl NodeIterator {
 }
 
 impl NodeIteratorMethods<crate::DomTypeHolder> for NodeIterator {
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-root
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-root>
     fn Root(&self) -> DomRoot<Node> {
         DomRoot::from_ref(&*self.root_node)
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-whattoshow
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-whattoshow>
     fn WhatToShow(&self) -> u32 {
         self.what_to_show
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-filter
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-filter>
     fn GetFilter(&self) -> Option<Rc<NodeFilter>> {
         match self.filter {
             Filter::None => None,
@@ -92,17 +91,17 @@ impl NodeIteratorMethods<crate::DomTypeHolder> for NodeIterator {
         }
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-referencenode
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-referencenode>
     fn ReferenceNode(&self) -> DomRoot<Node> {
         self.reference_node.get()
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-pointerbeforereferencenode
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-pointerbeforereferencenode>
     fn PointerBeforeReferenceNode(&self) -> bool {
         self.pointer_before_reference_node.get()
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-nextnode
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-nextnode>
     fn NextNode(&self, can_gc: CanGc) -> Fallible<Option<DomRoot<Node>>> {
         // https://dom.spec.whatwg.org/#concept-NodeIterator-traverse
         // Step 1.
@@ -146,7 +145,7 @@ impl NodeIteratorMethods<crate::DomTypeHolder> for NodeIterator {
         Ok(None)
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-previousnode
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-previousnode>
     fn PreviousNode(&self, can_gc: CanGc) -> Fallible<Option<DomRoot<Node>>> {
         // https://dom.spec.whatwg.org/#concept-NodeIterator-traverse
         // Step 1.
@@ -190,18 +189,18 @@ impl NodeIteratorMethods<crate::DomTypeHolder> for NodeIterator {
         Ok(None)
     }
 
-    // https://dom.spec.whatwg.org/#dom-nodeiterator-detach
+    /// <https://dom.spec.whatwg.org/#dom-nodeiterator-detach>
     fn Detach(&self) {
         // This method intentionally left blank.
     }
 }
 
 impl NodeIterator {
-    // https://dom.spec.whatwg.org/#concept-node-filter
+    /// <https://dom.spec.whatwg.org/#concept-node-filter>
     fn accept_node(&self, node: &Node, can_gc: CanGc) -> Fallible<u16> {
         // Step 1.
         if self.active.get() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         // Step 2.
         let n = node.NodeType() - 1;
@@ -227,8 +226,8 @@ impl NodeIterator {
     }
 }
 
-#[derive(JSTraceable)]
+#[derive(JSTraceable, MallocSizeOf)]
 pub(crate) enum Filter {
     None,
-    Callback(Rc<NodeFilter>),
+    Callback(#[ignore_malloc_size_of = "callbacks are hard"] Rc<NodeFilter>),
 }

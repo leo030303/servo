@@ -1,7 +1,6 @@
 /* This Source Code Form is subject to the terms of the Mozilla Public
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
-use crate::dom::bindings::codegen::Bindings::EventBinding::Event_Binding::EventMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLElementBinding::HTMLElementMethods;
 use crate::dom::bindings::codegen::Bindings::HTMLOrSVGElementBinding::FocusOptions;
 use crate::dom::bindings::inheritance::Castable;
@@ -9,8 +8,8 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::DOMString;
 use crate::dom::element::Element;
 use crate::dom::eventtarget::EventTarget;
-use crate::dom::htmldatalistelement::HTMLDataListElement;
-use crate::dom::htmlelement::HTMLElement;
+use crate::dom::html::htmldatalistelement::HTMLDataListElement;
+use crate::dom::html::htmlelement::HTMLElement;
 use crate::dom::node::Node;
 use crate::dom::validitystate::{ValidationFlags, ValidityState};
 use crate::script_runtime::CanGc;
@@ -20,7 +19,7 @@ pub(crate) trait Validatable {
     fn as_element(&self) -> &Element;
 
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validity>
-    fn validity_state(&self) -> DomRoot<ValidityState>;
+    fn validity_state(&self, can_gc: CanGc) -> DomRoot<ValidityState>;
 
     /// <https://html.spec.whatwg.org/multipage/#candidate-for-constraint-validation>
     fn is_instance_validatable(&self) -> bool;
@@ -35,13 +34,13 @@ pub(crate) trait Validatable {
     }
 
     /// <https://html.spec.whatwg.org/multipage/#concept-fv-valid>
-    fn satisfies_constraints(&self) -> bool {
-        self.validity_state().invalid_flags().is_empty()
+    fn satisfies_constraints(&self, can_gc: CanGc) -> bool {
+        self.validity_state(can_gc).invalid_flags().is_empty()
     }
 
     /// <https://html.spec.whatwg.org/multipage/#check-validity-steps>
     fn check_validity(&self, can_gc: CanGc) -> bool {
-        if self.is_instance_validatable() && !self.satisfies_constraints() {
+        if self.is_instance_validatable() && !self.satisfies_constraints(can_gc) {
             self.as_element()
                 .upcast::<EventTarget>()
                 .fire_cancelable_event(atom!("invalid"), can_gc);
@@ -58,26 +57,27 @@ pub(crate) trait Validatable {
             return true;
         }
 
-        if self.satisfies_constraints() {
+        if self.satisfies_constraints(can_gc) {
             return true;
         }
 
-        // Step 1.1.
-        let event = self
+        // Step 1.1: Let `report` be the result of firing an event named invalid at element,
+        // with the cancelable attribute initialized to true.
+        let report = self
             .as_element()
             .upcast::<EventTarget>()
             .fire_cancelable_event(atom!("invalid"), can_gc);
 
-        // Step 1.2.
-        if !event.DefaultPrevented() {
-            let flags = self.validity_state().invalid_flags();
+        // Step 1.2. If `report` is true, for the element,
+        // report the problem, run focusing steps, scroll into view.
+        if report {
+            let flags = self.validity_state(can_gc).invalid_flags();
             println!(
                 "Validation error: {}",
-                validation_message_for_flags(&self.validity_state(), flags)
+                validation_message_for_flags(&self.validity_state(can_gc), flags)
             );
             if let Some(html_elem) = self.as_element().downcast::<HTMLElement>() {
-                // TODO: "Focusing steps" has a different meaning from the focus() method.
-                // The actual focusing steps should be implemented
+                // Run focusing steps and scroll into view.
                 html_elem.Focus(&FocusOptions::default(), can_gc);
             }
         }
@@ -89,8 +89,8 @@ pub(crate) trait Validatable {
     /// <https://html.spec.whatwg.org/multipage/#dom-cva-validationmessage>
     fn validation_message(&self) -> DOMString {
         if self.is_instance_validatable() {
-            let flags = self.validity_state().invalid_flags();
-            validation_message_for_flags(&self.validity_state(), flags)
+            let flags = self.validity_state(CanGc::note()).invalid_flags();
+            validation_message_for_flags(&self.validity_state(CanGc::note()), flags)
         } else {
             DOMString::new()
         }

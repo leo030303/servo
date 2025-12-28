@@ -35,7 +35,7 @@ macro_rules! make_limited_int_setter(
             use $crate::script_runtime::CanGc;
 
             let value = if value < 0 {
-                return Err($crate::dom::bindings::error::Error::IndexSize);
+                return Err($crate::dom::bindings::error::Error::IndexSize(None));
             } else {
                 value
             };
@@ -147,7 +147,7 @@ macro_rules! make_form_action_getter(
 macro_rules! make_labels_getter(
     ( $attr:ident, $memo:ident ) => (
         fn $attr(&self) -> DomRoot<NodeList> {
-            use $crate::dom::htmlelement::HTMLElement;
+            use $crate::dom::html::htmlelement::HTMLElement;
             use $crate::dom::nodelist::NodeList;
             self.$memo.or_init(|| NodeList::new_labels_list(
                 self.upcast::<Node>().owner_doc().window(),
@@ -320,7 +320,7 @@ macro_rules! make_limited_uint_setter(
             use $crate::dom::values::UNSIGNED_LONG_MAX;
             use $crate::script_runtime::CanGc;
             let value = if value == 0 {
-                return Err($crate::dom::bindings::error::Error::IndexSize);
+                return Err($crate::dom::bindings::error::Error::IndexSize(None));
             } else if value > UNSIGNED_LONG_MAX {
                 $default
             } else {
@@ -392,12 +392,62 @@ macro_rules! make_nonzero_dimension_setter(
     );
 );
 
+#[macro_export]
+macro_rules! make_dimension_uint_getter(
+    ($attr:ident, $htmlname:tt, $default:expr) => (
+        fn $attr(&self) -> u32 {
+            use style::attr::parse_unsigned_integer;
+            use $crate::dom::bindings::inheritance::Castable;
+            use $crate::dom::element::Element;
+            use $crate::dom::values::UNSIGNED_LONG_MAX;
+            let element = self.upcast::<Element>();
+            element
+                .get_attribute(&html5ever::ns!(), &html5ever::local_name!($htmlname))
+                .map_or($default, |attribute| parse_unsigned_integer(attribute.value().chars())
+                    .map_or($default, |value| {
+                        if value > UNSIGNED_LONG_MAX {
+                            $default
+                        } else {
+                            value
+                        }
+                    })
+                )
+        }
+    );
+    ($attr:ident, $htmlname:tt) => {
+        make_dimension_uint_getter!($attr, $htmlname, 0);
+    };
+);
+
+#[macro_export]
+macro_rules! make_dimension_uint_setter(
+    ($attr:ident, $htmlname:tt, $default:expr) => (
+        fn $attr(&self, value: u32) {
+            use $crate::dom::bindings::inheritance::Castable;
+            use $crate::dom::element::Element;
+            use $crate::dom::values::UNSIGNED_LONG_MAX;
+            use $crate::script_runtime::CanGc;
+            let element = self.upcast::<Element>();
+            let value = if value > UNSIGNED_LONG_MAX {
+                $default
+            } else {
+                value
+            };
+            let value = AttrValue::from_dimension(value.to_string());
+            element.set_attribute(&html5ever::local_name!($htmlname), value, CanGc::note())
+        }
+    );
+    ($attr:ident, $htmlname:tt) => {
+        make_dimension_uint_setter!($attr, $htmlname, 0);
+    };
+);
+
 /// For use on non-jsmanaged types
 /// Use #[derive(JSTraceable)] on JS managed types
 macro_rules! unsafe_no_jsmanaged_fields(
     ($($ty:ty),+) => (
         $(
-            #[allow(unsafe_code)]
+            #[expect(unsafe_code)]
             unsafe impl $crate::dom::bindings::trace::JSTraceable for $ty {
                 #[inline]
                 unsafe fn trace(&self, _: *mut ::js::jsapi::JSTracer) {
@@ -631,7 +681,9 @@ macro_rules! window_event_handlers(
         event_handler!(unhandledrejection, GetOnunhandledrejection,
                        SetOnunhandledrejection);
         event_handler!(unload, GetOnunload, SetOnunload);
+        #[cfg(feature = "gamepad")]
         event_handler!(gamepadconnected, GetOngamepadconnected, SetOngamepadconnected);
+        #[cfg(feature = "gamepad")]
         event_handler!(gamepaddisconnected, GetOngamepaddisconnected, SetOngamepaddisconnected);
     );
     (ForwardToWindow) => (
@@ -661,14 +713,16 @@ macro_rules! window_event_handlers(
         window_owned_event_handler!(unhandledrejection, GetOnunhandledrejection,
                                     SetOnunhandledrejection);
         window_owned_event_handler!(unload, GetOnunload, SetOnunload);
+        #[cfg(feature = "gamepad")]
         window_owned_event_handler!(gamepadconnected, GetOngamepadconnected, SetOngamepadconnected);
+        #[cfg(feature = "gamepad")]
         window_owned_event_handler!(gamepaddisconnected, GetOngamepaddisconnected, SetOngamepaddisconnected);
     );
 );
 
 /// DOM struct implementation for simple interfaces inheriting from PerformanceEntry.
 macro_rules! impl_performance_entry_struct(
-    ($binding:ident, $struct:ident, $type:expr) => (
+    ($binding:ident, $struct:ident, $type:path) => (
         use base::cross_process_instant::CrossProcessInstant;
         use time::Duration;
 
@@ -676,7 +730,7 @@ macro_rules! impl_performance_entry_struct(
         use crate::dom::bindings::root::DomRoot;
         use crate::dom::bindings::str::DOMString;
         use crate::dom::globalscope::GlobalScope;
-        use crate::dom::performanceentry::PerformanceEntry;
+        use crate::dom::performance::performanceentry::{EntryType, PerformanceEntry};
         use crate::script_runtime::CanGc;
         use dom_struct::dom_struct;
 
@@ -690,7 +744,7 @@ macro_rules! impl_performance_entry_struct(
                 -> $struct {
                 $struct {
                     entry: PerformanceEntry::new_inherited(name,
-                                                           DOMString::from($type),
+                                                           $type,
                                                            Some(start_time),
                                                            duration)
                 }

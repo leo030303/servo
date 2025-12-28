@@ -10,24 +10,22 @@ use euclid::{Rect, Size2D};
 use js::rust::HandleObject;
 use webxr_api::{ContextId as WebXRContextId, LayerId, LayerInit, Viewport};
 
-use crate::canvas_context::CanvasContext as _;
+use crate::canvas_context::CanvasContext;
 use crate::conversions::Convert;
 use crate::dom::bindings::codegen::Bindings::WebGL2RenderingContextBinding::WebGL2RenderingContextConstants as constants;
 use crate::dom::bindings::codegen::Bindings::WebGLRenderingContextBinding::WebGLRenderingContextMethods;
 use crate::dom::bindings::codegen::Bindings::XRWebGLLayerBinding::{
     XRWebGLLayerInit, XRWebGLLayerMethods, XRWebGLRenderingContext,
 };
-use crate::dom::bindings::codegen::UnionTypes::HTMLCanvasElementOrOffscreenCanvas;
 use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::inheritance::Castable;
 use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::{DomGlobal, reflect_dom_object_with_proto};
 use crate::dom::bindings::root::{Dom, DomRoot};
 use crate::dom::globalscope::GlobalScope;
-use crate::dom::webglframebuffer::WebGLFramebuffer;
-use crate::dom::webglobject::WebGLObject;
-use crate::dom::webglrenderingcontext::WebGLRenderingContext;
-use crate::dom::webgltexture::WebGLTexture;
+use crate::dom::webgl::webglframebuffer::WebGLFramebuffer;
+use crate::dom::webgl::webglrenderingcontext::WebGLRenderingContext;
+use crate::dom::webgl::webgltexture::WebGLTexture;
 use crate::dom::window::Window;
 use crate::dom::xrframe::XRFrame;
 use crate::dom::xrlayer::XRLayer;
@@ -125,14 +123,7 @@ impl XRWebGLLayer {
                 size.1.try_into().unwrap_or(0),
             )
         } else {
-            let size = match self.context().Canvas() {
-                HTMLCanvasElementOrOffscreenCanvas::HTMLCanvasElement(canvas) => canvas.get_size(),
-                HTMLCanvasElementOrOffscreenCanvas::OffscreenCanvas(canvas) => {
-                    let size = canvas.get_size();
-                    Size2D::new(size.width, size.height)
-                },
-            };
-            Size2D::from_untyped(size)
+            Size2D::from_untyped(self.context().size())
         }
     }
 
@@ -147,13 +138,14 @@ impl XRWebGLLayer {
     pub(crate) fn begin_frame(&self, frame: &XRFrame) -> Option<()> {
         debug!("XRWebGLLayer begin frame");
         let framebuffer = self.framebuffer.as_ref()?;
-        let context = framebuffer.upcast::<WebGLObject>().context();
         let sub_images = frame.get_sub_images(self.layer_id()?)?;
         let session = self.session();
+        let context = framebuffer.upcast().context()?;
+
         // TODO: Cache this texture
         let color_texture_id = WebGLTextureId::new(sub_images.sub_image.as_ref()?.color_texture?);
         let color_texture =
-            WebGLTexture::new_webxr(context, color_texture_id, session, CanGc::note());
+            WebGLTexture::new_webxr(&context, color_texture_id, session, CanGc::note());
         let target = self.texture_target();
 
         // Save the current bindings
@@ -188,7 +180,7 @@ impl XRWebGLLayer {
             // TODO: Cache this texture
             let depth_stencil_texture_id = WebGLTextureId::new(id);
             let depth_stencil_texture =
-                WebGLTexture::new_webxr(context, depth_stencil_texture_id, session, CanGc::note());
+                WebGLTexture::new_webxr(&context, depth_stencil_texture_id, session, CanGc::note());
             framebuffer
                 .texture2d_even_if_opaque(
                     constants::DEPTH_STENCIL_ATTACHMENT,
@@ -227,7 +219,11 @@ impl XRWebGLLayer {
                 0,
             )
             .ok()?;
-        framebuffer.upcast::<WebGLObject>().context().Flush();
+
+        if let Some(context) = framebuffer.upcast().context() {
+            context.Flush();
+        }
+
         Some(())
     }
 
@@ -253,7 +249,7 @@ impl XRWebGLLayerMethods<crate::DomTypeHolder> for XRWebGLLayer {
 
         // Step 2
         if session.is_ended() {
-            return Err(Error::InvalidState);
+            return Err(Error::InvalidState(None));
         }
         // XXXManishearth step 3: throw error if context is lost
         // XXXManishearth step 4: check XR compat flag for immersive sessions
@@ -262,9 +258,9 @@ impl XRWebGLLayerMethods<crate::DomTypeHolder> for XRWebGLLayer {
             // Step 9.2. "Initialize layer’s framebuffer to a new opaque framebuffer created with context."
             let size = session
                 .with_session(|session| session.recommended_framebuffer_resolution())
-                .ok_or(Error::Operation)?;
+                .ok_or(Error::Operation(None))?;
             let framebuffer = WebGLFramebuffer::maybe_new_webxr(session, &context, size, can_gc)
-                .ok_or(Error::Operation)?;
+                .ok_or(Error::Operation(None))?;
 
             // Step 9.3. "Allocate and initialize resources compatible with session’s XR device,
             // including GPU accessible memory buffers, as required to support the compositing of layer."
@@ -272,7 +268,7 @@ impl XRWebGLLayerMethods<crate::DomTypeHolder> for XRWebGLLayer {
             let layer_init: LayerInit = init.convert();
             let layer_id = session
                 .with_session(|session| session.create_layer(context_id, layer_init))
-                .map_err(|_| Error::Operation)?;
+                .map_err(|_| Error::Operation(None))?;
 
             // Step 9.4: "If layer’s resources were unable to be created for any reason,
             // throw an OperationError and abort these steps."

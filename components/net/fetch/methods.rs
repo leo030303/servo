@@ -2,8 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::{io, mem, str};
 
 use base64::Engine as _;
@@ -15,7 +15,7 @@ use embedder_traits::resources::{self, Resource};
 use headers::{AccessControlExposeHeaders, ContentType, HeaderMapExt};
 use http::header::{self, HeaderMap, HeaderName, RANGE};
 use http::{HeaderValue, Method, StatusCode};
-use ipc_channel::ipc;
+use ipc_channel::ipc::{self, IpcReceiver, IpcSender};
 use log::{debug, trace, warn};
 use mime::{self, Mime};
 use net_traits::fetch::headers::extract_mime_type_as_mime;
@@ -25,26 +25,29 @@ use net_traits::policy_container::{PolicyContainer, RequestPolicyContainer};
 use net_traits::request::{
     BodyChunkRequest, BodyChunkResponse, CredentialsMode, Destination, Initiator,
     InsecureRequestsPolicy, Origin, ParserMetadata, RedirectMode, Referrer, Request, RequestMode,
-    ResponseTainting, Window, is_cors_safelisted_method, is_cors_safelisted_request_header,
+    ResponseTainting, is_cors_safelisted_method, is_cors_safelisted_request_header,
 };
 use net_traits::response::{Response, ResponseBody, ResponseType};
 use net_traits::{
     FetchTaskTarget, NetworkError, ReferrerPolicy, ResourceAttribute, ResourceFetchTiming,
-    ResourceTimeValue, ResourceTimingType, set_default_accept_language,
+    ResourceTimeValue, ResourceTimingType, WebSocketDomAction, WebSocketNetworkEvent,
+    set_default_accept_language,
 };
+use parking_lot::Mutex;
 use rustls_pki_types::CertificateDer;
 use serde::{Deserialize, Serialize};
 use servo_arc::Arc as ServoArc;
 use servo_url::{Host, ImmutableOrigin, ServoUrl};
 use tokio::sync::mpsc::{UnboundedReceiver as TokioReceiver, UnboundedSender as TokioSender};
 
-use super::fetch_params::FetchParams;
+use crate::connector::CACertificates;
 use crate::fetch::cors_cache::CorsCache;
+use crate::fetch::fetch_params::{FetchParams, PreloadResponseCandidate};
 use crate::fetch::headers::determine_nosniff;
 use crate::filemanager_thread::FileManager;
 use crate::http_loader::{
     HttpState, determine_requests_referrer, http_fetch, send_early_httprequest_to_devtools,
-    send_response_to_devtools, set_default_accept,
+    send_response_to_devtools, send_security_info_to_devtools, set_default_accept,
 };
 use crate::protocols::{ProtocolRegistry, is_url_potentially_trustworthy};
 use crate::request_interceptor::RequestInterceptor;
@@ -62,6 +65,21 @@ pub enum Data {
     Cancelled,
 }
 
+pub struct WebSocketChannel {
+    pub sender: IpcSender<WebSocketNetworkEvent>,
+    pub receiver: Option<IpcReceiver<WebSocketDomAction>>,
+}
+
+impl WebSocketChannel {
+    pub fn new(
+        sender: IpcSender<WebSocketNetworkEvent>,
+        receiver: Option<IpcReceiver<WebSocketDomAction>>,
+    ) -> Self {
+        Self { sender, receiver }
+    }
+}
+
+#[derive(Clone)]
 pub struct FetchContext {
     pub state: Arc<HttpState>,
     pub user_agent: String,
@@ -72,6 +90,9 @@ pub struct FetchContext {
     pub cancellation_listener: Arc<CancellationListener>,
     pub timing: ServoArc<Mutex<ResourceFetchTiming>>,
     pub protocols: Arc<ProtocolRegistry>,
+    pub websocket_chan: Option<Arc<Mutex<WebSocketChannel>>>,
+    pub ca_certificates: CACertificates<'static>,
+    pub ignore_certificate_errors: bool,
 }
 
 #[derive(Default)]
@@ -91,15 +112,15 @@ impl CancellationListener {
 pub type DoneChannel = Option<(TokioSender<Data>, TokioReceiver<Data>)>;
 
 /// [Fetch](https://fetch.spec.whatwg.org#concept-fetch)
-pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext) {
+pub async fn fetch(request: Request, target: Target<'_>, context: &FetchContext) -> Response {
     // Steps 7,4 of https://w3c.github.io/resource-timing/#processing-model
     // rev order okay since spec says they're equal - https://w3c.github.io/resource-timing/#dfn-starttime
     {
-        let mut timing_guard = context.timing.lock().unwrap();
+        let mut timing_guard = context.timing.lock();
         timing_guard.set_attribute(ResourceAttribute::FetchStart);
         timing_guard.set_attribute(ResourceAttribute::StartTime(ResourceTimeValue::FetchStart));
     }
-    fetch_with_cors_cache(request, &mut CorsCache::default(), target, context).await;
+    fetch_with_cors_cache(request, &mut CorsCache::default(), target, context).await
 }
 
 /// Continuation of fetch from step 8.
@@ -110,49 +131,64 @@ pub async fn fetch_with_cors_cache(
     cache: &mut CorsCache,
     target: Target<'_>,
     context: &FetchContext,
-) {
-    // Step 8: Let fetchParams be a new fetch params whose request is request
+) -> Response {
+    // Step 8. Let fetchParams be a new fetch params whose request is request
     let mut fetch_params = FetchParams::new(request);
     let request = &mut fetch_params.request;
 
-    // Step 9: If request’s window is "client", then set request’s window to request’s client, if
-    // request’s client’s global object is a Window object; otherwise "no-window".
-    if request.window == Window::Client {
-        // TODO: Set window to request's client object if client is a Window object
-    } else {
-        request.window = Window::NoWindow;
-    }
+    // Step 4. Populate request from client given request.
+    request.populate_request_from_client();
 
-    // Step 10: If request’s origin is "client", then set request’s origin to request’s client’s
-    // origin.
-    if request.origin == Origin::Client {
-        // TODO: set request's origin to request's client's origin
-        unimplemented!()
-    }
+    // Step 5. If request’s client is non-null, then:
+    // TODO
+    // Step 5.1. Set taskDestination to request’s client’s global object.
+    // TODO
+    // Step 5.2. Set crossOriginIsolatedCapability to request’s client’s cross-origin isolated capability.
+    // TODO
 
-    // Step 11: If all of the following conditions are true:
+    // Step 10. If all of the following conditions are true:
+    if
     // - request’s URL’s scheme is an HTTP(S) scheme
-    // - request’s mode is "same-origin", "cors", or "no-cors"
-    // - request’s window is an environment settings object
-    // - request’s method is `GET`
-    // - request’s unsafe-request flag is not set or request’s header list is empty
-    // TODO: evaluate these conditions when we have an an environment settings object
-
-    // Step 12: If request’s policy container is "client", then:
-    if let RequestPolicyContainer::Client = request.policy_container {
-        // Step 12.1: If request’s client is non-null, then set request’s policy container to a clone
-        // of request’s client’s policy container.
-        // TODO: Requires request's client to support PolicyContainer
-
-        // Step 12.2: Otherwise, set request’s policy container to a new policy container.
-        request.policy_container =
-            RequestPolicyContainer::PolicyContainer(PolicyContainer::default());
+    matches!(request.current_url().scheme(), "http" | "https")
+        // - request’s mode is "same-origin", "cors", or "no-cors"
+        && matches!(request.mode, RequestMode::SameOrigin | RequestMode::CorsMode | RequestMode::NoCors)
+        // - request’s method is `GET`
+        && matches!(request.method, Method::GET)
+        // - request’s unsafe-request flag is not set or request’s header list is empty
+        && (!request.unsafe_request || request.headers.is_empty())
+    {
+        // - request’s client is not null, and request’s client’s global object is a Window object
+        if let Some(client) = request.client.as_ref() {
+            // Step 10.1. Assert: request’s origin is same origin with request’s client’s origin.
+            assert!(request.origin == client.origin);
+            // Step 10.2. Let onPreloadedResponseAvailable be an algorithm that runs the
+            // following step given a response response: set fetchParams’s preloaded response candidate to response.
+            let on_preloaded_response_available = |response| {
+                fetch_params.preload_response_candidate =
+                    PreloadResponseCandidate::Response(Box::new(response))
+            };
+            // Step 10.3. Let foundPreloadedResource be the result of invoking consume a preloaded resource
+            // for request’s client, given request’s URL, request’s destination, request’s mode,
+            // request’s credentials mode, request’s integrity metadata, and onPreloadedResponseAvailable.
+            let found_preloaded_resource =
+                client.consume_preloaded_resource(request, on_preloaded_response_available);
+            // Step 10.4. If foundPreloadedResource is true and fetchParams’s preloaded response candidate is null,
+            // then set fetchParams’s preloaded response candidate to "pending".
+            if found_preloaded_resource &&
+                matches!(
+                    fetch_params.preload_response_candidate,
+                    PreloadResponseCandidate::None
+                )
+            {
+                fetch_params.preload_response_candidate = PreloadResponseCandidate::Pending;
+            }
+        }
     }
 
-    // Step 13: If request’s header list does not contain `Accept`:
+    // Step 11. If request’s header list does not contain `Accept`, then:
     set_default_accept(request);
 
-    // Step 14: If request’s header list does not contain `Accept-Language`, then user agents should
+    // Step 12. If request’s header list does not contain `Accept-Language`, then user agents should
     // append (`Accept-Language, an appropriate header value) to request’s header list.
     set_default_accept_language(&mut request.headers);
 
@@ -167,7 +203,7 @@ pub async fn fetch_with_cors_cache(
     }
 
     // Step 17: Run main fetch given fetchParams.
-    main_fetch(&mut fetch_params, cache, false, target, &mut None, context).await;
+    main_fetch(&mut fetch_params, cache, false, target, &mut None, context).await
 
     // Step 18: Return fetchParams’s controller.
     // TODO: We don't implement fetchParams as defined in the spec
@@ -178,8 +214,16 @@ pub(crate) fn convert_request_to_csp_request(request: &Request) -> Option<csp::R
         Origin::Client => return None,
         Origin::Origin(origin) => origin,
     };
+
+    // We need to retroactively upgrade the ws URL if the rewritten http URL was upgraded to a secure scheme.
+    // https://github.com/w3c/webappsec-csp/issues/532
+    let mut original_url = request.original_url();
+    if original_url.scheme() == "ws" && request.url().scheme() == "https" {
+        original_url.as_mut_url().set_scheme("wss").unwrap();
+    }
+
     let csp_request = csp::Request {
-        url: request.url().into_url(),
+        url: original_url.into_url(),
         origin: origin.clone().into_url_origin(),
         redirect_count: request.redirect_count,
         destination: request.destination,
@@ -238,6 +282,21 @@ fn should_response_be_blocked_by_csp(
             .actual_response()
             .url()
             .cloned()
+            // NOTE(pylbrecht): for WebSocket connections, the URL scheme is converted to http(s)
+            // to integrate with fetch(). We need to convert it back to ws(s) to get valid CSP
+            // checks.
+            // https://github.com/w3c/webappsec-csp/issues/532
+            .map(|mut url| {
+                match csp_request.url.scheme() {
+                    "ws" | "wss" => {
+                        url.as_mut_url()
+                            .set_scheme(csp_request.url.scheme())
+                            .expect("failed to set URL scheme");
+                    },
+                    _ => {},
+                };
+                url
+            })
             .expect("response must have a url")
             .into_url(),
         redirect_count: csp_request.redirect_count,
@@ -260,7 +319,6 @@ pub async fn main_fetch(
 ) -> Response {
     // Step 1: Let request be fetchParam's request.
     let request = &mut fetch_params.request;
-    // send early HTTP request to DevTools
     send_early_httprequest_to_devtools(request, context);
     // Step 2: Let response be null.
     let mut response = None;
@@ -286,9 +344,8 @@ pub async fn main_fetch(
     }
 
     // The request should have a valid policy_container associated with it.
-    // TODO: This should not be `Client` here
     let policy_container = match &request.policy_container {
-        RequestPolicyContainer::Client => PolicyContainer::default(),
+        RequestPolicyContainer::Client => unreachable!(),
         RequestPolicyContainer::PolicyContainer(container) => container.to_owned(),
     };
     let csp_request = convert_request_to_csp_request(request);
@@ -305,7 +362,7 @@ pub async fn main_fetch(
     // TODO: handle request abort.
 
     // Step 4. Upgrade request to a potentially trustworthy URL, if appropriate.
-    if should_upgrade_request_to_potentially_trustworty(request, context) ||
+    if should_upgrade_request_to_potentially_trustworthy(request, context) ||
         should_upgrade_mixed_content_request(request, &context.protocols)
     {
         trace!(
@@ -388,13 +445,10 @@ pub async fn main_fetch(
         .state
         .hsts_list
         .read()
-        .unwrap()
         .apply_hsts_rules(request.current_url_mut());
 
     // Step 11.
     // Not applicable: see fetch_async.
-
-    // Step 12.
 
     let current_url = request.current_url();
     let current_scheme = current_url.scheme();
@@ -403,21 +457,33 @@ pub async fn main_fetch(
     context
         .request_interceptor
         .lock()
-        .unwrap()
         .intercept_request(request, &mut response, context);
 
     let mut response = match response {
         Some(res) => res,
         None => {
+            // Step 12. If response is null, then set response to the result
+            // of running the steps corresponding to the first matching statement:
             let same_origin = if let Origin::Origin(ref origin) = request.origin {
                 *origin == current_url.origin()
             } else {
                 false
             };
 
+            // fetchParams’s preloaded response candidate is non-null
+            if let PreloadResponseCandidate::Response(response) =
+                &fetch_params.preload_response_candidate
+            {
+                // Step 1. Wait until fetchParams’s preloaded response candidate is not "pending".
+                // TODO
+                // Step 2. Assert: fetchParams’s preloaded response candidate is a response.
+                // TODO
+                // Step 3. Return fetchParams’s preloaded response candidate.
+                *response.clone()
+            }
             // request's current URL's origin is same origin with request's origin, and request's
             // response tainting is "basic"
-            if (same_origin && request.response_tainting == ResponseTainting::Basic) ||
+            else if (same_origin && request.response_tainting == ResponseTainting::Basic) ||
                 // request's current URL's scheme is "data"
                 current_scheme == "data" ||
                 // Note: Although it is not part of the specification, we make an exception here
@@ -644,7 +710,7 @@ pub async fn main_fetch(
         {
             // when Fetch is used only asynchronously, we will need to make sure
             // that nothing tries to write to the body at this point
-            let mut body = internal_response.body.lock().unwrap();
+            let mut body = internal_response.body.lock();
             *body = ResponseBody::Empty;
         }
 
@@ -707,6 +773,7 @@ pub async fn main_fetch(
     target.process_response(request, &response);
     // Send Response to Devtools
     send_response_to_devtools(request, context, &response, None);
+    send_security_info_to_devtools(request, context, &response);
 
     // Step 23.
     if !response_loaded {
@@ -720,9 +787,11 @@ pub async fn main_fetch(
     // processed before sending the response to Devtools.
     send_response_to_devtools(request, context, &response, None);
 
-    if let Ok(http_cache) = context.state.http_cache.write() {
-        http_cache.update_awaiting_consumers(request, &response);
-    }
+    context
+        .state
+        .http_cache
+        .update_awaiting_consumers(request, &response)
+        .await;
 
     // Steps 25-27.
     // TODO: remove this line when only asynchronous fetches are used
@@ -760,19 +829,20 @@ async fn wait_for_response(
             }
         }
     } else {
-        let body = response.actual_response().body.lock().unwrap();
-        if let ResponseBody::Done(ref vec) = *body {
-            // in case there was no channel to wait for, the body was
-            // obtained synchronously via scheme_fetch for data/file/about/etc
-            // We should still send the body across as a chunk
-            target.process_response_chunk(request, vec.clone());
-            if context.devtools_chan.is_some() {
-                // Now that we've replayed the entire cached body,
-                // notify the DevTools server with the full Response.
-                send_response_to_devtools(request, context, response, Some(vec.clone()));
-            }
-        } else {
-            assert_eq!(*body, ResponseBody::Empty)
+        match *response.actual_response().body.lock() {
+            ResponseBody::Done(ref vec) if !vec.is_empty() => {
+                // in case there was no channel to wait for, the body was
+                // obtained synchronously via scheme_fetch for data/file/about/etc
+                // We should still send the body across as a chunk
+                target.process_response_chunk(request, vec.clone());
+                if context.devtools_chan.is_some() {
+                    // Now that we've replayed the entire cached body,
+                    // notify the DevTools server with the full Response.
+                    send_response_to_devtools(request, context, response, Some(vec.clone()));
+                }
+            },
+            ResponseBody::Done(_) | ResponseBody::Empty => {},
+            _ => unreachable!(),
         }
     }
 }
@@ -814,7 +884,7 @@ fn create_blank_reply(url: ServoUrl, timing_type: ResourceTimingType) -> Respons
     response
         .headers
         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
-    *response.body.lock().unwrap() = ResponseBody::Done(vec![]);
+    *response.body.lock() = ResponseBody::Done(vec![]);
     response.status = HttpStatus::default();
     response
 }
@@ -824,8 +894,7 @@ fn create_about_memory(url: ServoUrl, timing_type: ResourceTimingType) -> Respon
     response
         .headers
         .typed_insert(ContentType::from(mime::TEXT_HTML_UTF_8));
-    *response.body.lock().unwrap() =
-        ResponseBody::Done(resources::read_bytes(Resource::AboutMemoryHTML));
+    *response.body.lock() = ResponseBody::Done(resources::read_bytes(Resource::AboutMemoryHTML));
     response.status = HttpStatus::default();
     response
 }
@@ -840,7 +909,7 @@ fn handle_allowcert_request(request: &mut Request, context: &FetchContext) -> io
     };
 
     let stream = body.take_stream();
-    let stream = stream.lock().unwrap();
+    let stream = stream.lock();
     let (body_chan, body_port) = ipc::channel().unwrap();
     let _ = stream.send(BodyChunkRequest::Connect(body_chan));
     let _ = stream.send(BodyChunkRequest::Chunk);
@@ -1115,7 +1184,7 @@ pub fn is_form_submission_request(request: &Request) -> bool {
 }
 
 /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#upgrade-request>
-fn should_upgrade_request_to_potentially_trustworty(
+fn should_upgrade_request_to_potentially_trustworthy(
     request: &mut Request,
     context: &FetchContext,
 ) -> bool {
@@ -1142,9 +1211,10 @@ fn should_upgrade_request_to_potentially_trustworty(
         // * request’s URL is not a potentially trustworthy URL
         // * request’s URL's host is not a preloadable HSTS host
         if !is_url_potentially_trustworthy(&context.protocols, &request.current_url()) ||
-            !request.current_url().host_str().is_some_and(|host| {
-                !context.state.hsts_list.read().unwrap().is_host_secure(host)
-            })
+            request
+                .current_url()
+                .host_str()
+                .is_none_or(|host| context.state.hsts_list.read().is_host_secure(host))
         {
             debug!("Appending the Upgrade-Insecure-Requests header to request’s header list");
             request

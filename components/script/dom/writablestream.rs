@@ -3,7 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::mem;
 use std::ptr::{self};
 use std::rc::Rc;
@@ -13,10 +13,12 @@ use constellation_traits::MessagePortImpl;
 use dom_struct::dom_struct;
 use js::jsapi::{Heap, JSObject};
 use js::jsval::{JSVal, ObjectValue, UndefinedValue};
+use js::realm::CurrentRealm;
 use js::rust::{
     HandleObject as SafeHandleObject, HandleValue as SafeHandleValue,
     MutableHandleValue as SafeMutableHandleValue,
 };
+use rustc_hash::FxHashMap;
 use script_bindings::codegen::GenericBindings::MessagePortBinding::MessagePortMethods;
 use script_bindings::conversions::SafeToJSValConvertible;
 
@@ -53,12 +55,14 @@ impl js::gc::Rootable for AbortAlgorithmFulfillmentHandler {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct AbortAlgorithmFulfillmentHandler {
     stream: Dom<WritableStream>,
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     abort_request_promise: Rc<Promise>,
 }
 
 impl Callback for AbortAlgorithmFulfillmentHandler {
-    fn callback(&self, cx: SafeJSContext, _v: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, _v: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // Resolve abortRequest’s promise with undefined.
         self.abort_request_promise.resolve_native(&(), can_gc);
 
@@ -77,12 +81,14 @@ impl js::gc::Rootable for AbortAlgorithmRejectionHandler {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct AbortAlgorithmRejectionHandler {
     stream: Dom<WritableStream>,
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     abort_request_promise: Rc<Promise>,
 }
 
 impl Callback for AbortAlgorithmRejectionHandler {
-    fn callback(&self, cx: SafeJSContext, reason: SafeHandleValue, _realm: InRealm, can_gc: CanGc) {
+    fn callback(&self, cx: &mut CurrentRealm, reason: SafeHandleValue) {
+        let can_gc = CanGc::from_cx(cx);
+        let cx: SafeJSContext = cx.into();
         // Reject abortRequest’s promise with reason.
         self.abort_request_promise.reject_native(&reason, can_gc);
 
@@ -100,7 +106,7 @@ impl js::gc::Rootable for PendingAbortRequest {}
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 struct PendingAbortRequest {
     /// <https://streams.spec.whatwg.org/#pending-abort-request-promise>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     promise: Rc<Promise>,
 
     /// <https://streams.spec.whatwg.org/#pending-abort-request-reason>
@@ -130,7 +136,7 @@ pub struct WritableStream {
     backpressure: Cell<bool>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-closerequest>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     close_request: DomRefCell<Option<Rc<Promise>>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-controller>
@@ -140,11 +146,11 @@ pub struct WritableStream {
     detached: Cell<bool>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-inflightwriterequest>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     in_flight_write_request: DomRefCell<Option<Rc<Promise>>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-inflightcloserequest>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     in_flight_close_request: DomRefCell<Option<Rc<Promise>>>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-pendingabortrequest>
@@ -161,7 +167,7 @@ pub struct WritableStream {
     writer: MutNullableDom<WritableStreamDefaultWriter>,
 
     /// <https://streams.spec.whatwg.org/#writablestream-writerequests>
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[conditional_malloc_size_of]
     write_requests: DomRefCell<VecDeque<Rc<Promise>>>,
 }
 
@@ -210,7 +216,6 @@ impl WritableStream {
         self.controller.set(Some(controller));
     }
 
-    #[allow(unused)]
     pub(crate) fn get_default_controller(&self) -> DomRoot<WritableStreamDefaultController> {
         self.controller.get().expect("Controller should be set.")
     }
@@ -1025,7 +1030,7 @@ impl WritableStreamMethods<crate::DomTypeHolder> for WritableStream {
         // converted to an IDL value of type UnderlyingSink.
         let underlying_sink_dict = if !underlying_sink_obj.is_null() {
             rooted!(in(*cx) let obj_val = ObjectValue(underlying_sink_obj.get()));
-            match UnderlyingSink::new(cx, obj_val.handle()) {
+            match UnderlyingSink::new(cx, obj_val.handle(), can_gc) {
                 Ok(ConversionResult::Success(val)) => val,
                 Ok(ConversionResult::Failure(error)) => return Err(Error::Type(error.to_string())),
                 _ => {
@@ -1148,14 +1153,14 @@ pub(crate) struct CrossRealmTransformWritable {
     controller: Dom<WritableStreamDefaultController>,
 
     /// The `backpressurePromise` used in the algorithm.
-    #[ignore_malloc_size_of = "Rc is hard"]
+    #[ignore_malloc_size_of = "nested Rc"]
     backpressure_promise: Rc<RefCell<Option<Rc<Promise>>>>,
 }
 
 impl CrossRealmTransformWritable {
     /// <https://streams.spec.whatwg.org/#abstract-opdef-setupcrossrealmtransformwritable>
     /// Add a handler for port’s message event with the following steps:
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     pub(crate) fn handle_message(
         &self,
         cx: SafeJSContext,
@@ -1204,7 +1209,7 @@ impl CrossRealmTransformWritable {
         // Let error be a new "DataCloneError" DOMException.
         let error = DOMException::new(global, DOMErrorName::DataCloneError, can_gc);
         rooted!(in(*cx) let mut rooted_error = UndefinedValue());
-        error.safe_to_jsval(cx, rooted_error.handle_mut());
+        error.safe_to_jsval(cx, rooted_error.handle_mut(), can_gc);
 
         // Perform ! CrossRealmTransformSendError(port, error).
         port.cross_realm_transform_send_error(rooted_error.handle(), can_gc);
@@ -1293,7 +1298,7 @@ impl Transferable for WritableStream {
     /// Note: we are relying on the port transfer, so the data returned here are related to the port.
     fn serialized_storage<'a>(
         data: StructuredData<'a, '_>,
-    ) -> &'a mut Option<HashMap<MessagePortId, Self::Data>> {
+    ) -> &'a mut Option<FxHashMap<MessagePortId, Self::Data>> {
         match data {
             StructuredData::Reader(r) => &mut r.port_impls,
             StructuredData::Writer(w) => &mut w.ports,

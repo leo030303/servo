@@ -91,10 +91,11 @@ pub(crate) fn is_valid_element_local_name(name: &str) -> bool {
 }
 
 /// <https://dom.spec.whatwg.org/#valid-doctype-name>
-pub(crate) fn is_valid_doctype_name(name: &str) -> bool {
+pub(crate) fn is_valid_doctype_name(name: &DOMString) -> bool {
     // A string is a valid doctype name if it does not contain
     // ASCII whitespace, U+0000 NULL, or U+003E (>).
     !name
+        .str()
         .chars()
         .any(|c| c.is_ascii_whitespace() || matches!(c, '\u{0000}' | '\u{003E}'))
 }
@@ -121,16 +122,18 @@ pub(crate) enum Context {
 /// <https://dom.spec.whatwg.org/#validate-and-extract>
 pub(crate) fn validate_and_extract(
     namespace: Option<DOMString>,
-    qualified_name: &str,
+    qualified_name: &DOMString,
     context: Context,
 ) -> Fallible<(Namespace, Option<Prefix>, LocalName)> {
+    let qualified_name = String::from(&*qualified_name.str());
+
     // Step 1. If namespace is the empty string, then set it to null.
     let namespace = namespace_from_domstring(namespace);
 
     // Step 2. Let prefix be null.
     let mut prefix = None;
     // Step 3. Let localName be qualifiedName.
-    let mut local_name = qualified_name;
+    let mut local_name = qualified_name.as_str();
     // Step 4. If qualifiedName contains a U+003A (:):
     if let Some(idx) = qualified_name.find(':') {
         //     Step 4.1. Let splitResult be the result of running
@@ -141,14 +144,14 @@ pub(crate) fn validate_and_extract(
         // then throw an "InvalidCharacterError" DOMException.
         if !is_valid_namespace_prefix(p) {
             debug!("Not a valid namespace prefix");
-            return Err(Error::InvalidCharacter);
+            return Err(Error::InvalidCharacter(None));
         }
 
         //     Step 4.2. Set prefix to splitResult[0].
         prefix = Some(p);
 
         //     Step 4.3. Set localName to splitResult[1].
-        let remaining = &qualified_name[(idx + 1).min(qualified_name.len())..];
+        let remaining = &qualified_name.as_str()[(idx + 1).min(qualified_name.len())..];
         match remaining.find(':') {
             Some(end) => local_name = &remaining[..end],
             None => local_name = remaining,
@@ -160,7 +163,7 @@ pub(crate) fn validate_and_extract(
         // then throw an "InvalidCharacterError" DOMException.
         if !is_valid_namespace_prefix(p) {
             debug!("Not a valid namespace prefix");
-            return Err(Error::InvalidCharacter);
+            return Err(Error::InvalidCharacter(None));
         }
     }
 
@@ -171,7 +174,7 @@ pub(crate) fn validate_and_extract(
         Context::Attribute => {
             if !is_valid_attribute_local_name(local_name) {
                 debug!("Not a valid attribute name");
-                return Err(Error::InvalidCharacter);
+                return Err(Error::InvalidCharacter(None));
             }
         },
         // Step 7. If context is "element" and localName
@@ -180,7 +183,7 @@ pub(crate) fn validate_and_extract(
         Context::Element => {
             if !is_valid_element_local_name(local_name) {
                 debug!("Not a valid element name");
-                return Err(Error::InvalidCharacter);
+                return Err(Error::InvalidCharacter(None));
             }
         },
     }
@@ -188,26 +191,26 @@ pub(crate) fn validate_and_extract(
     match prefix {
         // Step 8. If prefix is non-null and namespace is null,
         //      then throw a "NamespaceError" DOMException.
-        Some(_) if namespace.is_empty() => Err(Error::Namespace),
+        Some(_) if namespace.is_empty() => Err(Error::Namespace(None)),
         // Step 9. If prefix is "xml" and namespace is not the XML namespace,
         //      then throw a "NamespaceError" DOMException.
-        Some("xml") if *namespace != *XML_NAMESPACE => Err(Error::Namespace),
+        Some("xml") if *namespace != *XML_NAMESPACE => Err(Error::Namespace(None)),
         // Step 10. If either qualifiedName or prefix is "xmlns" and namespace
         //      is not the XMLNS namespace, then throw a "NamespaceError" DOMException.
         p if (qualified_name == "xmlns" || p == Some("xmlns")) &&
             *namespace != *XMLNS_NAMESPACE =>
         {
-            Err(Error::Namespace)
+            Err(Error::Namespace(None))
         },
         Some(_) if qualified_name == "xmlns" && *namespace != *XMLNS_NAMESPACE => {
-            Err(Error::Namespace)
+            Err(Error::Namespace(None))
         },
         // Step 11. If namespace is the XMLNS namespace and neither qualifiedName
         //      nor prefix is "xmlns", then throw a "NamespaceError" DOMException.
         p if *namespace == *XMLNS_NAMESPACE &&
             (qualified_name != "xmlns" && p != Some("xmlns")) =>
         {
-            Err(Error::Namespace)
+            Err(Error::Namespace(None))
         },
         // Step 12. Return (namespace, prefix, localName).
         _ => Ok((

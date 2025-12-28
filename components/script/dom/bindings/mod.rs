@@ -130,12 +130,12 @@
 //! return `Err()` from the method with the appropriate [error value]
 //! (error/enum.Error.html).
 
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 #![deny(missing_docs)]
 #![deny(non_snake_case)]
 
 pub(crate) mod buffer_source;
-#[allow(dead_code)]
+#[expect(dead_code)]
 pub(crate) mod cell;
 pub(crate) mod constructor;
 pub(crate) mod conversions;
@@ -170,7 +170,7 @@ pub(crate) mod codegen {
         include!(concat!(env!("OUT_DIR"), "/DomTypeHolder.rs"));
     }
     pub(crate) use script_bindings::codegen::GenericBindings;
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) mod Bindings {
         include!(concat!(env!("OUT_DIR"), "/ConcreteBindings/mod.rs"));
     }
@@ -181,7 +181,7 @@ pub(crate) mod codegen {
         include!(concat!(env!("OUT_DIR"), "/ConcreteInheritTypes.rs"));
     }
     pub(crate) use script_bindings::codegen::{PrototypeList, RegisterBindings};
-    #[allow(dead_code)]
+    #[expect(dead_code)]
     pub(crate) mod UnionTypes {
         include!(concat!(env!("OUT_DIR"), "/UnionTypes.rs"));
     }

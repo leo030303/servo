@@ -2,7 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 
 use std::borrow::Cow;
 use std::fmt::Debug;
@@ -215,6 +215,9 @@ pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialE
     /// If this is an image element, returns its image data. Otherwise, returns `None`.
     fn image_data(&self) -> Option<(Option<Image>, Option<ImageMetadata>)>;
 
+    /// Whether or not this is an image element that is showing a broken image icon.
+    fn showing_broken_image_icon(&self) -> bool;
+
     fn canvas_data(&self) -> Option<HTMLCanvasData>;
 
     fn svg_data(&self) -> Option<SVGElementData>;
@@ -243,6 +246,15 @@ pub trait ThreadSafeLayoutNode<'dom>: Clone + Copy + Debug + NodeInfo + PartialE
     }
 
     fn with_pseudo_element_chain(&self, pseudo_element_chain: PseudoElementChain) -> Self;
+
+    /// Set whether or not this node has an active pseudo-element style with a `content`
+    /// attribute that uses `attr`.
+    ///
+    /// # Safety
+    ///
+    /// This function accesses and modifies the underlying DOM object and should
+    /// not be used by more than a single thread at once.
+    fn set_uses_content_attribute_with_attr(&self, _uses_content_attribute_with_attr: bool);
 }
 
 pub trait ThreadSafeLayoutElement<'dom>:

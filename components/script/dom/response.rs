@@ -2,6 +2,7 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
+use std::cell::Cell;
 use std::rc::Rc;
 use std::str::FromStr;
 
@@ -13,7 +14,9 @@ use net_traits::http_status::HttpStatus;
 use servo_url::ServoUrl;
 use url::Position;
 
-use crate::body::{BodyMixin, BodyType, Extractable, ExtractedBody, consume_body};
+use crate::body::{
+    BodyMixin, BodyType, Extractable, ExtractedBody, clone_body_stream_for_dom_body, consume_body,
+};
 use crate::dom::bindings::cell::DomRefCell;
 use crate::dom::bindings::codegen::Bindings::HeadersBinding::HeadersMethods;
 use crate::dom::bindings::codegen::Bindings::ResponseBinding;
@@ -45,12 +48,15 @@ pub(crate) struct Response {
     url_list: DomRefCell<Vec<ServoUrl>>,
     /// The stream of <https://fetch.spec.whatwg.org/#body>.
     body_stream: MutNullableDom<ReadableStream>,
+    /// The stream that receives network delivered bytes for Fetch responses.
+    /// This must remain stable even if `body_stream` is replaced by `tee()` branches during `clone()`.
+    fetch_body_stream: MutNullableDom<ReadableStream>,
     #[ignore_malloc_size_of = "StreamConsumer"]
     stream_consumer: DomRefCell<Option<StreamConsumer>>,
-    redirected: DomRefCell<bool>,
+    redirected: Cell<bool>,
+    is_body_empty: Cell<bool>,
 }
 
-#[allow(non_snake_case)]
 impl Response {
     pub(crate) fn new_inherited(global: &GlobalScope, can_gc: CanGc) -> Response {
         let stream = ReadableStream::new_with_external_underlying_source(
@@ -67,8 +73,10 @@ impl Response {
             url: DomRefCell::new(None),
             url_list: DomRefCell::new(vec![]),
             body_stream: MutNullableDom::new(Some(&*stream)),
+            fetch_body_stream: MutNullableDom::new(Some(&*stream)),
             stream_consumer: DomRefCell::new(None),
-            redirected: DomRefCell::new(false),
+            redirected: Cell::new(false),
+            is_body_empty: Cell::new(true),
         }
     }
 
@@ -91,23 +99,35 @@ impl Response {
     }
 
     pub(crate) fn error_stream(&self, error: Error, can_gc: CanGc) {
-        if let Some(body) = self.body_stream.get() {
+        if let Some(body) = self.fetch_body_stream.get() {
             body.error_native(error, can_gc);
         }
+    }
+
+    pub(crate) fn is_disturbed(&self) -> bool {
+        let body_stream = self.body_stream.get();
+        body_stream
+            .as_ref()
+            .is_some_and(|stream| stream.is_disturbed())
+    }
+
+    pub(crate) fn is_locked(&self) -> bool {
+        let body_stream = self.body_stream.get();
+        body_stream
+            .as_ref()
+            .is_some_and(|stream| stream.is_locked())
     }
 }
 
 impl BodyMixin for Response {
-    fn is_disturbed(&self) -> bool {
-        self.body_stream
-            .get()
-            .is_some_and(|stream| stream.is_disturbed())
+    fn is_body_used(&self) -> bool {
+        self.is_disturbed()
     }
 
-    fn is_locked(&self) -> bool {
+    fn is_unusable(&self) -> bool {
         self.body_stream
             .get()
-            .is_some_and(|stream| stream.is_locked())
+            .is_some_and(|stream| stream.is_disturbed() || stream.is_locked())
     }
 
     fn body(&self) -> Option<DomRoot<ReadableStream>> {
@@ -120,12 +140,12 @@ impl BodyMixin for Response {
     }
 }
 
-// https://fetch.spec.whatwg.org/#redirect-status
+/// <https://fetch.spec.whatwg.org/#redirect-status>
 fn is_redirect_status(status: u16) -> bool {
     status == 301 || status == 302 || status == 303 || status == 307 || status == 308
 }
 
-// https://tools.ietf.org/html/rfc7230#section-3.1.2
+/// <https://tools.ietf.org/html/rfc7230#section-3.1.2>
 fn is_valid_status_text(status_text: &ByteString) -> bool {
     // reason-phrase  = *( HTAB / SP / VCHAR / obs-text )
     for byte in status_text.iter() {
@@ -136,7 +156,7 @@ fn is_valid_status_text(status_text: &ByteString) -> bool {
     true
 }
 
-// https://fetch.spec.whatwg.org/#null-body-status
+/// <https://fetch.spec.whatwg.org/#null-body-status>
 fn is_null_body_status(status: u16) -> bool {
     status == 101 || status == 204 || status == 205 || status == 304
 }
@@ -153,6 +173,9 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
         // 1. Set this’s response to a new response.
         // Our Response/Body types don't actually hold onto an internal fetch Response.
         let response = Response::new_with_proto(global, proto, can_gc);
+        if body_init.is_some() {
+            response.is_body_empty.set(false);
+        }
 
         // 2. Set this’s headers to a new Headers object with this’s relevant realm,
         // whose header list is this’s response’s header list and guard is "response".
@@ -161,7 +184,7 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
         // 3. Let bodyWithType be null.
         // 4. If body is non-null, then set bodyWithType to the result of extracting body.
         let body_with_type = match body_init {
-            Some(body) => Some(body.extract(global, can_gc)?),
+            Some(body) => Some(body.extract(global, false, can_gc)?),
             None => None,
         };
 
@@ -223,7 +246,6 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-response-json>
-    #[allow(unsafe_code)]
     fn CreateFromJson(
         cx: JSContext,
         global: &GlobalScope,
@@ -238,7 +260,7 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
         // The spec's definition of JSON bytes is a UTF-8 encoding so using a DOMString here handles
         // the encoding part.
         let body_init = BodyInit::String(json_str);
-        let mut body = body_init.extract(global, can_gc)?;
+        let mut body = body_init.extract(global, false, can_gc)?;
 
         // 3. Let responseObject be the result of creating a Response object, given a new response,
         // "response", and the current realm.
@@ -267,7 +289,7 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
 
     /// <https://fetch.spec.whatwg.org/#dom-response-redirected>
     fn Redirected(&self) -> bool {
-        return *self.redirected.borrow();
+        self.redirected.get()
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-response-status>
@@ -293,12 +315,12 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
 
     /// <https://fetch.spec.whatwg.org/#dom-response-clone>
     fn Clone(&self, can_gc: CanGc) -> Fallible<DomRoot<Response>> {
-        // Step 1
-        if self.is_locked() || self.is_disturbed() {
+        // Step 1. If this is unusable, then throw a TypeError.
+        if self.is_unusable() {
             return Err(Error::Type("cannot clone a disturbed response".to_string()));
         }
 
-        // Step 2
+        // Step 2. Let clonedResponse be the result of cloning this’s response.
         let new_response = Response::new(&self.global(), can_gc);
         new_response
             .Headers(can_gc)
@@ -307,9 +329,6 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
             .Headers(can_gc)
             .set_guard(self.Headers(can_gc).get_guard());
 
-        // https://fetch.spec.whatwg.org/#concept-response-clone
-        // Instead of storing a net_traits::Response internally, we
-        // only store the relevant fields, and only clone them here
         *new_response.response_type.borrow_mut() = *self.response_type.borrow();
         new_response
             .status
@@ -320,21 +339,20 @@ impl ResponseMethods<crate::DomTypeHolder> for Response {
             .url_list
             .borrow_mut()
             .clone_from(&self.url_list.borrow());
+        new_response.is_body_empty.set(self.is_body_empty.get());
 
-        if let Some(stream) = self.body_stream.get().clone() {
-            new_response.body_stream.set(Some(&*stream));
-        }
+        // Step 3. Return the result of creating a Response object,
+        // given clonedResponse, this’s headers’s guard, and this’s relevant realm.
+        clone_body_stream_for_dom_body(&self.body_stream, &new_response.body_stream, can_gc)?;
+        // The cloned response must not receive network chunks directly; it is fed via the tee branch.
+        new_response.fetch_body_stream.set(None);
 
-        // Step 3
-        // TODO: This step relies on promises, which are still unimplemented.
-
-        // Step 4
         Ok(new_response)
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-bodyused>
     fn BodyUsed(&self) -> bool {
-        self.is_disturbed()
+        !self.is_body_empty.get() && self.is_body_used()
     }
 
     /// <https://fetch.spec.whatwg.org/#dom-body-body>
@@ -421,6 +439,8 @@ fn initialize_response(
 
         // 6.2 Set response’s body to body’s body.
         response.body_stream.set(Some(&*body.stream));
+        response.fetch_body_stream.set(Some(&*body.stream));
+        response.is_body_empty.set(false);
 
         // 6.3 If body’s type is non-null and response’s header list does not contain `Content-Type`,
         // then append (`Content-Type`, body’s type) to response’s header list.
@@ -442,6 +462,7 @@ fn initialize_response(
         // fetch Response object.
         let stream = ReadableStream::new_from_bytes(global, Vec::with_capacity(0), can_gc)?;
         response.body_stream.set(Some(&*stream));
+        response.fetch_body_stream.set(Some(&*stream));
     }
 
     Ok(response)
@@ -478,7 +499,7 @@ impl Response {
     }
 
     pub(crate) fn set_redirected(&self, is_redirected: bool) {
-        *self.redirected.borrow_mut() = is_redirected;
+        self.redirected.set(is_redirected);
     }
 
     fn set_response_members_by_type(&self, response_type: DOMResponseType, can_gc: CanGc) {
@@ -492,11 +513,13 @@ impl Response {
                 *self.status.borrow_mut() = HttpStatus::new_error();
                 self.set_headers(None, can_gc);
                 self.body_stream.set(None);
+                self.fetch_body_stream.set(None);
             },
             DOMResponseType::Opaqueredirect => {
                 *self.status.borrow_mut() = HttpStatus::new_error();
                 self.set_headers(None, can_gc);
                 self.body_stream.set(None);
+                self.fetch_body_stream.set(None);
             },
             DOMResponseType::Default => {},
             DOMResponseType::Basic => {},
@@ -509,17 +532,18 @@ impl Response {
     }
 
     pub(crate) fn stream_chunk(&self, chunk: Vec<u8>, can_gc: CanGc) {
+        self.is_body_empty.set(false);
         // Note, are these two actually mutually exclusive?
         if let Some(stream_consumer) = self.stream_consumer.borrow().as_ref() {
             stream_consumer.consume_chunk(chunk.as_slice());
-        } else if let Some(body) = self.body_stream.get() {
+        } else if let Some(body) = self.fetch_body_stream.get() {
             body.enqueue_native(chunk, can_gc);
         }
     }
 
     #[cfg_attr(crown, allow(crown::unrooted_must_root))]
     pub(crate) fn finish(&self, can_gc: CanGc) {
-        if let Some(body) = self.body_stream.get() {
+        if let Some(body) = self.fetch_body_stream.get() {
             body.controller_close_native(can_gc);
         }
         let stream_consumer = self.stream_consumer.borrow_mut().take();
